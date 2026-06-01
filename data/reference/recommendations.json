@@ -1,0 +1,73 @@
+{
+  "categories": [
+    {
+      "name": "Good",
+      "class": "good",
+      "commonClass": "row-header",
+      "sensitiveGroups": [],
+      "everyoneElse": []
+    },
+    {
+      "name": "Fair",
+      "class": "fair",
+      "commonClass": "row-header",
+      "sensitiveGroups": [
+        "REDUCE outdoor physical activity if you develop symptoms such as cough or shortness of breath.",
+        " Consider closing windows and doors until outdoor air quality is better.",
+        "Follow the treatment plan recommended by your doctor.",
+        "If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        "In a health emergency, call triple zero (000) for an ambulance."
+      ],
+      "everyoneElse": []
+    },
+    {
+      "name": "Poor",
+      "class": "poor",
+      "commonClass": "row-header",
+      "sensitiveGroups": [
+        "AVOID outdoor physical activity if you develop symptoms such as cough or shortness of breath.",
+        "When indoors, close windows and doors until outdoor air quality is better.",
+        "Follow the treatment plan recommended by your doctor.",
+        " If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        " In a health emergency, call triple zero (000) for an ambulance."
+      ],
+      "everyoneElse": ["REDUCE outdoor physical activity if you develop symptoms such as cough or shortness of breath."]
+    },
+    {
+      "name": "Very poor",
+      "class": "very-poor",
+      "commonClass": "row-header",
+      "sensitiveGroups": [
+        "STAY INDOORS as much as possible with windows and doors closed until outdoor air quality is better.",
+        "If you feel that the air in your home is uncomfortable, consider going to a place with cleaner air (such as an air-conditioned building like a library or shopping centre) if it is safe to do so.",
+        "Actively monitor symptoms and follow the treatment plan recommended by your doctor.",
+        "If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        "In a health emergency, call triple zero (000) for an ambulance."
+      ],
+      "everyoneElse": [
+        "AVOID outdoor physical activity if you develop symptoms such as cough or shortness of breath.",
+        " When indoors, close windows and doors until outdoor air quality is better.",
+        "If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        "In a health emergency, call triple zero (000) for an ambulance."
+      ]
+    },
+    {
+      "name": "Extremely poor",
+      "class": "extremely-poor",
+      "commonClass": "row-header",
+      "sensitiveGroups": [
+        "STAY INDOORS with windows and doors closed until outdoor air quality is better and reduce indoor activity.",
+        " If you feel that the air in your home is uncomfortable, consider going to a place with cleaner air (such as an air-conditioned building like a library or shopping centre) if it is safe to do so.",
+        " Actively monitor symptoms and follow the treatment plan recommended by   your doctor.",
+        "If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        "In a health emergency, call triple zero (000) for an ambulance."
+      ],
+      "everyoneElse": [
+        "STAY INDOORS as much as possible with windows and doors closed until   outdoor air quality is better.",
+        "If you feel that the air in your home is uncomfortable, consider going to a place with cleaner air (such as an air-conditioned building like a library or shopping centre) if it is safe to do so.",
+        "If you are concerned about symptoms call the 24-hour HealthDirect helpline on 1800 022 222 or see your doctor.",
+        "In a health emergency, call triple zero (000) for an ambulance."
+      ]
+    }
+  ]
+}

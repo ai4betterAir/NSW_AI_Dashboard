@@ -1,0 +1,9 @@
+.monitor-top-boxes { display: flex; flex-direction: column; gap: 8px; }
+.monitor-top-box { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; min-width: 150px; padding: 12px; border-radius: 10px; background: #ffffff; box-shadow: 0 4px 10px rgba(2,6,23,0.06); border: 1px solid rgba(2,6,23,0.06); }
+.monitor-top-box__station { font-weight: 800; font-size: 0.95rem; margin-bottom: 6px; }
+.monitor-top-box__category { padding: 6px 12px; border-radius: 999px; color: #ffffff; font-weight: 800; font-size: 0.78rem; margin-bottom: 8px; }
+.monitor-top-box__value { font-size: 18px; font-weight: 900; color: #0f172a; }
+.monitor-top-box:hover { transform: translateY(-4px); transition: transform 120ms ease-in-out; }
+.monitor-highest-card { display: inline-block; }
+/* Ensure headings align */
+.monitor-top-boxes h4 { margin: 0; font-size: 0.95rem; }

@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pandas
+python-dotenv
+aiohttp
+apscheduler
+watchdog
+dash
+plotly
+requests
