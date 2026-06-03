@@ -695,6 +695,10 @@ body {
   overflow: auto;
 }
 
+.monitor-table-card .dash-table-container {
+  max-height: 520px;
+}
+
 .dash-spreadsheet-container,
 .dash-spreadsheet {
   font-family: "Source Sans 3", "Aptos", "Segoe UI", Helvetica, Arial, sans-serif !important;
@@ -803,6 +807,14 @@ body {
       "status next3"
       "map map"
       "trends trends";
+    /* On the 2-column Overview layout, make the two top cards the same height. */
+    align-items: stretch;
+  }
+
+  .overview-area--status,
+  .overview-area--next3 {
+    height: 100%;
+    min-height: 0;
   }
 }
 
@@ -1750,6 +1762,11 @@ body {
   text-underline-offset: 3px;
 }
 
+.monitor-outlook-time {
+  font-weight: 950;
+  color: #0f172a;
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1857,6 +1874,97 @@ body {
 .monitor-mini-strip .js-plotly-plot,
 .monitor-mini-strip .plot-container {
   width: 100%;
+}
+
+.monitor-region-series-card {
+  margin-top: 16px;
+  border-top: 4px solid #1d4ed8;
+  background: linear-gradient(180deg, #ffffff, #f8fbff);
+}
+
+.monitor-region-series-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.monitor-region-series-heading h4 {
+  margin: 0;
+}
+
+.monitor-region-series-subtitle {
+  margin: 0;
+  color: #475569;
+  font-size: 0.94rem;
+  font-weight: 700;
+}
+
+.monitor-region-series-filter {
+  max-width: 340px;
+  margin-top: 12px;
+}
+
+.monitor-region-series-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.monitor-region-series-filters .monitor-region-series-filter {
+  margin-top: 0;
+  max-width: none;
+}
+
+.monitor-region-series-station-filter,
+.monitor-region-series-pollutant-filter {
+  max-width: 100%;
+}
+
+.monitor-region-series-note {
+  margin-top: 10px;
+}
+
+.monitor-region-series-note__text {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: #334155;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.monitor-region-series-note__region {
+  color: #0f172a;
+  font-weight: 900;
+}
+
+.monitor-region-series-note__meta {
+  color: #64748b;
+}
+
+.monitor-region-series-plots {
+  margin-top: 12px;
+  display: grid;
+  gap: 16px;
+}
+
+.monitor-region-series-plot-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+  padding: 8px;
+}
+
+.monitor-region-series-graph .js-plotly-plot,
+.monitor-region-series-graph .plot-container {
+  width: 100%;
+}
+
+.monitor-region-series-graph .js-plotly-plot {
+  height: 260px !important;
 }
 
 .monitor-compare-summary {
@@ -2470,5 +2578,196 @@ body {
   .map-frame--forecast {
     height: 540px;
     min-height: 540px;
+  }
+}
+
+/* Air-quality badges inside Dash DataTable cells */
+td[data-dash-column="pm25_badge"] .dash-cell-value,
+td[data-dash-column="pm10_badge"] .dash-cell-value,
+td[data-dash-column="o3_badge"] .dash-cell-value,
+td[data-dash-column="co_badge"] .dash-cell-value,
+td[data-dash-column="no_badge"] .dash-cell-value,
+td[data-dash-column="no2_badge"] .dash-cell-value,
+td[data-dash-column="nox_badge"] .dash-cell-value {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0;
+}
+
+.aq-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  padding: 2px 10px;
+  text-align: center;
+  border-radius: 4px;
+  font-weight: 600;
+  color: #000;
+  line-height: 1;
+}
+
+.aq-badge__value {
+  line-height: 1;
+}
+
+.aq-badge__delta {
+  min-height: 0.65em;
+  font-size: 0.68rem;
+  line-height: 0.9;
+  font-weight: 900;
+  margin-top: -1px;
+}
+
+.aq-badge__delta--up {
+  color: #dc2626;
+}
+
+.aq-badge__delta--down {
+  color: #2563eb;
+}
+
+.aq-badge__delta--flat {
+  color: transparent;
+}
+
+.aq-badge--good {
+  background: #2e7d32;
+}
+
+.aq-badge--fair {
+  background: #f9a825;
+}
+
+.aq-badge--poor {
+  background: #e47400;
+}
+
+.aq-badge--very-poor {
+  background: #ef4444;
+}
+
+.aq-badge--extreme {
+  background: #9c27b0;
+}
+
+.aq-badge--no-data {
+  background: #9ca3af;
+}
+
+/* Monitoring: top-N station boxes under the map */
+.monitor-top-box-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.monitor-top-box-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.monitor-top-box {
+  width: 100%;
+  min-width: 0;
+}
+
+.monitor-top-box__station {
+  font-weight: 800;
+  font-size: 0.92rem;
+  line-height: 1.15;
+  color: #0f172a;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.monitor-top-box__category {
+  display: block;
+  width: 100%;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 900;
+  font-size: 0.86rem;
+  line-height: 1.1;
+  margin: 0 auto 6px;
+}
+
+.monitor-top-box__value {
+  font-weight: 800;
+  font-size: 0.9rem;
+  color: #0f172a;
+}
+
+.monitor-top-box__subnote {
+  margin-top: 5px;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  color: rgba(15, 23, 42, 0.72);
+  font-weight: 700;
+}
+
+.monitor-top-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.monitor-top-panel {
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: var(--shadow);
+  padding: 12px;
+}
+
+.monitor-top-panel__title {
+  font-weight: 950;
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+
+.monitor-top-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.monitor-top-section__title {
+  font-weight: 950;
+  color: rgba(15, 23, 42, 0.88);
+  margin-bottom: 8px;
+}
+
+.monitor-top-section__subtitle {
+  font-size: 0.82rem;
+  color: rgba(15, 23, 42, 0.68);
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.monitor-purpleair-top-data {
+  margin-top: 12px;
+}
+
+@media (max-width: 1260px) {
+  .monitor-top-box-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1040px) {
+  .monitor-top-box-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .monitor-top-box-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

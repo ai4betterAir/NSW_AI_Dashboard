@@ -182,6 +182,39 @@ def _load_purpleair_snapshot_cache():
             return json.load(fh)
     except Exception:
         return {"sensors": [], "fetched_at": None, "error": "Corrupt cache"}
+
+
+def _load_bundled_purpleair_snapshot():
+    """Load a packaged PurpleAir snapshot from the repository when live access fails."""
+
+    module_root = Path(__file__).resolve().parents[4]
+    candidate_dirs = [
+        module_root / "AI_Dashboard_2026Y" / "data" / "downloads" / "monitoring_test",
+        module_root / "AI_Dashboard_2026" / "data" / "downloads" / "monitoring_test",
+        module_root / "AI_DASH" / "data" / "downloads" / "monitoring_test",
+    ]
+    seen = set()
+    for directory in candidate_dirs:
+        if directory in seen or not directory.exists():
+            continue
+        seen.add(directory)
+        candidates = sorted(
+            directory.glob("purpleair_snapshot*.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and payload.get("sensors") is not None:
+                payload.setdefault("fetched_at", None)
+                payload.setdefault("error", None)
+                payload["source"] = "bundle"
+                return payload
+    return None
 SYDNEY_TZ = timezone(timedelta(hours=10))
 PURPLEAIR_API_KEY = os.environ.get("PURPLEAIR_API_KEY", "D80F3AFD-DDAD-11ED-BD21-42010A800008")
 PURPLEAIR_SNAPSHOT_URL = "https://api.purpleair.com/v1/sensors"
@@ -487,13 +520,29 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
         cached = _load_purpleair_snapshot_cache()
         cached_error = cached.get("error") if isinstance(cached, dict) else None
         if cached and cached_error != "No cache":
+            if isinstance(cached, dict):
+                cached.setdefault("source", "cache")
             return cached
-        return {"sensors": [], "fetched_at": None, "error": str(exc)}
+        bundled = _load_bundled_purpleair_snapshot()
+        if bundled:
+            try:
+                _save_purpleair_snapshot_cache(bundled)
+            except Exception:
+                pass
+            return bundled
+        return {"sensors": [], "fetched_at": None, "error": str(exc), "source": "error"}
 
     fields = payload.get("fields") or []
     data = payload.get("data") or []
     if not isinstance(fields, list) or not isinstance(data, list):
-        return {"sensors": [], "fetched_at": None, "error": "Unexpected PurpleAir payload."}
+        bundled = _load_bundled_purpleair_snapshot()
+        if bundled:
+            try:
+                _save_purpleair_snapshot_cache(bundled)
+            except Exception:
+                pass
+            return bundled
+        return {"sensors": [], "fetched_at": None, "error": "Unexpected PurpleAir payload.", "source": "error"}
 
     def idx(field):
         try:
@@ -540,6 +589,7 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
 
     fetched_at = payload.get("time_stamp") or payload.get("data_time_stamp")
     out = {"sensors": snapshot, "fetched_at": fetched_at, "error": None}
+    out["source"] = "live"
     try:
         _save_purpleair_snapshot_cache(out)
     except Exception:

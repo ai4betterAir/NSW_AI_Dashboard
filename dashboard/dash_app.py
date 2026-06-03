@@ -452,6 +452,22 @@ MONITOR_POLLUTANT_OPTIONS = [
     {"label": "O3", "value": "O3"},
 ]
 
+MONITOR_REGION_SERIES_POLLUTANTS = ["PM2.5", "PM10", "O3"]
+MONITOR_REGION_SERIES_COLORS = [
+    "#2563eb",
+    "#7c3aed",
+    "#0f766e",
+    "#ea580c",
+    "#db2777",
+    "#16a34a",
+    "#ca8a04",
+    "#4f46e5",
+    "#0891b2",
+    "#dc2626",
+    "#475569",
+]
+MONITOR_REGION_SERIES_OPTIONS = [option for option in MONITOR_REGION_OPTIONS if str(option.get("value") or "").strip() != "ALL"]
+
 MONITOR_CATEGORY_OPTIONS = [{"label": k.title().replace("_", " "), "value": k} for k in (MONITORING_CATEGORY_COLORS.keys() if 'MONITORING_CATEGORY_COLORS' in globals() else [])]
 
 
@@ -482,6 +498,27 @@ def _format_forecast_label(value):
     hour = parsed.strftime("%I").lstrip("0") or "0"
     meridiem = parsed.strftime("%p")
     return f"{hour}{meridiem} / {parsed.day} {parsed.strftime('%b %Y')}"
+
+
+def _monitor_region_series_key(value):
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
+def _monitor_region_series_station_options(region_value):
+    region_key = _monitor_region_series_key(region_value)
+    if not region_key:
+        return []
+    site_lookup = _sites_by_id()
+    options = []
+    for site_id, site in sorted(
+        site_lookup.items(),
+        key=lambda item: title_case_station_name(item[1].get("SiteName") or f"Site {item[0]}")
+    ):
+        if _monitor_region_series_key((site or {}).get("Region")) != region_key:
+            continue
+        station_name = title_case_station_name(site.get("SiteName") or f"Site {site_id}")
+        options.append({"label": station_name, "value": f"aqms:{int(site_id)}"})
+    return options
 
 
 def _station_plot_axes():
@@ -820,6 +857,66 @@ def _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label):
     return rows
 
 
+def _aqms_previous_hour_values_by_site(raw_obs, history_rows=None):
+    raw_obs = raw_obs or []
+    history_rows = history_rows or []
+    code_to_label = {
+        (POLLUTANTS.get("PM2.5") or {}).get("ParameterCode"): "PM2.5",
+        (POLLUTANTS.get("PM10") or {}).get("ParameterCode"): "PM10",
+        (POLLUTANTS.get("O3") or {}).get("ParameterCode"): "O3",
+        (POLLUTANTS.get("CO") or {}).get("ParameterCode"): "CO",
+        (POLLUTANTS.get("NO2") or {}).get("ParameterCode"): "NO2",
+        (POLLUTANTS.get("SO2") or {}).get("ParameterCode"): "SO2",
+        "NO": "NO",
+        "NOX": "NOX",
+    }
+    series_by_site = {}
+    for item in list(history_rows) + list(raw_obs):
+        param = item.get("Parameter") or {}
+        code = str(param.get("ParameterCode") or "").strip()
+        label = code_to_label.get(code)
+        if not label:
+            continue
+        if (param.get("Frequency") or "").strip() != "Hourly average":
+            continue
+        site_id = item.get("Site_Id")
+        if site_id is None:
+            continue
+        ts = _parse_aqms_time_point(item)
+        if ts is None:
+            continue
+        value = item.get("Value")
+        try:
+            value_num = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value_num = None
+        if value_num is None:
+            continue
+        try:
+            site_key = int(site_id)
+        except Exception:
+            continue
+        series_by_site.setdefault(site_key, {}).setdefault(label, {})[ts] = value_num
+
+    out = {}
+    for site_id, pollutant_map in series_by_site.items():
+        site_payload = {}
+        for label, ts_map in pollutant_map.items():
+            points = sorted(ts_map.items(), key=lambda item: item[0])
+            if not points:
+                continue
+            latest_value = points[-1][1]
+            previous_value = points[-2][1] if len(points) > 1 else None
+            site_payload[label] = {
+                "current": latest_value,
+                "previous": previous_value,
+                "delta": (latest_value - previous_value) if previous_value is not None else None,
+            }
+        if site_payload:
+            out[site_id] = site_payload
+    return out
+
+
 def _aqms_window_by_region(raw_obs, parameter_code, hours=6, aggregator="mean"):
     """Aggregate an AQMS parameter over the last `hours` for each region.
 
@@ -1060,12 +1157,14 @@ def _monitor_kpi_payload(aqms_rows, purpleair_rows, clusters, latest_label, comp
     }
 
 
-def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, max_rows=40):
+def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, previous_by_site=None, max_rows=40):
     rows = []
     snapshot_by_site = snapshot_by_site or {}
+    previous_by_site = previous_by_site or {}
     for row in (aqms_rows or [])[: max_rows // 2]:
         site_id = row.get("site_id")
         bucket = snapshot_by_site.get(int(site_id)) if site_id is not None else {}
+        prev_bucket = previous_by_site.get(int(site_id)) if site_id is not None else {}
         pm25_r = bucket.get("PM2.5") if isinstance(bucket, dict) else None
         pm10_r = bucket.get("PM10") if isinstance(bucket, dict) else None
         o3_r = bucket.get("O3") if isinstance(bucket, dict) else None
@@ -1076,15 +1175,18 @@ def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, max_ro
                 "pollutant": row.get("determining_pollutant") or "--",
                 "hour": row.get("hour_description") or "--",
                 "source": "AQMS",
-                "pm25": _format_value_with_arrow(site_id, "PM2.5", (pm25_r or {}).get("value_label") or "--", (pm25_r or {}).get("value")),
-                "pm10": _format_value_with_arrow(site_id, "PM10", (pm10_r or {}).get("value_label") or "--", (pm10_r or {}).get("value")),
-                "o3": _format_value_with_arrow(site_id, "O3", (o3_r or {}).get("value_label") or "--", (o3_r or {}).get("value")),
+                "pm25": (pm25_r or {}).get("value_label") or "--",
+                "pm10": (pm10_r or {}).get("value_label") or "--",
+                "o3": (o3_r or {}).get("value_label") or "--",
                 "pm25_category": (pm25_r or {}).get("category") or "No data",
                 "pm10_category": (pm10_r or {}).get("category") or "No data",
                 "o3_category": (o3_r or {}).get("category") or "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"aqms:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
+                "pm25_previous": (prev_bucket or {}).get("PM2.5", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "pm10_previous": (prev_bucket or {}).get("PM10", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "o3_previous": (prev_bucket or {}).get("O3", {}).get("previous") if isinstance(prev_bucket, dict) else None,
             }
         )
     for row in (purpleair_rows or [])[: max_rows - len(rows)]:
@@ -1110,15 +1212,21 @@ def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, max_ro
     return rows
 
 
-def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None):
+def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None, previous_by_site=None):
     rows = []
     snapshot_by_site = snapshot_by_site or {}
+    previous_by_site = previous_by_site or {}
     for row in aqms_rows or []:
         site_id = row.get("site_id")
         bucket = snapshot_by_site.get(int(site_id)) if site_id is not None else {}
+        prev_bucket = previous_by_site.get(int(site_id)) if site_id is not None else {}
         pm25_r = bucket.get("PM2.5") if isinstance(bucket, dict) else None
         pm10_r = bucket.get("PM10") if isinstance(bucket, dict) else None
         o3_r = bucket.get("O3") if isinstance(bucket, dict) else None
+        co_r = bucket.get("CO") if isinstance(bucket, dict) else None
+        no_r = bucket.get("NO") if isinstance(bucket, dict) else None
+        no2_r = bucket.get("NO2") if isinstance(bucket, dict) else None
+        nox_r = bucket.get("NOX") if isinstance(bucket, dict) else None
         rows.append(
             {
                 "station": row.get("station"),
@@ -1126,15 +1234,30 @@ def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None):
             "pollutant": row.get("determining_pollutant") or "--",
                 "hour": row.get("hour_description") or "--",
                 "source": "AQMS",
-                "pm25": _format_value_with_arrow(site_id, "PM2.5", (pm25_r or {}).get("value_label") or "--", (pm25_r or {}).get("value")),
-                "pm10": _format_value_with_arrow(site_id, "PM10", (pm10_r or {}).get("value_label") or "--", (pm10_r or {}).get("value")),
-                "o3": _format_value_with_arrow(site_id, "O3", (o3_r or {}).get("value_label") or "--", (o3_r or {}).get("value")),
+                "pm25": (pm25_r or {}).get("value_label") or "--",
+                "pm10": (pm10_r or {}).get("value_label") or "--",
+                "o3": (o3_r or {}).get("value_label") or "--",
+                "co": (co_r or {}).get("value_label") or "--",
+                "no": (no_r or {}).get("value_label") or "--",
+                "no2": (no2_r or {}).get("value_label") or "--",
+                "nox": (nox_r or {}).get("value_label") or "--",
                 "pm25_category": (pm25_r or {}).get("category") or "No data",
                 "pm10_category": (pm10_r or {}).get("category") or "No data",
                 "o3_category": (o3_r or {}).get("category") or "No data",
+                "co_category": (co_r or {}).get("category") or "No data",
+                "no_category": (no_r or {}).get("category") or "No data",
+                "no2_category": (no2_r or {}).get("category") or "No data",
+                "nox_category": (nox_r or {}).get("category") or "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"aqms:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
+                "pm25_previous": (prev_bucket or {}).get("PM2.5", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "pm10_previous": (prev_bucket or {}).get("PM10", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "o3_previous": (prev_bucket or {}).get("O3", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "co_previous": (prev_bucket or {}).get("CO", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "no_previous": (prev_bucket or {}).get("NO", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "no2_previous": (prev_bucket or {}).get("NO2", {}).get("previous") if isinstance(prev_bucket, dict) else None,
+                "nox_previous": (prev_bucket or {}).get("NOX", {}).get("previous") if isinstance(prev_bucket, dict) else None,
             }
         )
     for row in purpleair_rows or []:
@@ -1148,9 +1271,17 @@ def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None):
                 "pm25": row.get("value_label") or "--",
                 "pm10": "--",
                 "o3": "--",
+                "co": "--",
+                "no": "--",
+                "no2": "--",
+                "nox": "--",
                 "pm25_category": row.get("category") or "No data",
                 "pm10_category": "No data",
                 "o3_category": "No data",
+                "co_category": "No data",
+                "no_category": "No data",
+                "no2_category": "No data",
+                "nox_category": "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"purpleair:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
@@ -1202,74 +1333,70 @@ def _monitor_kpi_cards(kpis):
 
 
 def _monitor_table_styles(_table_rows=None):
-    # Use value-based styling so sorting/paging doesn't break colours.
-    base = [
-        {
-            "if": {"filter_query": '{category} = "Good"', "column_id": "category"},
-            "backgroundColor": "#16a34a",
-            "color": "#ffffff",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-        {
-            "if": {"filter_query": '{category} = "Fair"', "column_id": "category"},
-            "backgroundColor": "#facc15",
-            "color": "#0f172a",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-        {
-            "if": {"filter_query": '{category} = "Poor"', "column_id": "category"},
-            "backgroundColor": "#f97316",
-            "color": "#ffffff",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-        {
-            "if": {"filter_query": '{category} = "Very poor"', "column_id": "category"},
-            "backgroundColor": "#ef4444",
-            "color": "#ffffff",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-        {
-            "if": {"filter_query": '{category} = "Extremely poor"', "column_id": "category"},
-            "backgroundColor": "#7f1d1d",
-            "color": "#ffffff",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-        {
-            "if": {"filter_query": '{category} = "No data"', "column_id": "category"},
-            "backgroundColor": "#9ca3af",
-            "color": "#0f172a",
-            "fontWeight": "900",
-            "borderRadius": "999px",
-        },
-    ]
-
-    # Add same category-based background colouring for PM2.5, PM10 and O3 columns
-    pollutants = [
-        ("pm25_category", "pm25"),
-        ("pm10_category", "pm10"),
-        ("o3_category", "o3"),
-    ]
-    for cat_field, col in pollutants:
-        base.extend(
-            [
-                {"if": {"filter_query": f'{{{cat_field}}} = "Good"', "column_id": col}, "backgroundColor": "#16a34a", "color": "#ffffff"},
-                {"if": {"filter_query": f'{{{cat_field}}} = "Fair"', "column_id": col}, "backgroundColor": "#facc15", "color": "#0f172a"},
-                {"if": {"filter_query": f'{{{cat_field}}} = "Poor"', "column_id": col}, "backgroundColor": "#f97316", "color": "#ffffff"},
-                {"if": {"filter_query": f'{{{cat_field}}} = "Very poor"', "column_id": col}, "backgroundColor": "#ef4444", "color": "#ffffff"},
-                {"if": {"filter_query": f'{{{cat_field}}} = "Extremely poor"', "column_id": col}, "backgroundColor": "#7f1d1d", "color": "#ffffff"},
-                {"if": {"filter_query": f'{{{cat_field}}} = "No data"', "column_id": col}, "backgroundColor": "#9ca3af", "color": "#0f172a"},
-            ]
-        )
-
-    return base
+    # Badge rendering is handled via per-cell HTML + CSS rather than DataTable
+    # conditional formatting.
+    return []
 
 
-def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _aq_badge_class(category_label: str) -> str:
+    key = str(category_label or "").strip().lower()
+    if key in {"good"}:
+        return "aq-badge--good"
+    if key in {"fair", "moderate"}:
+        return "aq-badge--fair"
+    if key in {"poor"}:
+        return "aq-badge--poor"
+    if key in {"very poor", "verypoor"}:
+        return "aq-badge--very-poor"
+    if key in {"extremely poor", "extreme", "extremelypoor"}:
+        return "aq-badge--extreme"
+    return "aq-badge--no-data"
+
+
+def _aq_badge_html(value_text, category_label) -> str:
+    text = str(value_text or "").strip()
+    arrow = ""
+    if "↑" in text:
+        arrow = "up"
+    elif "↓" in text:
+        arrow = "down"
+    if text and text != "--":
+        match = _NUMBER_RE.search(text)
+        if match:
+            text = match.group(0)
+    if not text or text == "--":
+        text = "--"
+    css = f"aq-badge {_aq_badge_class(category_label)}"
+    # DataTable renders markdown cells; enable HTML via markdown_options={"html": True}
+    arrow_html = ""
+    if arrow == "up":
+        arrow_html = '<div class="aq-badge__delta aq-badge__delta--up">↑</div>'
+    elif arrow == "down":
+        arrow_html = '<div class="aq-badge__delta aq-badge__delta--down">↓</div>'
+    else:
+        arrow_html = '<div class="aq-badge__delta aq-badge__delta--flat">&nbsp;</div>'
+    return f'<div class="{css}"><div class="aq-badge__value">{escape(text)}</div>{arrow_html}</div>'
+
+
+def _inject_badges_into_monitor_rows(rows):
+    out = []
+    for row in rows or []:
+        r = dict(row or {})
+        r["pm25_badge"] = _aq_badge_html(r.get("pm25"), r.get("pm25_category"))
+        r["pm10_badge"] = _aq_badge_html(r.get("pm10"), r.get("pm10_category"))
+        r["o3_badge"] = _aq_badge_html(r.get("o3"), r.get("o3_category"))
+        r["co_badge"] = _aq_badge_html(r.get("co"), r.get("co_category"))
+        r["no_badge"] = _aq_badge_html(r.get("no"), r.get("no_category"))
+        r["no2_badge"] = _aq_badge_html(r.get("no2"), r.get("no2_category"))
+        r["nox_badge"] = _aq_badge_html(r.get("nox"), r.get("nox_category"))
+        out.append(r)
+    return out
+
+
+def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=None):
     """Ensure each AQMS row's pm25/pm10/o3 fields include arrows based on the
     in-process `_LAST_AQMS_SNAPSHOT`. This augments rows passed from the store
     so UI interactions (region filter) still show arrows.
@@ -1277,6 +1404,7 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
     if not rows:
         return rows
     snapshot_by_site = snapshot_by_site or {}
+    previous_by_site = previous_by_site or {}
     # Prefer the prior snapshot (the state before the most recent refresh) when
     # available; fall back to the last snapshot.
     prev_snap = globals().get('_PRIOR_AQMS_SNAPSHOT') or globals().get("_LAST_AQMS_SNAPSHOT") or {}
@@ -1299,6 +1427,13 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
         except Exception:
             bucket = None
 
+        current_prev = {}
+        try:
+            if site_id is not None:
+                current_prev = previous_by_site.get(int(site_id)) or {}
+        except Exception:
+            current_prev = {}
+
         # Fallback to previously saved numeric snapshot
         prev_bucket = None
         try:
@@ -1315,8 +1450,21 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
             except Exception:
                 pass
             try:
+                if current_prev and isinstance(current_prev, dict) and current_prev.get(pollutant_label) and current_prev.get(pollutant_label).get("current") is not None:
+                    return current_prev.get(pollutant_label).get("current")
+            except Exception:
+                pass
+            try:
                 if prev_bucket and isinstance(prev_bucket, dict):
                     return prev_bucket.get(pollutant_label)
+            except Exception:
+                pass
+            return None
+
+        def _previous_value_for(pollutant_label):
+            try:
+                if current_prev and isinstance(current_prev, dict) and current_prev.get(pollutant_label):
+                    return current_prev.get(pollutant_label).get("previous")
             except Exception:
                 pass
             return None
@@ -1364,11 +1512,19 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
                 return False
 
         if not _has_arrow(r.get("pm25")):
-            r["pm25"] = _format_value_with_arrow(site_id, "PM2.5", (r.get("pm25") or "--"), _value_for("PM2.5"))
+            r["pm25"] = _format_value_with_arrow(site_id, "PM2.5", (r.get("pm25") or "--"), _value_for("PM2.5"), previous_value=_previous_value_for("PM2.5"))
         if not _has_arrow(r.get("pm10")):
-            r["pm10"] = _format_value_with_arrow(site_id, "PM10", (r.get("pm10") or "--"), _value_for("PM10"))
+            r["pm10"] = _format_value_with_arrow(site_id, "PM10", (r.get("pm10") or "--"), _value_for("PM10"), previous_value=_previous_value_for("PM10"))
         if not _has_arrow(r.get("o3")):
-            r["o3"] = _format_value_with_arrow(site_id, "O3", (r.get("o3") or "--"), _value_for("O3"))
+            r["o3"] = _format_value_with_arrow(site_id, "O3", (r.get("o3") or "--"), _value_for("O3"), previous_value=_previous_value_for("O3"))
+        if not _has_arrow(r.get("co")) and "co" in r:
+            r["co"] = _format_value_with_arrow(site_id, "CO", (r.get("co") or "--"), _value_for("CO"), previous_value=_previous_value_for("CO"))
+        if not _has_arrow(r.get("no")) and "no" in r:
+            r["no"] = _format_value_with_arrow(site_id, "NO", (r.get("no") or "--"), _value_for("NO"), previous_value=_previous_value_for("NO"))
+        if not _has_arrow(r.get("no2")) and "no2" in r:
+            r["no2"] = _format_value_with_arrow(site_id, "NO2", (r.get("no2") or "--"), _value_for("NO2"), previous_value=_previous_value_for("NO2"))
+        if not _has_arrow(r.get("nox")) and "nox" in r:
+            r["nox"] = _format_value_with_arrow(site_id, "NOX", (r.get("nox") or "--"), _value_for("NOX"), previous_value=_previous_value_for("NOX"))
         out.append(r)
     return out
 
@@ -1431,7 +1587,7 @@ def _hex_to_rgba(value, alpha):
     return f"rgba({r}, {g}, {b}, {alpha_num})"
 
 
-def _format_value_with_arrow(site_id, pollutant_label, value_label, value_num):
+def _format_value_with_arrow(site_id, pollutant_label, value_label, value_num, previous_value=None):
     """Return a display label with an up/down arrow when value changed since last snapshot.
 
     Compares against the in-process `_LAST_AQMS_SNAPSHOT` per-site values.
@@ -1442,22 +1598,23 @@ def _format_value_with_arrow(site_id, pollutant_label, value_label, value_num):
     except Exception:
         val_num = None
 
-    prev_sites = (_LAST_AQMS_SNAPSHOT or {}).get("sites") or {}
-    prev_val = None
-    try:
-        if site_id is not None:
-            prev_entry = prev_sites.get(int(site_id))
-            if isinstance(prev_entry, dict):
-                prev_val = prev_entry.get(pollutant_label)
-    except Exception:
-        prev_val = None
+    prev_val = previous_value
+    if prev_val is None:
+        prev_sites = (_LAST_AQMS_SNAPSHOT or {}).get("sites") or {}
+        try:
+            if site_id is not None:
+                prev_entry = prev_sites.get(int(site_id))
+                if isinstance(prev_entry, dict):
+                    prev_val = prev_entry.get(pollutant_label)
+        except Exception:
+            prev_val = None
 
     arrow = ""
     if prev_val is not None and val_num is not None:
         try:
             prev_num = float(prev_val)
             diff = val_num - prev_num
-            if abs(diff) >= 0.1:
+            if diff > 1e-9:
                 arrow = " ↑" if diff > 0 else " ↓"
         except Exception:
             arrow = ""
@@ -1738,6 +1895,110 @@ def _overview_build_trends_figure(hours=48):
         tickfont=dict(size=10),
     )
     fig.update_yaxes(showgrid=False, tickfont=dict(size=12))
+    return fig
+
+
+@lru_cache(maxsize=64)
+def _fetch_monitor_region_history(site_ids_tuple, start_iso, end_iso):
+    site_ids = []
+    for site_id in site_ids_tuple or ():
+        try:
+            site_ids.append(int(site_id))
+        except Exception:
+            continue
+    if not site_ids:
+        return []
+
+    parameter_codes = []
+    for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
+        code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
+        if code and code not in parameter_codes:
+            parameter_codes.append(code)
+
+    try:
+        return fetch_observation_history(site_ids, parameter_codes, start_iso, end_iso, timeout=15)
+    except Exception:
+        return []
+
+
+def _monitor_region_series_figure(history_rows, pollutant_label, start_dt, end_dt, region_label, station_name):
+    pollutant_code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
+    values_by_time = {}
+    for item in history_rows or []:
+        param = item.get("Parameter") or {}
+        if str(param.get("ParameterCode") or "").strip() != str(pollutant_code):
+            continue
+        ts = _parse_aqms_time_point(item)
+        if ts is None or ts < start_dt or ts > end_dt:
+            continue
+        value = item.get("Value")
+        try:
+            value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is None:
+            continue
+        values_by_time[ts.replace(minute=0, second=0, microsecond=0)] = value
+
+    x_times = []
+    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
+    end_cursor = end_dt.replace(minute=0, second=0, microsecond=0)
+    while cursor <= end_cursor:
+        x_times.append(cursor)
+        cursor = cursor + timedelta(hours=1)
+
+    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
+    y_values = [values_by_time.get(ts) for ts in x_times]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=x_times,
+            y=y_values,
+            name=station_name,
+            marker=dict(color="#6d28d9"),
+            opacity=0.9,
+            hovertemplate=f"<b>{station_name}</b><br>%{{x|%d %b %H:%M}}<br>%{{y:.1f}} {units}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        height=260,
+        margin=dict(l=56, r=20, t=36, b=34),
+        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
+        hovermode="x",
+        showlegend=False,
+        bargap=0.22,
+        title=dict(text=f"{pollutant_label} — {station_name}", x=0.01, y=0.98, xanchor="left", font=dict(size=16)),
+    )
+    fig.update_xaxes(
+        title_text="Time (AEST)",
+        showgrid=True,
+        gridcolor="#e2e8f0",
+        tickformat="%H:%M<br>%d %b",
+        nticks=6,
+        ticks="outside",
+        tickfont=dict(size=10),
+    )
+    fig.update_yaxes(
+        title_text=f"{pollutant_display(pollutant_label)} ({units})",
+        showgrid=True,
+        gridcolor="#e2e8f0",
+        zeroline=False,
+        tickfont=dict(size=11),
+    )
+
+    if not fig.data:
+        fig.add_annotation(
+            text="No AQMS observations found for this pollutant and region.",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(family=BASE_FONT_FAMILY, size=14, color="#475569"),
+        )
+
     return fig
 
 
@@ -4265,13 +4526,18 @@ def render_monitor_highest_purpleair(monitor_store):
     [Input("monitor-store", "data"), Input("monitor-pollutant", "value"), Input("monitor-source", "value")],
 )
 def render_monitor_top_boxes(monitor_store, pollutant_label, source):
-    """Render up to 5 top boxes for AQMS and PurpleAir based on the selected pollutant."""
+    """Render top boxes for AQMS (PM2.5/PM10/O3) and PurpleAir (selected pollutant)."""
     monitor_store = monitor_store or {}
-    pollutant = pollutant_label or "PM2.5"
+    current_label = datetime.now(SYDNEY_TZ).strftime("%Y-%m-%d %H:%M")
+    selected_pollutant = pollutant_label or "PM2.5"
     # Map pollutant to store keys for AQMS
     key_map = {"PM2.5": "aqmsPm25Rows", "PM10": "aqmsPm10Rows", "O3": "aqmsO3Rows"}
-    aqms_rows = monitor_store.get(key_map.get(pollutant, "aqmsPm25Rows")) or []
-    purple_rows = monitor_store.get("purpleairSensors") or []
+    purple_snapshot = monitor_store.get("purpleairSnapshot") or {}
+    purple_rows_pm25 = _purpleair_rows_for_pollutant((purple_snapshot or {}).get("sensors") or [], "PM2.5")
+    purple_rows_pm10 = _purpleair_rows_for_pollutant((purple_snapshot or {}).get("sensors") or [], "PM10")
+    card_backgrounds = ["#f8fafc", "#eff6ff", "#f0fdf4", "#fff7ed", "#fdf2f8"]
+    purple_backgrounds_pm25 = ["#f7f3ff", "#f3edff", "#efe7ff", "#e9e0ff", "#e4d8ff"]
+    purple_backgrounds_pm10 = ["#efe1ff", "#e7d5ff", "#ddc7ff", "#d2baff", "#c9aefc"]
 
     def top_n(rows, n=5):
         selected = []
@@ -4286,10 +4552,7 @@ def render_monitor_top_boxes(monitor_store, pollutant_label, source):
         selected.sort(key=lambda x: x[0], reverse=True)
         return [r for _, r in selected[:n]]
 
-    aqms_top = top_n(aqms_rows, 5) if source in ("both", "aqms") else []
-    pa_top = top_n(purple_rows, 5) if source in ("both", "purpleair") else []
-
-    def box_for_row(r):
+    def box_for_row(r, pollutant, src_label, card_index=0, background_colour=None):
         station = r.get("station") or r.get("name") or "--"
         value = r.get("value") if r.get("value") is not None else r.get("pm25") or r.get("pm10")
         try:
@@ -4300,31 +4563,105 @@ def render_monitor_top_boxes(monitor_store, pollutant_label, source):
         value_label = "--" if v is None else f"{v:.1f} {units}"
         category_label = r.get("category") or "No data"
         colour = r.get("category_color") or "#9ca3af"
-        # Use station text as the index for the clickable id
         station_key = str(station)
+        # IDs must be unique across all rendered boxes; include pollutant + source.
+        box_index = f"{src_label}|{pollutant}|{station_key}"
+        if background_colour is None:
+            background_colour = card_backgrounds[card_index % len(card_backgrounds)]
         return html.Button(
             [
                 html.Div(station, className="monitor-top-box__station"),
                 html.Div(category_label, className="monitor-top-box__category", style={"backgroundColor": colour, "color": "#fff"}),
                 html.Div(value_label, className="monitor-top-box__value"),
             ],
-            id={"type": "monitor-top-box", "index": station_key},
+            id={"type": "monitor-top-box", "index": box_index},
             n_clicks=0,
             className="monitor-top-box",
-            style={"width": "150px", "padding": "10px", "borderRadius": "8px", "background": "#fff", "boxShadow": "0 1px 4px rgba(2,6,23,0.08)", "marginRight": "10px", "textAlign": "center", "border": "none", "cursor": "pointer"},
+            style={
+                "padding": "10px",
+                "borderRadius": "8px",
+                "backgroundColor": background_colour,
+                "boxShadow": "0 1px 4px rgba(2,6,23,0.08)",
+                "textAlign": "center",
+                "border": "1px solid rgba(148, 163, 184, 0.18)",
+                "cursor": "pointer",
+            },
         )
 
-    rows = []
-    if aqms_top:
-        rows.append(html.Div([html.H4(f"Top {len(aqms_top)} AQMS ({pollutant})", style={"marginTop": "6px", "marginBottom": "8px"})]))
-        rows.append(html.Div([box_for_row(r) for r in aqms_top], style={"display": "flex", "gap": "10px", "flexWrap": "nowrap", "overflowX": "auto"}))
-    if pa_top:
-        rows.append(html.Div([html.H4(f"Top {len(pa_top)} PurpleAir ({pollutant})", style={"marginTop": "12px", "marginBottom": "8px"})]))
-        rows.append(html.Div([box_for_row(r) for r in pa_top], style={"display": "flex", "gap": "10px", "flexWrap": "nowrap", "overflowX": "auto"}))
+    def panel_title(label):
+        return html.Div(
+            [
+                html.Span(label),
+                html.Span(f" @ {current_label}", style={"color": "#94a3b8", "fontWeight": "500", "fontSize": "0.92rem"}),
+            ],
+            className="monitor-top-panel__title",
+        )
 
-    if not rows:
+    panels = []
+
+    # AQMS: always show PM2.5 + PM10 + O3 rows so the boxes are visible without switching filters.
+    if source in ("both", "aqms"):
+        sections = []
+        for pollutant in ["PM2.5", "PM10", "O3"]:
+            aqms_rows = monitor_store.get(key_map.get(pollutant, "aqmsPm25Rows")) or []
+            aqms_top = top_n(aqms_rows, 5)
+            if not aqms_top:
+                continue
+            sections.append(
+                html.Div(
+                    [
+                        html.Div(pollutant, className="monitor-top-section__title"),
+                        html.Div([box_for_row(r, pollutant, "AQMS", card_index=i) for i, r in enumerate(aqms_top)], className="monitor-top-box-grid"),
+                    ],
+                    className="monitor-top-section",
+                )
+            )
+        if sections:
+            panels.append(
+                html.Div(
+                    [
+                        panel_title("Top AQMS Stations by Pollutant"),
+                        html.Div(sections, className="monitor-top-panel__body"),
+                    ],
+                    className="monitor-top-panel",
+                )
+            )
+
+    if source in ("both", "purpleair"):
+        purple_sections = []
+        for pollutant, rows, palette in [
+            ("PM2.5", purple_rows_pm25, purple_backgrounds_pm25),
+            ("PM10", purple_rows_pm10, purple_backgrounds_pm10),
+        ]:
+            pa_top = top_n(rows, 5)
+            if not pa_top:
+                continue
+            purple_sections.append(
+                html.Div(
+                    [
+                        html.Div(pollutant, className="monitor-top-section__title"),
+                        html.Div(
+                            [box_for_row(r, pollutant, "PurpleAir", card_index=i, background_colour=palette[i % len(palette)]) for i, r in enumerate(pa_top)],
+                            className="monitor-top-box-grid",
+                        ),
+                    ],
+                    className="monitor-top-section",
+                )
+            )
+        if purple_sections:
+            panels.append(
+                html.Div(
+                    [
+                        panel_title("Top PurpleAir Stations by Pollutant"),
+                        html.Div(purple_sections, className="monitor-top-panel__body"),
+                    ],
+                    className="monitor-top-panel",
+                )
+            )
+
+    if not panels:
         return html.Div("No top observations available", className="card-hint")
-    return html.Div(rows)
+    return html.Div(panels, className="monitor-top-panels")
 
 
 @app.callback(Output("monitor-station", "value"), [Input({"type": "monitor-top-box", "index": MATCH}, "n_clicks")], [State({"type": "monitor-top-box", "index": MATCH}, "id")], prevent_initial_call=True)
@@ -4332,7 +4669,9 @@ def monitor_top_box_clicked(n_clicks, box_id):
     if not n_clicks:
         return no_update
     # box_id is a dict {'type':'monitor-top-box','index': station_key}
-    station_key = (box_id or {}).get("index")
+    index = (box_id or {}).get("index") or ""
+    # index format: "<source>|<pollutant>|<station>"
+    station_key = str(index).split("|", 2)[-1] if index else None
     return station_key
 
 
@@ -4897,7 +5236,12 @@ app.layout = html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
-                                                                            html.H4("Station ranking (current snapshot)"),
+                                                                            html.H4(
+                                                                                [
+                                                                                    "Air quality outlook @ ",
+                                                                                    html.Span(id="monitor-outlook-time", className="monitor-outlook-time"),
+                                                                                ]
+                                                                            ),
                                                                             html.Button(
                                                                                 "View all stations →",
                                                                                 id="monitor-view-all",
@@ -4912,15 +5256,13 @@ app.layout = html.Div(
                                                                         columns=[
                                                                             {"name": "Station", "id": "station"},
                                                                             {"name": "Region", "id": "region"},
-                                                                            {"name": "Hour", "id": "hour"},
-                                                                            {"name": "Source", "id": "source"},
-                                                                            {"name": "PM2.5", "id": "pm25"},
-                                                                            {"name": "PM10", "id": "pm10"},
-                                                                            {"name": "O3", "id": "o3"},
-                                                                            {"name": "Category", "id": "category"},
+                                                                            {"name": "PM2.5", "id": "pm25_badge", "presentation": "markdown"},
+                                                                            {"name": "PM10", "id": "pm10_badge", "presentation": "markdown"},
+                                                                            {"name": "O3", "id": "o3_badge", "presentation": "markdown"},
                                                                         ],
                                                                         data=[],
-                                                                        page_size=8,
+                                                                        page_size=10,
+                                                                        markdown_options={"html": True},
                                                                         style_table={"overflowX": "auto"},
                                                                         style_cell={
                                                                             "fontFamily": BASE_FONT_FAMILY,
@@ -4936,10 +5278,9 @@ app.layout = html.Div(
                                                                             "color": "#0f172a",
                                                                         },
                                                                         style_cell_conditional=[
-                                                                            {"if": {"column_id": "category"}, "textAlign": "center", "fontWeight": "900"},
-                                                                            {"if": {"column_id": "pm25"}, "textAlign": "right"},
-                                                                            {"if": {"column_id": "pm10"}, "textAlign": "right"},
-                                                                            {"if": {"column_id": "o3"}, "textAlign": "right"},
+                                                                            {"if": {"column_id": "pm25_badge"}, "textAlign": "center"},
+                                                                            {"if": {"column_id": "pm10_badge"}, "textAlign": "center"},
+                                                                            {"if": {"column_id": "o3_badge"}, "textAlign": "center"},
                                                                         ],
                                                                         style_data={"borderBottom": "1px solid #eef2f7"},
                                                                         style_data_conditional=[],
@@ -4968,17 +5309,19 @@ app.layout = html.Div(
                                                                         columns=[
                                                                             {"name": "Station", "id": "station"},
                                                                             {"name": "Region", "id": "region"},
-                                                                            {"name": "Hour", "id": "hour"},
-                                                                            {"name": "Source", "id": "source"},
-                                                                            {"name": "PM2.5", "id": "pm25"},
-                                                                            {"name": "PM10", "id": "pm10"},
-                                                                            {"name": "O3", "id": "o3"},
-                                                                            {"name": "Category", "id": "category"},
+                                                                            {"name": "PM2.5", "id": "pm25_badge", "presentation": "markdown"},
+                                                                            {"name": "PM10", "id": "pm10_badge", "presentation": "markdown"},
+                                                                            {"name": "O3", "id": "o3_badge", "presentation": "markdown"},
+                                                                            {"name": "CO", "id": "co_badge", "presentation": "markdown"},
+                                                                            {"name": "NO", "id": "no_badge", "presentation": "markdown"},
+                                                                            {"name": "NO2", "id": "no2_badge", "presentation": "markdown"},
+                                                                            {"name": "NOX", "id": "nox_badge", "presentation": "markdown"},
                                                                         ],
                                                                                 data=[],
                                                                                 page_size=20,
                                                                                 sort_action="native",
                                                                                 filter_action="native",
+                                                                                markdown_options={"html": True},
                                                                                 style_table={"overflowX": "auto"},
                                                                                 style_cell={
                                                                                     "fontFamily": BASE_FONT_FAMILY,
@@ -4994,10 +5337,13 @@ app.layout = html.Div(
                                                                                     "color": "#0f172a",
                                                                                 },
                                                                                 style_cell_conditional=[
-                                                                                    {"if": {"column_id": "category"}, "textAlign": "center", "fontWeight": "900"},
-                                                                                    {"if": {"column_id": "pm25"}, "textAlign": "right"},
-                                                                                    {"if": {"column_id": "pm10"}, "textAlign": "right"},
-                                                                                    {"if": {"column_id": "o3"}, "textAlign": "right"},
+                                                                                    {"if": {"column_id": "pm25_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "pm10_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "o3_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "co_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "no_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "no2_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "nox_badge"}, "textAlign": "center"},
                                                                                 ],
                                                                                 style_data={"borderBottom": "1px solid #eef2f7"},
                                                                                 style_data_conditional=[],
@@ -5034,6 +5380,64 @@ app.layout = html.Div(
                                                     ),
                                                 ],
                                                 className="monitor-main",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Regional pollutant time series"),
+                                                            html.P("Last 24 hours for one AQMS station in the selected region.", className="monitor-region-series-subtitle"),
+                                                        ],
+                                                        className="monitor-region-series-heading",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.Label("Region"),
+                                                                    dcc.Dropdown(
+                                                                        id="monitor-region-series",
+                                                                        options=MONITOR_REGION_SERIES_OPTIONS,
+                                                                        value=(MONITOR_REGION_SERIES_OPTIONS[0]["value"] if MONITOR_REGION_SERIES_OPTIONS else None),
+                                                                        clearable=False,
+                                                                    ),
+                                                                ],
+                                                                className="filter-field monitor-region-series-filter",
+                                                            ),
+                                                        ],
+                                                        className="monitor-region-series-filters",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Label("Station"),
+                                                            dcc.Dropdown(
+                                                                id="monitor-region-series-station",
+                                                                options=[],
+                                                                value=None,
+                                                                clearable=False,
+                                                            ),
+                                                        ],
+                                                        className="filter-field monitor-region-series-filter monitor-region-series-station-filter",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Label("Pollutant"),
+                                                            dcc.Dropdown(
+                                                                id="monitor-region-series-pollutant",
+                                                                options=MONITOR_POLLUTANT_OPTIONS,
+                                                                value="PM2.5",
+                                                                clearable=False,
+                                                            ),
+                                                        ],
+                                                        className="filter-field monitor-region-series-filter monitor-region-series-pollutant-filter",
+                                                    ),
+                                                    html.Div(id="monitor-region-series-note", className="monitor-region-series-note"),
+                                                    dcc.Loading(
+                                                        html.Div(id="monitor-region-series-plots", className="monitor-region-series-plots"),
+                                                        type="default",
+                                                    ),
+                                                ],
+                                                className="map-card monitor-region-series-card",
                                             ),
                                             html.Div(
                                                 [
@@ -5545,12 +5949,14 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
 
     purpleair_bounds = NSW_MAP_BOUNDS
     purpleair_payload = {"sensors": [], "fetched_at": None, "error": None}
-    if source_filter in {"both", "purpleair"} and pollutant_label in {"PM2.5", "PM10"}:
+    if on_monitor or on_overview_snapshot:
         purpleair_payload = fetch_purpleair_snapshot(bounds=purpleair_bounds, timeout=12)
         if purpleair_payload.get("error"):
             status_bits.append("PurpleAir feed: Offline")
             if error is None:
                 error = f"PurpleAir feed unavailable: {purpleair_payload.get('error')}"
+        elif purpleair_payload.get("source") in {"bundle", "cache"}:
+            status_bits.append("PurpleAir feed: Cached")
         else:
             status_bits.append("PurpleAir feed: Live")
     else:
@@ -5564,8 +5970,31 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     aqms_no2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["NO2"]["ParameterCode"], "NO2")
     aqms_so2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["SO2"]["ParameterCode"], "SO2")
     aqms_co_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["CO"]["ParameterCode"], "CO")
+    # Optional nitrogen parameters (not always present in the AQMS feed).
+    aqms_no_rows = _aqms_rows_for_pollutant(raw_obs, "NO", "NO")
+    aqms_nox_rows = _aqms_rows_for_pollutant(raw_obs, "NOX", "NOX")
     # Always compute site-level AQC (Air Quality Category) rows for the Overview tab.
     aqc_rows = _aqms_rows_for_pollutant(raw_obs, "AQC", "AQC")
+    aqms_history_rows = []
+    if on_monitor and raw_obs:
+        try:
+            history_site_ids = sorted({int(item.get("Site_Id")) for item in raw_obs if item.get("Site_Id") is not None})
+        except Exception:
+            history_site_ids = []
+        history_parameter_codes = []
+        for pollutant_name in ["PM2.5", "PM10", "O3", "CO", "NO", "NO2", "NOX"]:
+            code = (POLLUTANTS.get(pollutant_name) or {}).get("ParameterCode") or pollutant_name
+            if code and code not in history_parameter_codes:
+                history_parameter_codes.append(code)
+        if history_site_ids and history_parameter_codes:
+            now = datetime.now(SYDNEY_TZ)
+            start_date = (now.date() - timedelta(days=1)).isoformat()
+            end_date = now.date().isoformat()
+            try:
+                aqms_history_rows = fetch_observation_history(history_site_ids, history_parameter_codes, start_date, end_date, timeout=12)
+            except Exception:
+                aqms_history_rows = []
+    aqms_previous_by_site = _aqms_previous_hour_values_by_site(raw_obs, aqms_history_rows)
 
     # Meteorology-capable AQMS sites (from latest snapshot, used to keep history calls small).
     met_site_ids_by_region = {}
@@ -5604,7 +6033,9 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         "PM2.5": aqms_pm25_rows,
         "PM10": aqms_pm10_rows,
         "O3": aqms_o3_rows,
+        "NO": aqms_no_rows,
         "NO2": aqms_no2_rows,
+        "NOX": aqms_nox_rows,
         "SO2": aqms_so2_rows,
         "CO": aqms_co_rows,
         "AQC": aqc_rows,
@@ -5653,8 +6084,8 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     latest_label = _format_monitor_label(_monitoring_time_row(aqms_rows)) if aqms_rows else "--"
     completeness = _data_completeness(aqms_rows, purpleair_sensors if source_filter in {"both", "purpleair"} else [])
     kpis = _monitor_kpi_payload(aqms_rows, purpleair_sensors, clusters, latest_label, completeness)
-    table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, max_rows=40)
-    table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site)
+    table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site, max_rows=40)
+    table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site)
     feeds = {
         "aqms": {"status": "Live" if aqms_ok else "Offline"},
         "purpleair": {"status": "Live" if not purpleair_payload.get("error") else "Offline"},
@@ -5713,11 +6144,15 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         "aqmsPm10Rows": aqms_pm10_rows,
         "aqmsO3Rows": aqms_o3_rows,
         "aqmsNo2Rows": aqms_no2_rows,
+        "aqmsNoRows": aqms_no_rows,
+        "aqmsNoxRows": aqms_nox_rows,
         "aqmsSo2Rows": aqms_so2_rows,
         "aqmsCoRows": aqms_co_rows,
         "aqcRows": aqc_rows,
         "metSiteIdsByRegion": {k: sorted(list(v)) for k, v in (met_site_ids_by_region or {}).items()},
         "aqmsSnapshotBySite": aqms_snapshot_by_site,
+        "aqmsPreviousBySite": aqms_previous_by_site,
+        "purpleairSnapshot": purpleair_payload,
         "purpleairSensors": purpleair_sensors,
         "purpleairClusters": clusters,
         "mapRows": map_rows,
@@ -5831,6 +6266,7 @@ def update_monitor_station_options(monitor_store, region_value, source_value, se
         Output("monitor-map", "srcDoc"),
         Output("monitor-kpi-row", "children"),
         Output("monitor-time-label", "children"),
+        Output("monitor-outlook-time", "children"),
         Output("monitor-table", "data"),
         Output("monitor-table", "style_data_conditional"),
         Output("monitor-network-status", "children"),
@@ -5870,8 +6306,10 @@ def render_monitoring(monitor_store, monitor_settings):
         return True
 
     # Re-attach arrows to table rows using latest snapshot info, then apply filters.
-    table_rows = _attach_arrows_to_table_rows(table_rows, monitor_store.get("aqmsSnapshotBySite"))
-    table_rows_all = _attach_arrows_to_table_rows(table_rows_all, monitor_store.get("aqmsSnapshotBySite"))
+    table_rows = _attach_arrows_to_table_rows(table_rows, monitor_store.get("aqmsSnapshotBySite"), monitor_store.get("aqmsPreviousBySite"))
+    table_rows_all = _attach_arrows_to_table_rows(table_rows_all, monitor_store.get("aqmsSnapshotBySite"), monitor_store.get("aqmsPreviousBySite"))
+    table_rows = _inject_badges_into_monitor_rows(table_rows)
+    table_rows_all = _inject_badges_into_monitor_rows(table_rows_all)
     map_rows = [row for row in map_rows if _match_station(row)]
     table_rows = [row for row in table_rows if _match_station(row)]
     table_rows_all = [row for row in table_rows_all if _match_station(row)]
@@ -5884,6 +6322,7 @@ def render_monitoring(monitor_store, monitor_settings):
     return (
         map_html,
         kpi_nodes,
+        latest_label,
         latest_label,
         table_rows,
         style_conditional,
@@ -7662,6 +8101,40 @@ def _monitor_from_key(monitor_key):
     return None
 
 
+def _haversine_meters(lat1, lon1, lat2, lon2):
+    try:
+        lat1 = float(lat1)
+        lon1 = float(lon1)
+        lat2 = float(lat2)
+        lon2 = float(lon2)
+    except (TypeError, ValueError):
+        return None
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return 6371000.0 * c
+
+
+def _nearest_aqms_site(lat, lon):
+    best_site = None
+    best_distance = None
+    for site in (_sites_by_id() or {}).values():
+        site_lat = site.get("Latitude")
+        site_lon = site.get("Longitude")
+        if site_lat is None or site_lon is None:
+            continue
+        distance = _haversine_meters(lat, lon, site_lat, site_lon)
+        if distance is None:
+            continue
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_site = site
+    return best_site, best_distance
+
+
 def _parse_aqms_time_point(item):
     date_text = item.get("Date")
     hour = item.get("Hour")
@@ -8229,6 +8702,112 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
         selected_children.append(html.Div(mini_strip_nodes, className="monitor-mini-strips"))
 
     return html.Div(selected_children, className="selected-site__wrap"), compare_fig, compare_summary, trend_fig
+
+
+@app.callback(
+    [Output("monitor-region-series-station", "options"), Output("monitor-region-series-station", "value")],
+    [Input("monitor-region-series", "value"), Input("selected-monitor-site-store", "data")],
+)
+def sync_monitor_region_series_station(region_value, selected_monitor_site):
+    options = _monitor_region_series_station_options(region_value)
+    if not options:
+        return [], None
+
+    selected_value = None
+    try:
+        if isinstance(selected_monitor_site, dict) and str(selected_monitor_site.get("source") or "").strip() == "AQMS":
+            selected_candidate = f"aqms:{int(selected_monitor_site.get('id'))}"
+            if any(option.get("value") == selected_candidate for option in options):
+                selected_value = selected_candidate
+    except Exception:
+        selected_value = None
+
+    if selected_value is None:
+        selected_value = options[0]["value"]
+
+    return options, selected_value
+
+
+@app.callback(
+    [
+        Output("monitor-region-series-note", "children"),
+        Output("monitor-region-series-plots", "children"),
+    ],
+    [
+        Input("monitor-store", "data"),
+        Input("monitor-region-series", "value"),
+        Input("monitor-region-series-station", "value"),
+        Input("monitor-region-series-pollutant", "value"),
+        Input("selected-monitor-site-store", "data"),
+    ],
+)
+def render_monitor_region_series(monitor_store, region_value, station_value, pollutant_value, selected_monitor_site):
+    monitor_store = monitor_store or {}
+    region_value = str(region_value or "ALL").strip()
+    if not region_value or region_value.upper() == "ALL":
+        if MONITOR_REGION_SERIES_OPTIONS:
+            region_value = str(MONITOR_REGION_SERIES_OPTIONS[0].get("value") or "").strip()
+        else:
+            region_value = ""
+
+    region_label = next((option.get("label") for option in MONITOR_REGION_SERIES_OPTIONS if str(option.get("value") or "").strip() == region_value), title_case_station_name(region_value) or "Selected region")
+    station_options = _monitor_region_series_station_options(region_value)
+    if not station_options:
+        note = html.Div("No AQMS stations found for the selected region.", className="monitor-region-series-empty")
+        return note, []
+
+    station_value = str(station_value or "").strip()
+    if station_value not in {option["value"] for option in station_options}:
+        try:
+            if isinstance(selected_monitor_site, dict) and str(selected_monitor_site.get("source") or "").strip() == "AQMS":
+                selected_candidate = f"aqms:{int(selected_monitor_site.get('id'))}"
+                if selected_candidate in {option["value"] for option in station_options}:
+                    station_value = selected_candidate
+        except Exception:
+            station_value = ""
+    if station_value not in {option["value"] for option in station_options}:
+        station_value = station_options[0]["value"]
+
+    try:
+        selected_site_id = int(str(station_value).split(":", 1)[1])
+    except Exception:
+        selected_site_id = None
+    if selected_site_id is None:
+        note = html.Div("No AQMS station selected.", className="monitor-region-series-empty")
+        return note, []
+
+    site_lookup = _sites_by_id()
+    station = site_lookup.get(selected_site_id) or {}
+    station_name = title_case_station_name(station.get("SiteName") or station.get("StationName") or f"Site {selected_site_id}")
+    pollutant_label = str(pollutant_value or "PM2.5").strip() or "PM2.5"
+    pollutant_code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
+
+    now = datetime.now(SYDNEY_TZ).replace(minute=0, second=0, microsecond=0)
+    start_dt = now - timedelta(hours=24)
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:00:00")
+    end_iso = now.strftime("%Y-%m-%dT%H:00:00")
+    history_rows = fetch_observation_history([selected_site_id], [pollutant_code], start_iso, end_iso, timeout=15) or []
+
+    fig = _monitor_region_series_figure(history_rows, pollutant_label, start_dt, now, region_label, station_name)
+    plot_cards = [
+        html.Div(
+            dcc.Graph(
+                figure=fig,
+                config={"displayModeBar": False, "responsive": True},
+                className="monitor-region-series-graph",
+            ),
+            className="monitor-region-series-plot-card",
+        )
+    ]
+
+    note = html.Div(
+        [
+            html.Span(f"{region_label}", className="monitor-region-series-note__region"),
+            html.Span(f" • {station_name} • {pollutant_label} • last 24 hours", className="monitor-region-series-note__meta"),
+        ],
+        className="monitor-region-series-note__text",
+    )
+    return note, plot_cards
 
 
 @app.callback(

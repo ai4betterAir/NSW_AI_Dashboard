@@ -7,12 +7,14 @@ export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 usage() {
   cat <<'EOF'
 Usage:
-  run_dashboard.sh [--open] [--force]
+  run_dashboard.sh [--open] [--force] [--daemon]
 
 Options:
   --open   Try to open the dashboard URL in a browser on this machine.
   --force  If the selected PORT is already in use, try to stop a prior
            dashboard process owned by you and restart.
+  --daemon Start the dashboard and exit immediately (leave it running in
+           the background). Writes dashboard.pid and dashboard.log.
 
 Environment:
   PORT=8050           Bind port (default: 8050)
@@ -20,6 +22,7 @@ Environment:
   DASHBOARD_READY_TIMEOUT=60   Seconds to wait for /debug-page (default: 60)
   OPEN_BROWSER=1      Same as --open
   FORCE_RESTART=1     Same as --force
+  DASHBOARD_DAEMON=1  Same as --daemon
   DASHBOARD_LOG=path  Log file (default: dashboard.log)
   DASHBOARD_LOG_APPEND=1  Append to log (default: overwrite)
   OPEN_BROWSER_REMOTE=1   Allow browser open over SSH
@@ -30,6 +33,7 @@ EOF
 OPEN_BROWSER="${OPEN_BROWSER:-0}"
 FORCE_RESTART="${FORCE_RESTART:-0}"
 OPEN_BROWSER_REMOTE="${OPEN_BROWSER_REMOTE:-0}"
+DASHBOARD_DAEMON="${DASHBOARD_DAEMON:-0}"
 while [[ $# -gt 0 ]]; do
   case "${1}" in
     -h|--help)
@@ -42,6 +46,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force)
       FORCE_RESTART=1
+      shift
+      ;;
+    --daemon)
+      DASHBOARD_DAEMON=1
       shift
       ;;
     *)
@@ -165,7 +173,13 @@ if [[ "${DASHBOARD_LOG_APPEND}" == "1" ]]; then
 else
   : >"${DASHBOARD_LOG}"
 fi
-PORT="${PORT}" "${PYTHON_BIN}" dashboard/dash_app.py >>"${DASHBOARD_LOG}" 2>&1 &
+if [[ "${DASHBOARD_DAEMON}" == "1" ]]; then
+  # In a non-interactive shell, background jobs can receive SIGHUP when the
+  # parent shell exits. `nohup` ensures the dashboard keeps running.
+  nohup env PORT="${PORT}" "${PYTHON_BIN}" dashboard/dash_app.py >>"${DASHBOARD_LOG}" 2>&1 </dev/null &
+else
+  PORT="${PORT}" "${PYTHON_BIN}" dashboard/dash_app.py >>"${DASHBOARD_LOG}" 2>&1 &
+fi
 dash_pid="$!"
 echo "${dash_pid}" > dashboard.pid
 
@@ -175,7 +189,9 @@ cleanup() {
   fi
   rm -f dashboard.pid >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+if [[ "${DASHBOARD_DAEMON}" != "1" ]]; then
+  trap cleanup EXIT INT TERM
+fi
 
 ready_url="http://${DASHBOARD_HOST}:${PORT}/debug-page"
 READY_TIMEOUT="${DASHBOARD_READY_TIMEOUT:-60}"
@@ -228,6 +244,12 @@ if [[ "${ready_ok}" != "1" ]]; then
 fi
 echo "Ready in $((end_ts - start_ts))s (checked ${ready_url})."
 echo "Dashboard is running (pid=${dash_pid}). Press Ctrl+C to stop."
+
+if [[ "${DASHBOARD_DAEMON}" == "1" ]]; then
+  echo "Daemon mode enabled (--daemon): leaving dashboard running in the background."
+  echo "To stop it later: kill $(cat dashboard.pid)  (or rerun with --force)"
+  exit 0
+fi
 
 if command -v curl >/dev/null 2>&1; then
   echo "Healthcheck: / -> $(curl -fsS -o /dev/null -w 'HTTP %{http_code} %{time_total}s' "http://${DASHBOARD_HOST}:${PORT}/" 2>/dev/null || echo 'FAILED')"
