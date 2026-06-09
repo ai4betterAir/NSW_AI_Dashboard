@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Dashboard Redirect</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f4f6f8;
+      color: #1f2933;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    main {
+      width: min(560px, 100%);
+      background: #ffffff;
+      border: 1px solid #d8dee6;
+      border-radius: 8px;
+      padding: 28px;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      line-height: 1.25;
+    }
+
+    p {
+      margin: 0 0 18px;
+      line-height: 1.5;
+    }
+
+    a.button {
+      display: inline-block;
+      max-width: 100%;
+      box-sizing: border-box;
+      padding: 11px 16px;
+      border-radius: 6px;
+      background: #005eb8;
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      margin-top: 18px;
+      padding: 12px;
+      background: #eef2f6;
+      border-radius: 6px;
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Opening AI Dashboard</h1>
+    <p id="message">Finding the current dashboard link...</p>
+    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open dashboard</a></p>
+    <div id="status" class="status">Waiting for link data.</div>
+  </main>
+
+  <script>
+    async function loadCurrentLink() {
+      const status = document.getElementById("status");
+      const message = document.getElementById("message");
+      const link = document.getElementById("open-link");
+
+      try {
+        const response = await fetch(`current.json?ts=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`current.json returned ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (!data.url || !/^https:\/\/[a-z0-9.-]+\.lhr\.life\/?$/.test(data.url)) {
+          throw new Error("No valid dashboard URL is published yet.");
+        }
+
+        link.href = data.url;
+        link.removeAttribute("aria-disabled");
+        link.textContent = data.url;
+        message.textContent = "Redirecting to the current dashboard link...";
+        status.textContent = `Last updated: ${data.updated_at || "unknown"}`;
+
+        window.setTimeout(() => {
+          window.location.href = data.url;
+        }, 1500);
+      } catch (error) {
+        message.textContent = "The current dashboard link is not available yet.";
+        status.textContent = error.message;
+      }
+    }
+
+    loadCurrentLink();
+  </script>
+</body>
+</html>
