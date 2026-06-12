@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Dashboard Redirect</title>
+  <title>NSW Air Quality Forecasting Dashboard</title>
   <style>
     :root {
       color-scheme: light;
@@ -53,57 +53,167 @@
       overflow-wrap: anywhere;
     }
 
-    .status {
-      margin-top: 18px;
+    .current-url {
+      margin: 0 0 18px;
       padding: 12px;
-      background: #eef2f6;
+      border: 1px solid #c9d6e2;
       border-radius: 6px;
+      background: #f8fafc;
       font-size: 14px;
       overflow-wrap: anywhere;
+    }
+
+    .current-url a {
+      color: #005eb8;
+      font-weight: 700;
     }
   </style>
 </head>
 <body>
   <main>
-    <h1>Opening AI Dashboard</h1>
-    <p id="message">Finding the current dashboard link...</p>
-    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open dashboard</a></p>
-    <div id="status" class="status">Waiting for link data.</div>
+    <h1>NSW Air Quality Forecasting Dashboard</h1>
+    <p id="message">Finding the current live dashboard...</p>
+    <div id="current-url" class="current-url" hidden></div>
+    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open NSW Air Quality Forecasting Dashboard</a></p>
   </main>
 
   <script>
+    const linkSources = [
+      "current.json",
+      "https://raw.githubusercontent.com/ai4betterAir/ai4betterAir.github.io/main/current.json"
+    ];
+
+    function isValidDashboardUrl(url) {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === "https:" && parsed.hostname.endsWith(".lhr.life");
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function updatedTime(data) {
+      const time = Date.parse(data.updated_at || "");
+      return Number.isFinite(time) ? time : 0;
+    }
+
+    function candidatesFromData(data) {
+      const candidates = [];
+
+      if (!data || typeof data !== "object") {
+        return candidates;
+      }
+
+      if (isValidDashboardUrl(data.url)) {
+        candidates.push({
+          url: data.url,
+          updated_at: data.updated_at || ""
+        });
+      }
+
+      if (Array.isArray(data.urls)) {
+        for (const item of data.urls) {
+          const candidate = typeof item === "string" ? { url: item, updated_at: data.updated_at || "" } : item;
+          if (candidate && isValidDashboardUrl(candidate.url)) {
+            candidates.push({
+              url: candidate.url,
+              updated_at: candidate.updated_at || data.updated_at || ""
+            });
+          }
+        }
+      }
+
+      return candidates;
+    }
+
+    async function probeDashboardUrl(url, timeoutMs = 2500) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        await fetch(url, {
+          method: "GET",
+          mode: "no-cors",
+          cache: "no-store",
+          signal: controller.signal
+        });
+        return true;
+      } catch (error) {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function fetchLinkSource(source) {
+      const separator = source.includes("?") ? "&" : "?";
+      const response = await fetch(`${source}${separator}ts=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`${source} returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      const candidates = candidatesFromData(data);
+      if (!candidates.length) {
+        throw new Error(`${source} has no valid dashboard URL`);
+      }
+
+      return candidates;
+    }
+
     async function loadCurrentLink() {
-      const status = document.getElementById("status");
       const message = document.getElementById("message");
       const link = document.getElementById("open-link");
+      const currentUrl = document.getElementById("current-url");
 
       try {
-        const response = await fetch(`current.json?ts=${Date.now()}`, { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(`current.json returned ${response.status}`);
+        const results = await Promise.allSettled(linkSources.map(fetchLinkSource));
+        const links = results
+          .filter((result) => result.status === "fulfilled")
+          .flatMap((result) => result.value)
+          .filter((data, index, all) => all.findIndex((item) => item.url === data.url) === index)
+          .sort((left, right) => updatedTime(right) - updatedTime(left));
+
+        if (!links.length) {
+          const errors = results
+            .filter((result) => result.status === "rejected")
+            .map((result) => result.reason.message)
+            .join("; ");
+          throw new Error(errors || "No valid dashboard URL is published yet.");
         }
 
-        const data = await response.json();
-        if (!data.url || !/^https:\/\/[a-z0-9.-]+\.lhr\.life\/?$/.test(data.url)) {
-          throw new Error("No valid dashboard URL is published yet.");
+        let data = null;
+        for (const candidate of links) {
+          if (await probeDashboardUrl(candidate.url)) {
+            data = candidate;
+            break;
+          }
+        }
+        if (!data) {
+          data = links[0];
         }
 
         link.href = data.url;
         link.removeAttribute("aria-disabled");
-        link.textContent = data.url;
-        message.textContent = "Redirecting to the current dashboard link...";
-        status.textContent = `Last updated: ${data.updated_at || "unknown"}`;
-
-        window.setTimeout(() => {
-          window.location.href = data.url;
-        }, 1500);
+        link.textContent = "Open NSW Air Quality Forecasting Dashboard";
+        message.textContent = "The current live dashboard is ready.";
+        currentUrl.hidden = false;
+        currentUrl.innerHTML = "";
+        currentUrl.appendChild(document.createTextNode("Current live link: "));
+        const currentAnchor = document.createElement("a");
+        currentAnchor.href = data.url;
+        currentAnchor.textContent = data.url;
+        currentAnchor.rel = "noopener";
+        currentUrl.appendChild(currentAnchor);
       } catch (error) {
         message.textContent = "The current dashboard link is not available yet.";
-        status.textContent = error.message;
+        currentUrl.hidden = true;
+        link.href = "#";
+        link.setAttribute("aria-disabled", "true");
       }
     }
 
     loadCurrentLink();
+    setInterval(loadCurrentLink, 30000);
   </script>
 </body>
 </html>
