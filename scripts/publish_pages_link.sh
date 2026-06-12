@@ -9,12 +9,14 @@ URL_FILE="${URL_FILE:-$ROOT_DIR/dashboard_url.txt}"
 URL_FILES="${URL_FILES:-${URL_FILE}}"
 CURRENT_JSON="${CURRENT_JSON:-$ROOT_DIR/docs/current.json}"
 INDEX_HTML="${INDEX_HTML:-$ROOT_DIR/docs/index.html}"
+CURRENT_HTML="${CURRENT_HTML:-$ROOT_DIR/docs/current.html}"
 CNAME_FILE="${CNAME_FILE:-$ROOT_DIR/docs/CNAME}"
 URL_HISTORY_LIMIT="${URL_HISTORY_LIMIT:-5}"
 DO_PUSH=0
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-ai4betterAir/ai4betterAir.github.io}"
 GITHUB_PAGES_JSON_PATH="${GITHUB_PAGES_JSON_PATH:-current.json}"
 GITHUB_PAGES_INDEX_PATH="${GITHUB_PAGES_INDEX_PATH:-index.html}"
+GITHUB_PAGES_CURRENT_HTML_PATH="${GITHUB_PAGES_CURRENT_HTML_PATH:-current.html}"
 GITHUB_PAGES_CNAME_PATH="${GITHUB_PAGES_CNAME_PATH:-CNAME}"
 GITHUB_PAGES_BRANCH="${GITHUB_PAGES_BRANCH:-main}"
 
@@ -254,6 +256,9 @@ PY
   if [[ -f "${INDEX_HTML}" ]]; then
     update_github_file "${INDEX_HTML}" "${GITHUB_PAGES_INDEX_PATH}" || return 1
   fi
+  if [[ -f "${CURRENT_HTML}" ]]; then
+    update_github_file "${CURRENT_HTML}" "${GITHUB_PAGES_CURRENT_HTML_PATH}" || return 1
+  fi
   if [[ -f "${CNAME_FILE}" ]]; then
     update_github_file "${CNAME_FILE}" "${GITHUB_PAGES_CNAME_PATH}" || return 1
   fi
@@ -283,6 +288,9 @@ publish_with_git_clone() {
   if [[ -f "${INDEX_HTML}" ]]; then
     cp "${INDEX_HTML}" "${pages_clone}/${GITHUB_PAGES_INDEX_PATH}"
   fi
+  if [[ -f "${CURRENT_HTML}" ]]; then
+    cp "${CURRENT_HTML}" "${pages_clone}/${GITHUB_PAGES_CURRENT_HTML_PATH}"
+  fi
   if [[ -f "${CNAME_FILE}" ]]; then
     cp "${CNAME_FILE}" "${pages_clone}/${GITHUB_PAGES_CNAME_PATH}"
   fi
@@ -294,10 +302,13 @@ publish_with_git_clone() {
   if [[ -f "${INDEX_HTML}" ]]; then
     git add "${GITHUB_PAGES_INDEX_PATH}"
   fi
+  if [[ -f "${CURRENT_HTML}" ]]; then
+    git add "${GITHUB_PAGES_CURRENT_HTML_PATH}"
+  fi
   if [[ -f "${CNAME_FILE}" ]]; then
     git add "${GITHUB_PAGES_CNAME_PATH}"
   fi
-  if git diff --cached --quiet -- "${GITHUB_PAGES_JSON_PATH}" "${GITHUB_PAGES_INDEX_PATH}" "${GITHUB_PAGES_CNAME_PATH}"; then
+  if git diff --cached --quiet -- "${GITHUB_PAGES_JSON_PATH}" "${GITHUB_PAGES_INDEX_PATH}" "${GITHUB_PAGES_CURRENT_HTML_PATH}" "${GITHUB_PAGES_CNAME_PATH}"; then
     echo "GitHub Pages already up to date."
     cd "${ROOT_DIR}"
     return 0

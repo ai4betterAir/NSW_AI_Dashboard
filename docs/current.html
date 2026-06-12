@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Current NSW Air Quality Dashboard Link</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f4f6f8;
+      color: #1f2933;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    main {
+      width: min(640px, 100%);
+      background: #ffffff;
+      border: 1px solid #d8dee6;
+      border-radius: 8px;
+      padding: 28px;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      line-height: 1.25;
+    }
+
+    p {
+      margin: 0 0 18px;
+      line-height: 1.5;
+    }
+
+    a {
+      color: #005eb8;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .link-box {
+      margin: 0 0 18px;
+      padding: 12px;
+      border: 1px solid #c9d6e2;
+      border-radius: 6px;
+      background: #f8fafc;
+      overflow-wrap: anywhere;
+    }
+
+    .button {
+      display: inline-block;
+      max-width: 100%;
+      box-sizing: border-box;
+      padding: 11px 16px;
+      border-radius: 6px;
+      background: #005eb8;
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Current Live Dashboard Link</h1>
+    <p id="message">Finding the current live dashboard...</p>
+    <div id="link-box" class="link-box" hidden></div>
+    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open dashboard</a></p>
+  </main>
+
+  <script>
+    function isValidDashboardUrl(url) {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === "https:" && parsed.hostname.endsWith(".lhr.life");
+      } catch (error) {
+        return false;
+      }
+    }
+
+    async function loadCurrentLink() {
+      const message = document.getElementById("message");
+      const linkBox = document.getElementById("link-box");
+      const openLink = document.getElementById("open-link");
+
+      try {
+        const response = await fetch(`current.json?ts=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`current.json returned ${response.status}`);
+        }
+        const data = await response.json();
+        const url = data && data.url;
+        if (!isValidDashboardUrl(url)) {
+          throw new Error("No valid dashboard URL is published.");
+        }
+
+        message.textContent = "Current live dashboard:";
+        linkBox.hidden = false;
+        linkBox.innerHTML = "";
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.textContent = url;
+        anchor.rel = "noopener";
+        linkBox.appendChild(anchor);
+
+        openLink.href = url;
+        openLink.removeAttribute("aria-disabled");
+        openLink.textContent = "Open dashboard";
+      } catch (error) {
+        message.textContent = "The current dashboard link is not available yet.";
+        linkBox.hidden = true;
+        openLink.href = "#";
+        openLink.setAttribute("aria-disabled", "true");
+      }
+    }
+
+    loadCurrentLink();
+  </script>
+</body>
+</html>
