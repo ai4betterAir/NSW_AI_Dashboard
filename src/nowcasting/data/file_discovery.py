@@ -14,7 +14,7 @@ _KNOWN_POLLUTANTS = {"O3", "PM2.5", "PM10"}
 _env_data_path = os.environ.get("CSV_DATA_FILE_PATH")
 _default_data_path = DASHBOARD_DATA_DIR
 
-# Prefer the project's cnn_lstm `AI_dashboard_files` if present and non-empty.
+# Prefer the configured shared dashboard folder if present and non-empty.
 # Otherwise respect an explicit `CSV_DATA_FILE_PATH` env var, then fall back to
 # the packaged default folder so the dashboard can still render when `.env`
 # contains a placeholder.
@@ -36,10 +36,11 @@ def _parse_forecast_filename(filename):
     """Parse forecast CSV filenames into the key parameters used by the dashboard.
 
     Expected pattern (underscore-delimited, with variable-length region/model names):
-      <region>_<pollutant>_<inputs>_<horizon>_<model...>_<date>.csv
+      <region>_<pollutant>_<inputs>_<horizon>_<model...>_<date>[_<run_hour>].csv
 
     Examples:
       Central_Coast_O3_12_3_Sparse_LSTM_v1_20260521AEST.csv
+      Central_Coast_O3_12_3_Sparse_LSTM_v1_20260521_06AEST.csv
       CE_Sydney_PM2.5_12_6_Sparse_LSTM_v2_20260515AEST.csv
     """
 
@@ -52,7 +53,27 @@ def _parse_forecast_filename(filename):
     if len(parts) < 6:
         return None
 
-    date = parts[-1]
+    run_hour = None
+    date_index = len(parts) - 1
+    if (
+        len(parts) >= 2
+        and (
+            (len(parts[-1]) == 2 and parts[-1].isdigit())
+            or (
+                len(parts[-1]) == 6
+                and parts[-1][:2].isdigit()
+                and (parts[-1].endswith("AEST") or parts[-1].endswith("AEDT"))
+            )
+        )
+        and (
+            parts[-2].isdigit()
+            or parts[-2].endswith("AEST")
+            or parts[-2].endswith("AEDT")
+        )
+    ):
+        run_hour = parts[-1]
+        date_index = len(parts) - 2
+    date = parts[date_index]
 
     pollutant_idx = None
     for idx, token in enumerate(parts):
@@ -66,11 +87,11 @@ def _parse_forecast_filename(filename):
 
     # Inputs and horizon tokens should be immediately after pollutant.
     # We only keep `horizon` for the dashboard filters.
-    if pollutant_idx + 2 >= len(parts) - 1:
+    if pollutant_idx + 2 >= date_index:
         return None
     horizon = parts[pollutant_idx + 2]
 
-    model_parts = parts[pollutant_idx + 3 : -1]
+    model_parts = parts[pollutant_idx + 3 : date_index]
     if not model_parts:
         return None
     model = PARTITION.join(model_parts)
@@ -82,7 +103,7 @@ def _parse_forecast_filename(filename):
         "pollutants": pollutant,
         "timeScopes": horizon,
         "models": model,
-        "date": date,
+        "date": f"{date}_{run_hour}" if run_hour else date,
     }
 
 # Cached lists

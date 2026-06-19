@@ -40,6 +40,7 @@ from nowcasting.data.file_discovery import CSV_DATA_FILE_PATH, forecast_file_pat
 from nowcasting.data.obs_data import (
     MONITORING_CATEGORY_COLORS,
     PURPLEAIR_COLOR,
+    _OBS_CACHE_CSV,
     _load_observations_cache,
     _load_purpleair_snapshot_cache,
     fetch_observation_history,
@@ -360,6 +361,8 @@ _LAST_AQMS_SNAPSHOT = {"ts": None, "sites": {}}
 _PRIOR_AQMS_SNAPSHOT = None
 _LAST_GOOD_MONITOR_MAP_ROWS = []
 _LAST_GOOD_MONITOR_MAP_HTML = None
+_LAST_GOOD_FORECAST_MAP_HTML = None
+_LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML = None
 # Attempt to seed from disk on import so arrows survive restarts
 try:
     disk_snap = _load_last_aqms_snapshot_from_disk()
@@ -744,6 +747,52 @@ def _format_forecast_label(value):
     hour = parsed.strftime("%I").lstrip("0") or "0"
     meridiem = parsed.strftime("%p")
     return f"{hour}{meridiem} / {parsed.day} {parsed.strftime('%b %Y')}"
+
+
+def _forecast_datetime_sydney(value):
+    parsed = _parse_forecast_timestamp(value)
+    if not parsed:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return parsed.replace(tzinfo=SYDNEY_TZ)
+    return parsed.astimezone(SYDNEY_TZ)
+
+
+def _forecast_live_base_index(times, now=None):
+    """Pick the forecast index that best matches the current Sydney hour."""
+    if not times:
+        return 0
+    parsed_times = [_forecast_datetime_sydney(item) for item in times]
+    indexed_times = [(idx, dt) for idx, dt in enumerate(parsed_times) if dt is not None]
+    if not indexed_times:
+        return 0
+
+    now_dt = now or datetime.now(SYDNEY_TZ)
+    if now_dt.tzinfo is None or now_dt.tzinfo.utcoffset(now_dt) is None:
+        now_dt = now_dt.replace(tzinfo=SYDNEY_TZ)
+    else:
+        now_dt = now_dt.astimezone(SYDNEY_TZ)
+
+    future_times = [(idx, dt) for idx, dt in indexed_times if dt >= now_dt]
+    if future_times:
+        return min(future_times, key=lambda item: item[1])[0]
+
+    target_minutes = now_dt.hour * 60
+
+    def minute_delta(item):
+        _idx, dt = item
+        candidate_minutes = dt.hour * 60 + dt.minute
+        return (candidate_minutes - target_minutes) % (24 * 60)
+
+    return min(indexed_times, key=minute_delta)[0]
+
+
+def _forecast_hour_label(value):
+    parsed = _forecast_datetime_sydney(value)
+    if not parsed:
+        return str(value or "--")
+    hour = parsed.strftime("%I").lstrip("0") or "0"
+    return f"{hour}{parsed.strftime('%p')}"
 
 
 def _monitor_region_series_key(value):
@@ -1493,13 +1542,14 @@ def _fetch_met_history(region_name, start_iso, end_iso):
 
 @lru_cache(maxsize=128)
 def _fetch_met_history_for_sites(site_ids_tuple, start_iso, end_iso):
-    site_ids = [int(x) for x in (site_ids_tuple or ()) if x is not None]
-    if not site_ids:
-        return []
-    try:
-        return fetch_observation_history(site_ids, ["TEMP", "HUMID", "WSP", "RAIN"], start_iso, end_iso, timeout=6)
-    except Exception:
-        return []
+    return _monitor_history_rows_for_sites(
+        tuple(site_ids_tuple or ()),
+        ("TEMP", "HUMID", "WSP", "RAIN"),
+        start_iso,
+        end_iso,
+        live_timeout=6,
+        fallback_hours=24,
+    )
 
 
 def _met_series_for_region(region_name, site_ids, hours=6):
@@ -2435,39 +2485,277 @@ def _overview_build_trends_figure(hours=48):
     return fig
 
 
-@lru_cache(maxsize=64)
-def _fetch_monitor_region_history(site_ids_tuple, start_iso, end_iso):
-    site_ids = []
-    for site_id in site_ids_tuple or ():
-        try:
-            site_ids.append(int(site_id))
-        except Exception:
-            continue
-    if not site_ids:
-        return []
-
+def _monitor_region_series_parameter_codes():
     parameter_codes = []
     for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
         code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
         if code and code not in parameter_codes:
             parameter_codes.append(code)
+    return parameter_codes
+
+
+def _monitor_region_series_seed_site_id():
+    try:
+        if MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE:
+            return int(str(MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE).split(":", 1)[1])
+    except Exception:
+        pass
+    for site_id in sorted(_sites_by_id()):
+        try:
+            return int(site_id)
+        except Exception:
+            continue
+    return 0
+
+
+@lru_cache(maxsize=8)
+def _monitor_observation_cache_rows(cache_mtime):
+    rows = _load_observations_cache() or []
+    return tuple(row for row in rows if isinstance(row, dict))
+
+
+@lru_cache(maxsize=8)
+def _monitor_observation_cache_index(cache_mtime):
+    entries = []
+    for row in _monitor_observation_cache_rows(cache_mtime):
+        param_code = str(_aqms_parameter(row).get("ParameterCode") or row.get("ParameterCode") or "").strip()
+        if not param_code:
+            continue
+        ts = _parse_aqms_time_point(row)
+        if ts is None:
+            continue
+        try:
+            site_id = int(row.get("Site_Id") or row.get("site_id") or row.get("SiteId") or row.get("SiteID"))
+        except Exception:
+            site_id = None
+        entries.append((param_code, site_id, ts.replace(minute=0, second=0, microsecond=0), row))
+    return tuple(entries)
+
+
+@lru_cache(maxsize=8)
+def _monitor_observation_cache_by_site_param(cache_mtime):
+    grouped = {}
+    for param_code, site_id, ts, row in _monitor_observation_cache_index(cache_mtime):
+        if site_id is None:
+            continue
+        grouped.setdefault((site_id, param_code), []).append((ts, row))
+    return {key: tuple(values) for key, values in grouped.items()}
+
+
+def _monitor_cache_mtime():
+    try:
+        return int(os.path.getmtime(_OBS_CACHE_CSV))
+    except OSError:
+        return None
+
+
+def _monitor_window_bounds(start_iso, end_iso):
+    start_dt = _parse_forecast_timestamp(start_iso)
+    end_dt = _parse_forecast_timestamp(end_iso)
+    if start_dt is not None:
+        start_dt = start_dt.replace(tzinfo=SYDNEY_TZ) if start_dt.tzinfo is None else start_dt.astimezone(SYDNEY_TZ)
+    if end_dt is not None:
+        end_dt = end_dt.replace(tzinfo=SYDNEY_TZ) if end_dt.tzinfo is None else end_dt.astimezone(SYDNEY_TZ)
+    return start_dt, end_dt
+
+
+def _monitor_cached_history_window(parameter_codes_tuple, start_iso, end_iso, fallback_hours=None):
+    cache_mtime = _monitor_cache_mtime()
+    if cache_mtime is None:
+        return []
+    parameter_codes = {str(code or "").strip() for code in parameter_codes_tuple or () if str(code or "").strip()}
+    if not parameter_codes:
+        return []
+
+    start_dt, end_dt = _monitor_window_bounds(start_iso, end_iso)
+    entries = _monitor_observation_cache_index(cache_mtime)
+    filtered = []
+    latest_ts = None
+    for param_code, _site_id, ts, row in entries:
+        if param_code not in parameter_codes:
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+        if start_dt is not None and ts < start_dt:
+            continue
+        if end_dt is not None and ts > end_dt:
+            continue
+        filtered.append(row)
+
+    if filtered:
+        return filtered
+
+    if latest_ts is None or not fallback_hours:
+        return []
+    fallback_start = latest_ts - timedelta(hours=float(fallback_hours))
+    fallback = []
+    for param_code, _site_id, ts, row in entries:
+        if param_code not in parameter_codes:
+            continue
+        if fallback_start <= ts <= latest_ts:
+            fallback.append(row)
+    return fallback
+
+
+def _monitor_cached_history_rows_for_sites(site_ids, parameter_codes, start_iso, end_iso, fallback_hours=None):
+    cache_mtime = _monitor_cache_mtime()
+    if cache_mtime is None:
+        return []
+    site_id_set = set()
+    for site_id in site_ids or ():
+        try:
+            site_id_set.add(int(site_id))
+        except Exception:
+            continue
+    parameter_code_set = {str(code or "").strip() for code in parameter_codes or () if str(code or "").strip()}
+    if not site_id_set or not parameter_code_set:
+        return []
+
+    start_dt, end_dt = _monitor_window_bounds(start_iso, end_iso)
+    grouped = _monitor_observation_cache_by_site_param(cache_mtime)
+    filtered = []
+    latest_ts = None
+    for site_id in site_id_set:
+        for param_code in parameter_code_set:
+            for ts, row in grouped.get((site_id, param_code), ()):
+                if latest_ts is None or ts > latest_ts:
+                    latest_ts = ts
+                if start_dt is not None and ts < start_dt:
+                    continue
+                if end_dt is not None and ts > end_dt:
+                    continue
+                filtered.append(row)
+
+    if filtered:
+        return filtered
+
+    if latest_ts is None or not fallback_hours:
+        return []
+    fallback_start = latest_ts - timedelta(hours=float(fallback_hours))
+    fallback = []
+    for site_id in site_id_set:
+        for param_code in parameter_code_set:
+            for ts, row in grouped.get((site_id, param_code), ()):
+                if fallback_start <= ts <= latest_ts:
+                    fallback.append(row)
+    return fallback
+
+
+def _monitor_region_series_cached_window(parameter_codes_tuple, start_iso, end_iso):
+    # If the live API/cache lags the current clock, return a latest 24-hour
+    # slice from cache. The render callback already adjusts its x-axis to that
+    # latest timestamp.
+    return _monitor_cached_history_window(parameter_codes_tuple, start_iso, end_iso, fallback_hours=24)
+
+
+@lru_cache(maxsize=16)
+def _fetch_monitor_region_history_window(parameter_codes_tuple, start_iso, end_iso):
+    parameter_codes = list(parameter_codes_tuple or ())
+    if not parameter_codes:
+        return []
+
+    if str(os.environ.get("MONITOR_REGION_SERIES_CACHE_FIRST", "1")).strip().lower() not in {"0", "false", "no", "n"}:
+        cached_rows = _monitor_region_series_cached_window(tuple(parameter_codes), start_iso, end_iso)
+        if cached_rows:
+            return cached_rows
 
     try:
-        return fetch_observation_history(site_ids, parameter_codes, start_iso, end_iso, timeout=15)
+        timeout = float(os.environ.get("MONITOR_REGION_SERIES_HISTORY_TIMEOUT", "8"))
+    except (TypeError, ValueError):
+        timeout = 8
+
+    # The NSW history endpoint can return a broad payload even for a single site.
+    # Cache it by time window so changing station filters locally instead of
+    # redownloading the same large response.
+    try:
+        return fetch_observation_history([_monitor_region_series_seed_site_id()], parameter_codes, start_iso, end_iso, timeout=timeout)
     except Exception:
         return []
 
 
-def _monitor_region_series_figure(
-    history_rows,
-    pollutant_label,
-    start_dt,
-    end_dt,
-    region_label,
-    station_name,
-    purpleair_history=None,
-    purpleair_label=None,
-):
+@lru_cache(maxsize=256)
+def _monitor_history_rows_for_sites(site_ids_tuple, parameter_codes_tuple, start_iso, end_iso, live_timeout=8, fallback_hours=None):
+    site_ids = set()
+    for site_id in site_ids_tuple or ():
+        try:
+            site_ids.add(int(site_id))
+        except Exception:
+            continue
+    if not site_ids:
+        return []
+
+    parameter_codes = tuple(sorted({str(code or "").strip() for code in parameter_codes_tuple or () if str(code or "").strip()}))
+    if not parameter_codes:
+        return []
+
+    rows = _monitor_cached_history_rows_for_sites(site_ids, parameter_codes, start_iso, end_iso, fallback_hours=fallback_hours)
+    if not rows:
+        try:
+            rows = fetch_observation_history(list(site_ids), list(parameter_codes), start_iso, end_iso, timeout=float(live_timeout))
+        except Exception:
+            rows = []
+
+    filtered = []
+    parameter_code_set = set(parameter_codes)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_site_id = int(row.get("Site_Id") or row.get("site_id") or row.get("SiteId") or row.get("SiteID"))
+        except Exception:
+            continue
+        if row_site_id not in site_ids:
+            continue
+        param_code = str(_aqms_parameter(row).get("ParameterCode") or row.get("ParameterCode") or "").strip()
+        if param_code and param_code not in parameter_code_set:
+            continue
+        filtered.append(row)
+    return tuple(filtered)
+
+
+@lru_cache(maxsize=256)
+def _fetch_purpleair_sensor_history_cached(sensor_index, start_ts, end_ts, average, fields_tuple, timeout):
+    try:
+        return fetch_purpleair_sensor_history(
+            int(sensor_index),
+            int(start_ts),
+            int(end_ts),
+            average=int(average),
+            fields=list(fields_tuple or ()),
+            timeout=float(timeout),
+        )
+    except Exception:
+        return {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
+
+
+@lru_cache(maxsize=128)
+def _fetch_monitor_region_history(site_ids_tuple, start_iso, end_iso):
+    return _monitor_history_rows_for_sites(
+        tuple(site_ids_tuple or ()),
+        tuple(_monitor_region_series_parameter_codes()),
+        start_iso,
+        end_iso,
+        live_timeout=float(os.environ.get("MONITOR_REGION_SERIES_HISTORY_TIMEOUT", "8") or 8),
+        fallback_hours=24,
+    )
+
+
+def _prewarm_monitor_observation_cache():
+    cache_mtime = _monitor_cache_mtime()
+    if cache_mtime is None:
+        return
+    try:
+        _monitor_observation_cache_rows(cache_mtime)
+        _monitor_observation_cache_index(cache_mtime)
+        _monitor_observation_cache_by_site_param(cache_mtime)
+    except Exception:
+        return
+
+
+_prewarm_monitor_observation_cache()
+
+
+def _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt):
     pollutant_code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
     values_by_time = {}
     for item in history_rows or []:
@@ -2487,6 +2775,32 @@ def _monitor_region_series_figure(
         if value is None:
             continue
         values_by_time[ts.replace(minute=0, second=0, microsecond=0)] = value
+    return values_by_time
+
+
+def _monitor_region_series_latest_timestamp(history_rows):
+    latest_ts = None
+    for row in history_rows or []:
+        ts = _parse_aqms_time_point(row)
+        if ts is None:
+            continue
+        ts = ts.replace(minute=0, second=0, microsecond=0)
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+    return latest_ts
+
+
+def _monitor_region_series_figure(
+    history_rows,
+    pollutant_label,
+    start_dt,
+    end_dt,
+    region_label,
+    station_name,
+    purpleair_history=None,
+    purpleair_label=None,
+):
+    values_by_time = _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt)
 
     x_times = []
     cursor = start_dt.replace(minute=0, second=0, microsecond=0)
@@ -2589,6 +2903,85 @@ def _monitor_region_series_figure(
             font=dict(family=BASE_FONT_FAMILY, size=14, color="#475569"),
         )
 
+    return fig
+
+
+def _monitor_region_series_combined_figure(history_rows, start_dt, end_dt, region_label, station_name):
+    x_times = []
+    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
+    end_cursor = end_dt.replace(minute=0, second=0, microsecond=0)
+    while cursor <= end_cursor:
+        x_times.append(cursor)
+        cursor = cursor + timedelta(hours=1)
+
+    fig = make_subplots(
+        rows=len(MONITOR_REGION_SERIES_POLLUTANTS),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.075,
+        subplot_titles=[
+            f"{pollutant_display(pollutant_label)} ({(POLLUTANTS.get(pollutant_label) or {}).get('Units') or 'Value'})"
+            for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS
+        ],
+    )
+
+    has_points = False
+    for row_idx, pollutant_label in enumerate(MONITOR_REGION_SERIES_POLLUTANTS, start=1):
+        values_by_time = _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt)
+        y_values = [values_by_time.get(ts) for ts in x_times]
+        if any(value is not None for value in y_values):
+            has_points = True
+        units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
+        plot_color = MONITOR_REGION_SERIES_PLOT_COLORS.get(pollutant_label, "#2563eb")
+        fig.add_trace(
+            go.Scattergl(
+                x=x_times,
+                y=y_values,
+                name=pollutant_display(pollutant_label),
+                mode="lines+markers",
+                line=dict(color=plot_color, width=2.5),
+                marker=dict(size=5, color=plot_color),
+                connectgaps=False,
+                hovertemplate=(
+                    f"<b>{station_name}</b><br>"
+                    f"{pollutant_display(pollutant_label)}<br>"
+                    "%{x|%d %b %H:%M}<br>%{y:.1f} "
+                    f"{units}<extra></extra>"
+                ),
+            ),
+            row=row_idx,
+            col=1,
+        )
+        fig.update_yaxes(title_text=units, showgrid=True, gridcolor="#e8eef8", zeroline=False, row=row_idx, col=1)
+
+    if not has_points:
+        fig.add_annotation(
+            text="No hourly AQMS history returned for this station in the selected window.",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=13, color="#64748b", family=BASE_FONT_FAMILY),
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        height=390,
+        margin=dict(l=56, r=18, t=42, b=34),
+        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+        hovermode="x unified",
+        title=dict(
+            text=f"{region_label} · {station_name} · last 24 hours",
+            x=0,
+            xanchor="left",
+            font=dict(size=14, family=BASE_FONT_FAMILY, color="#0f172a"),
+        ),
+    )
+    fig.update_xaxes(showgrid=False, tickformat="%H:%M", ticks="outside", tickfont=dict(size=10))
     return fig
 
 
@@ -2945,7 +3338,7 @@ def _overview_next3_values(selection):
     hours = min(2, max_hours)
     pollutants = ["PM2.5", "PM10", "O3"]
 
-    # Discover the next-hour timestamps (use the first available parsed file).
+    # Discover the forecast timestamps (use the first available parsed file).
     time_labels = []
     for region in regions or []:
         fp = forecast_file_path([str(region), "PM2.5", str(horizon), str(model_name), str(run_date)])
@@ -2960,16 +3353,24 @@ def _overview_next3_values(selection):
             continue
         times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
         if times:
-            time_labels = list(times[:hours])
+            time_labels = list(times)
             break
+
+    base_index = _forecast_live_base_index(time_labels)
+    if time_labels:
+        selected_indices = list(range(base_index, min(base_index + hours, len(time_labels))))
+        display_time_labels = [time_labels[idx] for idx in selected_indices]
+    else:
+        selected_indices = list(range(hours))
+        display_time_labels = []
 
     # Compute per pollutant, worst across stations for each hour index, plus contributing station counts
     # and the station name responsible for the maximum.
     rows = []
     for pollutant in pollutants:
-        maxima = [None for _ in range(hours)]
-        max_stations = [None for _ in range(hours)]
-        counts = [0 for _ in range(hours)]
+        maxima = [None for _ in selected_indices]
+        max_stations = [None for _ in selected_indices]
+        counts = [0 for _ in selected_indices]
         used_model = model_name
 
         def _iter_files_for_model(model_value):
@@ -3007,21 +3408,21 @@ def _overview_next3_values(selection):
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
                 values = (payload or {}).get("forecastValue") or []
-                for idx in range(hours):
-                    if idx >= len(values):
+                for out_idx, hour_idx in enumerate(selected_indices):
+                    if hour_idx >= len(values):
                         continue
                     try:
-                        val = float(values[idx])
+                        val = float(values[hour_idx])
                     except (TypeError, ValueError):
                         continue
-                    counts[idx] += 1
-                    current = maxima[idx]
+                    counts[out_idx] += 1
+                    current = maxima[out_idx]
                     if current is None or val > current:
-                        maxima[idx] = val
-                        max_stations[idx] = station_name
+                        maxima[out_idx] = val
+                        max_stations[out_idx] = station_name
 
         rows.append({"pollutant": pollutant, "values": maxima, "counts": counts, "stations": max_stations, "model": used_model})
-    return time_labels, rows
+    return display_time_labels, rows
 
 
 def _ranking_rows(parsed):
@@ -4669,6 +5070,7 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
     rows = []
     station_index = {}
     time_labels = []
+    base_index = 0
 
     def _ensure_row(station_name, region_name):
         station_norm = normalize_station_name(station_name)
@@ -4744,6 +5146,7 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
                 times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
                 if times:
                     time_labels = list(times)
+                    base_index = _forecast_live_base_index(time_labels)
 
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
@@ -4752,7 +5155,7 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
                     continue
                 series = (payload or {}).get("forecastValue") or []
                 for off in offsets:
-                    hour_idx = off - 1
+                    hour_idx = base_index + off - 1
                     value_num = None
                     if 0 <= hour_idx < len(series):
                         value_num = _coerce_float(series[hour_idx])
@@ -4771,11 +5174,9 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
         label = f"+{off}h"
         # try to compute exact time if available
         if time_labels:
-            if len(time_labels) >= off:
-                dt = _parse_forecast_timestamp(time_labels[off - 1])
-                if dt:
-                    pretty = dt.strftime("%H:%M")
-                    label = f"{pretty}"
+            time_index = base_index + off - 1
+            if 0 <= time_index < len(time_labels):
+                label = _forecast_hour_label(time_labels[time_index])
         pretty_labels.append(label)
 
     columns = [
@@ -7285,7 +7686,7 @@ app.layout = html.Div(
                                                                     ),
                                                                     html.Iframe(
                                                                         id="overview-next-hour-forecast-map",
-                                                                        srcDoc=_leaflet_forecast_map_html({}, DEFAULT_SELECTION.get("pollutants"), 0),
+                                                                        srcDoc=INITIAL_FORECAST_MAP_HTML,
                                                                         className="map-frame map-frame--overview-next map-frame--forecast",
                                                                     ),
                                                                     html.Div(id="overview-next-hour-station-panel", className="overview-next-hour-station-panel"),
@@ -8069,7 +8470,7 @@ app.layout = html.Div(
                             className="card-heading-row",
                         ),
                         html.Div([
-                            html.H4("All stations forecast (next 3 hours)"),
+                            html.H4("All stations forecast"),
                         ], className="card-heading-row"),
                         html.Div(
                             [
@@ -8925,6 +9326,7 @@ def render_overview_next_hour_forecast_map(
     next_clicks,
     current_index,
 ):
+    global _LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML
     if active_tab != "overview":
         return no_update, no_update, no_update
 
@@ -9068,9 +9470,13 @@ def render_overview_next_hour_forecast_map(
     if times and new_index >= len(times):
         new_index = max(0, len(times) - 1)
 
-    # Create map HTML for selected index
     time_index = new_index if times else 0
-    map_html = _leaflet_forecast_map_html(merged_parsed if merged_stations else {}, pollutant, time_index, include_series=False)
+    if merged_stations:
+        map_html = _leaflet_forecast_map_html(merged_parsed, pollutant, time_index, include_series=False)
+        _LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML = map_html
+        map_output = map_html
+    else:
+        map_output = no_update
 
     # Build user-facing label (show only the timestamp in uppercase, larger font)
     label_el = ""
@@ -9084,7 +9490,7 @@ def render_overview_next_hour_forecast_map(
     else:
         label_el = html.Div("", className="card-hint")
 
-    return map_html, label_el, new_index
+    return map_output, label_el, new_index
 
 
 @app.callback(
@@ -9246,12 +9652,7 @@ def render_overview_next3_diamonds(active_tab, region, time_scope, model, date, 
     # Header hour labels.
     hours_pretty = []
     for ts in time_labels or []:
-        dt = _parse_forecast_timestamp(ts)
-        if dt:
-            hour = dt.strftime("%I").lstrip("0") or "0"
-            hours_pretty.append(f"{hour}{dt.strftime('%p')}")
-        else:
-            hours_pretty.append(str(ts))
+        hours_pretty.append(_forecast_hour_label(ts))
 
     units_by_pollutant = {k: (POLLUTANTS.get(k) or {}).get("Units") or "" for k in ["PM2.5", "PM10", "O3"]}
 
@@ -9332,6 +9733,7 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
     rows = []
     station_index = {}
     time_labels = []
+    base_index = 0
 
     def _ensure_row(station_name, region_name):
         station_norm = normalize_station_name(station_name)
@@ -9406,7 +9808,8 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
             if not time_labels:
                 times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
                 if times:
-                    time_labels = list(times[:hours])
+                    time_labels = list(times)
+                    base_index = _forecast_live_base_index(time_labels)
 
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
@@ -9416,8 +9819,9 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
                 series = (payload or {}).get("forecastValue") or []
                 for hour_idx in range(hours):
                     value_num = None
-                    if hour_idx < len(series):
-                        value_num = _coerce_float(series[hour_idx])
+                    source_idx = base_index + hour_idx
+                    if source_idx < len(series):
+                        value_num = _coerce_float(series[source_idx])
                     col = f"h{hour_idx + 1}_{p_key}"
                     cat_col = f"h{hour_idx + 1}_{p_key}_cat"
                     if value_num is None:
@@ -9430,12 +9834,10 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
 
     pretty_labels = []
     for idx in range(hours):
-        if idx < len(time_labels):
-            dt = _parse_forecast_timestamp(time_labels[idx])
-            if dt:
-                hour = dt.strftime("%I").lstrip("0") or "0"
-                pretty_labels.append(f"{hour}{dt.strftime('%p')}")
-                continue
+        time_idx = base_index + idx
+        if time_idx < len(time_labels):
+            pretty_labels.append(_forecast_hour_label(time_labels[time_idx]))
+            continue
         pretty_labels.append(f"+{idx + 1}h")
 
     columns = [
@@ -9474,12 +9876,17 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
         Input("overview-forecast-load", "n_intervals"),
         Input("overview-open-allstations", "n_clicks"),
     ],
+    [State("overview-allstations-overlay", "style")],
 )
-def render_overview_next2_allstations(active_tab, region, time_scope, model, date, _overview_load, open_allstations_clicks):
+def render_overview_next2_allstations(active_tab, region, time_scope, model, date, _overview_load, open_allstations_clicks, overlay_style):
     # Populate when either the (now-removed) All-stations tab is active or the
     # overlay open button was clicked.
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    if active_tab != "allstations" and trigger != "overview-open-allstations":
+    overlay_style = overlay_style or {}
+    overlay_is_open = overlay_style.get("display") not in (None, "", "none")
+    if active_tab not in {"overview", "allstations"}:
+        return no_update, no_update
+    if trigger != "overview-open-allstations" and not overlay_is_open:
         return no_update, no_update
     selection = {
         "regions": region or DEFAULT_SELECTION.get("regions"),
@@ -9488,8 +9895,7 @@ def render_overview_next2_allstations(active_tab, region, time_scope, model, dat
         "models": model or DEFAULT_SELECTION.get("models"),
         "date": date or DEFAULT_SELECTION.get("date"),
     }
-    # return columns and rows for offsets +1h, +3h, +6h, +12h
-    return _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12))
+    return _overview_allstations_multi_hour_rows(selection, hours=2)
 
 
 @app.callback(
@@ -10990,7 +11396,14 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
         if parameter_code and parameter_code not in mini_codes:
             mini_codes.append(parameter_code)
         try:
-            raw_history = fetch_observation_history([int(site_id)], mini_codes, start_date, end_date, timeout=14)
+            raw_history = _monitor_history_rows_for_sites(
+                (site_id,),
+                tuple(mini_codes),
+                start_date,
+                end_date,
+                live_timeout=6,
+                fallback_hours=window_hours + 24,
+            )
             aqms_histories = {}
             for item in raw_history or []:
                 param = _aqms_parameter(item).get("ParameterCode")
@@ -11003,22 +11416,16 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
 
         nearest_pa = nearest_purpleair_sensor(selected_row.get("lat"), selected_row.get("lon"), monitor_store.get("purpleairSensors") or [])
         if nearest_pa and pollutant_label in {"PM2.5", "PM10"}:
-            end_ts = int(now.timestamp())
+            end_ts = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
             start_ts = end_ts - window_hours * 3600
             fields = ["pm2.5_alt"] if pollutant_label == "PM2.5" else ["pm10.0_atm"]
-            try:
-                pa_history = fetch_purpleair_sensor_history(nearest_pa.get("site_id"), start_ts, end_ts, average=60, fields=fields, timeout=14)
-            except Exception:
-                pa_history = {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
+            pa_history = _fetch_purpleair_sensor_history_cached(nearest_pa.get("site_id"), start_ts, end_ts, 60, tuple(fields), 5)
 
     if source == "PurpleAir":
-        end_ts = int(now.timestamp())
+        end_ts = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
         start_ts = end_ts - window_hours * 3600
         fields = ["pm2.5_alt"] if pollutant_label == "PM2.5" else ["pm10.0_atm"]
-        try:
-            pa_history = fetch_purpleair_sensor_history(int(selected_row.get("site_id")), start_ts, end_ts, average=60, fields=fields, timeout=14)
-        except Exception:
-            pa_history = {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
+        pa_history = _fetch_purpleair_sensor_history_cached(int(selected_row.get("site_id")), start_ts, end_ts, 60, tuple(fields), 5)
 
     # Filter down to the selected time window for plotting.
     cutoff = now - timedelta(hours=window_hours)
@@ -11287,6 +11694,21 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
     return "", compare_fig, compare_summary, trend_fig
 
 
+def _prewarm_monitor_selected_render():
+    if str(os.environ.get("MONITOR_SELECTED_RENDER_PREWARM", "1")).strip().lower() in {"0", "false", "no", "n"}:
+        return
+    try:
+        store = INITIAL_MONITOR_STORE if isinstance(INITIAL_MONITOR_STORE, dict) else {}
+        selection = _default_monitor_selection(store)
+        if selection:
+            render_monitor_selected(selection, store, "24h", "PM2.5")
+    except Exception:
+        return
+
+
+_prewarm_monitor_selected_render()
+
+
 @app.callback(
     [Output("monitor-region-series-station", "options"), Output("monitor-region-series-station", "value")],
     [Input("monitor-region-series", "value"), Input("selected-monitor-site-store", "data")],
@@ -11348,14 +11770,6 @@ def render_monitor_region_series(active_tab, region_value, station_value):
 
     station_value = str(station_value or "").strip()
     if station_value not in {option["value"] for option in station_options}:
-        try:
-            if isinstance(selected_monitor_site, dict) and str(selected_monitor_site.get("source") or "").strip() == "AQMS":
-                selected_candidate = f"aqms:{int(selected_monitor_site.get('id'))}"
-                if selected_candidate in {option["value"] for option in station_options}:
-                    station_value = selected_candidate
-        except Exception:
-            station_value = ""
-    if station_value not in {option["value"] for option in station_options}:
         station_value = station_options[0]["value"]
 
     try:
@@ -11375,6 +11789,17 @@ def render_monitor_region_series(active_tab, region_value, station_value):
     start_iso = start_dt.strftime("%Y-%m-%dT%H:00:00")
     end_iso = now.strftime("%Y-%m-%dT%H:00:00")
     history_rows = _fetch_monitor_region_history((selected_site_id,), start_iso, end_iso) or []
+    if history_rows:
+        has_current_window_points = False
+        for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
+            if _monitor_region_series_values(history_rows, pollutant_label, start_dt, now):
+                has_current_window_points = True
+                break
+        if not has_current_window_points:
+            latest_ts = _monitor_region_series_latest_timestamp(history_rows)
+            if latest_ts is not None:
+                now = latest_ts
+                start_dt = now - timedelta(hours=24)
 
     plot_cards = []
     for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
@@ -11407,16 +11832,33 @@ def render_monitor_region_series(active_tab, region_value, station_value):
     return note, plot_cards
 
 
+def _prewarm_monitor_region_series_render():
+    if str(os.environ.get("MONITOR_REGION_SERIES_RENDER_PREWARM", "1")).strip().lower() in {"0", "false", "no", "n"}:
+        return
+    try:
+        render_monitor_region_series("monitor", MONITOR_REGION_SERIES_DEFAULT_VALUE, MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE)
+    except Exception:
+        return
+
+
+_prewarm_monitor_region_series_render()
+
+
 @app.callback(
     Output("forecast-map", "srcDoc"),
     [Input("forecast-store", "data")],
     [State("pollutant-dropdown", "value")],
 )
 def render_forecast_map_srcdoc(parsed, pollutant):
+    global _LAST_GOOD_FORECAST_MAP_HTML
     if not parsed:
-        return _leaflet_forecast_map_html({}, pollutant, 0)
+        if _LAST_GOOD_FORECAST_MAP_HTML:
+            return _LAST_GOOD_FORECAST_MAP_HTML
+        return no_update
     # Keep the same iframe document while the slider moves; values update via postMessage.
-    return _leaflet_forecast_map_html(parsed, pollutant, 0)
+    next_html = _leaflet_forecast_map_html(parsed, pollutant, 0)
+    _LAST_GOOD_FORECAST_MAP_HTML = next_html
+    return next_html
 
 
 @app.callback(
@@ -11467,8 +11909,14 @@ def toggle_forecast_all_stations_modal(open_clicks, close_clicks, current_style)
         Input("ranking-hour-dropdown", "value"),
         Input("forecast-view-all", "n_clicks"),
     ],
+    [State("forecast-all-stations-modal", "style")],
 )
-def render_forecast_all_stations_table(region, pollutant, time_scope, model, date, ranking_hour_index, _open_clicks):
+def render_forecast_all_stations_table(region, pollutant, time_scope, model, date, ranking_hour_index, _open_clicks, modal_style):
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    modal_style = modal_style or {}
+    modal_is_open = modal_style.get("display") not in (None, "", "none")
+    if trigger != "forecast-view-all" and not modal_is_open:
+        return no_update, no_update, no_update, no_update
     selection = {
         "regions": region,
         "pollutants": "PM2.5",

@@ -5,6 +5,8 @@ set -euo pipefail
 # optional GitHub Pages current-link publisher enabled.
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT_DIR}/scripts/load_local_env.sh"
+load_dashboard_env
 cd "${ROOT_DIR}"
 
 export PUBLISH_PAGES_ON_URL="${PUBLISH_PAGES_ON_URL:-1}"

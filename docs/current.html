@@ -77,6 +77,11 @@
   </main>
 
   <script>
+    const linkSources = [
+      "current.json",
+      "https://raw.githubusercontent.com/ai4betterAir/ai4betterAir.github.io/main/current.json"
+    ];
+
     function isValidDashboardUrl(url) {
       try {
         const parsed = new URL(url);
@@ -86,34 +91,126 @@
       }
     }
 
+    function updatedTime(data) {
+      const time = Date.parse(data.updated_at || "");
+      return Number.isFinite(time) ? time : 0;
+    }
+
+    function candidatesFromData(data) {
+      const candidates = [];
+
+      if (!data || typeof data !== "object") {
+        return candidates;
+      }
+
+      if (isValidDashboardUrl(data.url)) {
+        candidates.push({
+          url: data.url,
+          updated_at: data.updated_at || ""
+        });
+      }
+
+      if (Array.isArray(data.urls)) {
+        for (const item of data.urls) {
+          const candidate = typeof item === "string" ? { url: item, updated_at: data.updated_at || "" } : item;
+          if (candidate && isValidDashboardUrl(candidate.url)) {
+            candidates.push({
+              url: candidate.url,
+              updated_at: candidate.updated_at || data.updated_at || ""
+            });
+          }
+        }
+      }
+
+      return candidates;
+    }
+
+    async function probeDashboardUrl(url, timeoutMs = 2500) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        await fetch(url, {
+          method: "GET",
+          mode: "no-cors",
+          cache: "no-store",
+          signal: controller.signal
+        });
+        return true;
+      } catch (error) {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function fetchLinkSource(source) {
+      const separator = source.includes("?") ? "&" : "?";
+      const response = await fetch(`${source}${separator}ts=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`${source} returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      const candidates = candidatesFromData(data);
+      if (!candidates.length) {
+        throw new Error(`${source} has no valid dashboard URL`);
+      }
+
+      return candidates;
+    }
+
+    function shouldAutoRedirect() {
+      const params = new URLSearchParams(window.location.search);
+      return !params.has("stay");
+    }
+
     async function loadCurrentLink() {
       const message = document.getElementById("message");
       const linkBox = document.getElementById("link-box");
       const openLink = document.getElementById("open-link");
 
       try {
-        const response = await fetch(`current.json?ts=${Date.now()}`, { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(`current.json returned ${response.status}`);
-        }
-        const data = await response.json();
-        const url = data && data.url;
-        if (!isValidDashboardUrl(url)) {
+        const results = await Promise.allSettled(linkSources.map(fetchLinkSource));
+        const links = results
+          .filter((result) => result.status === "fulfilled")
+          .flatMap((result) => result.value)
+          .filter((data, index, all) => all.findIndex((item) => item.url === data.url) === index)
+          .sort((left, right) => updatedTime(right) - updatedTime(left));
+
+        if (!links.length) {
           throw new Error("No valid dashboard URL is published.");
+        }
+
+        let data = null;
+        for (const candidate of links) {
+          if (await probeDashboardUrl(candidate.url)) {
+            data = candidate;
+            break;
+          }
+        }
+        if (!data) {
+          data = links[0];
         }
 
         message.textContent = "Current live dashboard:";
         linkBox.hidden = false;
         linkBox.innerHTML = "";
         const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.textContent = url;
+        anchor.href = data.url;
+        anchor.textContent = data.url;
         anchor.rel = "noopener";
         linkBox.appendChild(anchor);
 
-        openLink.href = url;
+        openLink.href = data.url;
         openLink.removeAttribute("aria-disabled");
         openLink.textContent = "Open dashboard";
+
+        if (shouldAutoRedirect()) {
+          message.textContent = "Opening the current live dashboard...";
+          setTimeout(() => {
+            window.location.replace(data.url);
+          }, 400);
+        }
       } catch (error) {
         message.textContent = "The current dashboard link is not available yet.";
         linkBox.hidden = true;
@@ -123,6 +220,7 @@
     }
 
     loadCurrentLink();
+    setInterval(loadCurrentLink, 30000);
   </script>
 </body>
 </html>

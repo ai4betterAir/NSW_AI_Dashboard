@@ -58,6 +58,20 @@ scripts/publish_pages_link.sh --push
 With `GITHUB_TOKEN`, the script updates `current.json` through the GitHub
 API instead of using `git push`.
 
+For persistent publishing after server restarts, store the token in the local
+dashboard `.env` file. This file is ignored by git and the scripts load it
+automatically:
+
+```bash
+cd /mnt/scratch_lustre/ar_ai4ba_scratch/Ai4BetterAir/AI_Nowcasting/NSW_AI_Dashboard
+read -rsp "Paste GitHub token: " GH_PAT
+echo
+umask 077
+printf 'GITHUB_TOKEN=%s\n' "$GH_PAT" > .env
+unset GH_PAT
+scripts/publish_pages_link.sh --push
+```
+
 ## Automatic updates
 
 To keep `https://ai4betterair.github.io/` pointing at the current live tunnel,
@@ -66,6 +80,12 @@ repository. Set `GITHUB_TOKEN` before starting the tunnel loop:
 
 ```bash
 export GITHUB_TOKEN='ghp_...'
+PUBLISH_PAGES_ON_URL=1 PUBLISH_PAGES_PUSH=1 scripts/start_pages_watchdog.sh
+```
+
+If `GITHUB_TOKEN` is saved in `.env`, no manual `export` is needed:
+
+```bash
 PUBLISH_PAGES_ON_URL=1 PUBLISH_PAGES_PUSH=1 scripts/start_pages_watchdog.sh
 ```
 

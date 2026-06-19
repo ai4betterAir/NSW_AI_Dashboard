@@ -5,6 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "Stopping localhost.run tunnels..."
+pkill -f "$(pwd)/scripts/watchdog.sh" || true
+pkill -f "$(pwd)/scripts/tunnel_loop.sh" || true
 pkill -f "ssh .*localhost.run" || true
 echo "Stopping Gunicorn processes for dashboard.dash_app..."
 pkill -f "gunicorn dashboard.dash_app:server" || true

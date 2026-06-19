@@ -184,17 +184,47 @@ def _load_purpleair_snapshot_cache():
         return {"sensors": [], "fetched_at": None, "error": "Corrupt cache"}
 
 
-def _load_bundled_purpleair_snapshot():
-    """Load a packaged PurpleAir snapshot from the repository when live access fails."""
-
+def _bundled_monitoring_dirs():
     module_root = Path(__file__).resolve().parents[4]
-    candidate_dirs = [
+    server_root = Path(__file__).resolve().parents[3]
+    return [
+        server_root / "data" / "downloads" / "monitoring_test",
         module_root / "AI_Dashboard_2026Y" / "data" / "downloads" / "monitoring_test",
         module_root / "AI_Dashboard_2026" / "data" / "downloads" / "monitoring_test",
         module_root / "AI_DASH" / "data" / "downloads" / "monitoring_test",
     ]
+
+
+def _load_bundled_observations_snapshot():
+    """Load packaged AQMS observations when live access and shared cache are unavailable."""
+
     seen = set()
-    for directory in candidate_dirs:
+    for directory in _bundled_monitoring_dirs():
+        if directory in seen or not directory.exists():
+            continue
+        seen.add(directory)
+        candidates = sorted(
+            directory.glob("aqms_observations_snapshot*.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception:
+                continue
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            if isinstance(rows, list) and rows:
+                return rows
+    return []
+
+
+def _load_bundled_purpleair_snapshot():
+    """Load a packaged PurpleAir snapshot from the repository when live access fails."""
+
+    seen = set()
+    for directory in _bundled_monitoring_dirs():
         if directory in seen or not directory.exists():
             continue
         seen.add(directory)
@@ -265,7 +295,16 @@ def fetch_observations(query=None, timeout=30):
     except Exception:
         # On network error, fall back to cached observations if available
         cached = _load_observations_cache()
-        return cached or []
+        if cached:
+            return cached
+        bundled = _load_bundled_observations_snapshot()
+        if bundled:
+            try:
+                _save_observations_cache(bundled)
+            except Exception:
+                pass
+            return bundled
+        return []
 
     # Save successful fetch to cache for offline reuse
     try:

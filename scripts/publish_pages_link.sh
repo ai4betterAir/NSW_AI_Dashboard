@@ -5,6 +5,8 @@ set -euo pipefail
 # publish it either through GITHUB_TOKEN or through git commit/push.
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT_DIR}/scripts/load_local_env.sh"
+load_dashboard_env
 URL_FILE="${URL_FILE:-$ROOT_DIR/dashboard_url.txt}"
 URL_FILES="${URL_FILES:-${URL_FILE}}"
 CURRENT_JSON="${CURRENT_JSON:-$ROOT_DIR/docs/current.json}"

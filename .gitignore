@@ -4,4 +4,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .env
+.env.*
+!.env.example
+.venv/
+node_modules/
 logs/
+dashboard.log
+dashboard.pid
+dashboard_url.txt
+dashboard_named_url.txt

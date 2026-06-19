@@ -160,6 +160,11 @@
       return candidates;
     }
 
+    function shouldAutoRedirect() {
+      const params = new URLSearchParams(window.location.search);
+      return !params.has("stay");
+    }
+
     async function loadCurrentLink() {
       const message = document.getElementById("message");
       const link = document.getElementById("open-link");
@@ -204,6 +209,13 @@
         currentAnchor.textContent = data.url;
         currentAnchor.rel = "noopener";
         currentUrl.appendChild(currentAnchor);
+
+        if (shouldAutoRedirect()) {
+          message.textContent = "Opening the current live dashboard...";
+          setTimeout(() => {
+            window.location.replace(data.url);
+          }, 400);
+        }
       } catch (error) {
         message.textContent = "The current dashboard link is not available yet.";
         currentUrl.hidden = true;
