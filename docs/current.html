@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Current NSW Air Quality Dashboard Link</title>
+  <title>Current NSW Air Quality Nowcasting Dashboard Link</title>
   <style>
     :root {
       color-scheme: light;
@@ -70,10 +70,10 @@
 </head>
 <body>
   <main>
-    <h1>Current Live Dashboard Link</h1>
-    <p id="message">Finding the current live dashboard...</p>
+    <h1>Current Live NSW Air Quality Nowcasting Dashboard Link</h1>
+    <p id="message">Finding the current live NSW Air Quality Nowcasting Dashboard...</p>
     <div id="link-box" class="link-box" hidden></div>
-    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open dashboard</a></p>
+    <p><a id="open-link" class="button" href="#" aria-disabled="true">Open NSW Air Quality Nowcasting Dashboard</a></p>
   </main>
 
   <script>
@@ -192,7 +192,7 @@
           data = links[0];
         }
 
-        message.textContent = "Current live dashboard:";
+        message.textContent = "Current live NSW Air Quality Nowcasting Dashboard:";
         linkBox.hidden = false;
         linkBox.innerHTML = "";
         const anchor = document.createElement("a");
@@ -203,10 +203,10 @@
 
         openLink.href = data.url;
         openLink.removeAttribute("aria-disabled");
-        openLink.textContent = "Open dashboard";
+        openLink.textContent = "Open NSW Air Quality Nowcasting Dashboard";
 
         if (shouldAutoRedirect()) {
-          message.textContent = "Opening the current live dashboard...";
+          message.textContent = "Opening the current live NSW Air Quality Nowcasting Dashboard...";
           setTimeout(() => {
             window.location.replace(data.url);
           }, 400);

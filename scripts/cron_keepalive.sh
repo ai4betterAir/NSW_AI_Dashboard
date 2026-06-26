@@ -20,9 +20,10 @@ cd "${ROOT_DIR}"
 
 {
   printf '\n[%s] keepalive start\n' "$(date -Is)"
-  FORCE_TUNNEL_RESTART=0 \
-    PUBLISH_PAGES_ON_URL=1 \
-    PUBLISH_PAGES_PUSH=1 \
-    scripts/start_pages_watchdog.sh
+	  FORCE_TUNNEL_RESTART=0 \
+	    PUBLISH_PAGES_ON_URL=1 \
+	    PUBLISH_PAGES_PUSH=1 \
+	    WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-10}" \
+	    scripts/start_pages_watchdog.sh
   printf '[%s] keepalive done\n' "$(date -Is)"
 } >> "${LOG_FILE}" 2>&1

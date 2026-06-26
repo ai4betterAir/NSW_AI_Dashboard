@@ -2,7 +2,7 @@ import pandas as pd
 import os
 import re
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 
@@ -67,6 +67,18 @@ def _limit_forecast_text(first_txt, max_forecast_hours):
     return "\n".join(limited)
 
 
+def _run_datetime_from_filename(filepath):
+    """Return the forecast run timestamp encoded in operational CSV filenames."""
+    filename = os.path.basename(str(filepath or ""))
+    match = re.search(r"_(\d{8})_(\d{2})(?:AEST|AEDT)\.csv$", filename)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(f"{match.group(1)}{match.group(2)}", "%Y%m%d%H")
+    except ValueError:
+        return None
+
+
 def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
     """Implementation of CSV parsing. Accepts `filepath` as string."""
     if not os.path.exists(filepath):
@@ -78,6 +90,7 @@ def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
         pollutant_code = mapping.get(pollutant_label) or pollutant_label
 
     stats_txt = None
+    run_datetime = _run_datetime_from_filename(filepath)
     raw = open(filepath, "r", encoding="utf-8", errors="ignore").read()
     first_txt, stats_txt = _split_sections(raw)
     first_txt = _limit_forecast_text(first_txt, max_forecast_hours)
@@ -88,7 +101,11 @@ def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
         return {"error": f"Could not parse first table: {e}"}
 
     # prepare result
-    result = {"ranking": {}, "data": {"time": {"forecastTime": [], "histTime": []}, "stations": {}}, "stats": {}}
+    result = {
+        "ranking": {},
+        "data": {"time": {"forecastTime": [], "histTime": [], "forecastLeadHours": [], "histLeadHours": []}, "stations": {}},
+        "stats": {},
+    }
     forecast_time_set = set()
     hist_time_set = set()
 
@@ -158,6 +175,9 @@ def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
         if max_forecast_hours is not None and forecast_hours > max_forecast_hours:
             continue
 
+        if run_datetime is not None:
+            timestamp = (run_datetime + timedelta(hours=forecast_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
         for col in station_cols:
             if not col.startswith("_") and "_" in col:
                 parts = col.split("_", 1)
@@ -182,11 +202,13 @@ def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
                 if timestamp not in forecast_time_set:
                     forecast_time_set.add(timestamp)
                     result["data"]["time"]["forecastTime"].append(timestamp)
+                    result["data"]["time"]["forecastLeadHours"].append(forecast_hours)
                 result["data"]["stations"][site_name]["forecastValue"].append(value)
             else:
                 if timestamp not in hist_time_set:
                     hist_time_set.add(timestamp)
                     result["data"]["time"]["histTime"].append(timestamp)
+                    result["data"]["time"]["histLeadHours"].append(forecast_hours)
                 result["data"]["stations"][site_name]["histValue"].append(value)
 
     # process stats table if present
@@ -210,11 +232,19 @@ def _parse_csv_impl(filepath, pollutant_label=None, max_forecast_hours=None):
     return result
 
 
-@lru_cache(maxsize=32)
-def _parse_csv_cached(filepath_str, pollutant_label, max_forecast_hours):
+@lru_cache(maxsize=128)
+def _parse_csv_cached(filepath_str, pollutant_label, max_forecast_hours, mtime_ns, file_size):
     return _parse_csv_impl(filepath_str, pollutant_label, max_forecast_hours)
 
 
 def parse_csv(filepath, pollutant_label=None, max_forecast_hours=None):
-    """Public wrapper that normalizes `filepath` and delegates to cached implementation."""
-    return _parse_csv_cached(str(filepath), pollutant_label, max_forecast_hours)
+    """Parse a forecast again whenever the source file changes."""
+    filepath_str = str(filepath)
+    try:
+        stat_result = os.stat(filepath_str)
+        mtime_ns = stat_result.st_mtime_ns
+        file_size = stat_result.st_size
+    except OSError:
+        mtime_ns = 0
+        file_size = 0
+    return _parse_csv_cached(filepath_str, pollutant_label, max_forecast_hours, mtime_ns, file_size)

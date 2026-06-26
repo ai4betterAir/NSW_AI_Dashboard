@@ -5,7 +5,6 @@ import math
 import os
 import re
 import sys
-import threading
 from html import escape
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -16,7 +15,7 @@ import dash
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash import Input, Output, State, callback_context, dcc, html, no_update, dash_table, MATCH
-from flask import Response, send_from_directory
+from flask import send_from_directory
 from dateutil import tz, parser as date_parser
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -40,9 +39,6 @@ from nowcasting.data.file_discovery import CSV_DATA_FILE_PATH, forecast_file_pat
 from nowcasting.data.obs_data import (
     MONITORING_CATEGORY_COLORS,
     PURPLEAIR_COLOR,
-    _OBS_CACHE_CSV,
-    _load_observations_cache,
-    _load_purpleair_snapshot_cache,
     fetch_observation_history,
     fetch_observations,
     fetch_monitoring_and_purpleair_rows,
@@ -61,6 +57,7 @@ RECOMMENDATIONS_PATHS = [RECOMMENDATIONS_JSON]
 OPTIONS = get_options()
 FILE_KEY_PARAMS = get_file_key_params()
 FILE_KEY_PARAMS = get_file_key_params()
+
 
 GENERAL_HEALTH_GUIDE = []
 MONITOR_REFRESH_MS = 20 * 60 * 1000
@@ -85,8 +82,9 @@ LEAFLET_TILE_ATTRIBUTION = str(
 def _leaflet_tile_url_js():
     """Return a single tile URL as a JS string literal."""
     url = LEAFLET_TILE_URLS or LEAFLET_TILE_URL
+    # If multiple URLs provided in LEAFLET_TILE_URLS, use the first.
     if LEAFLET_TILE_URLS:
-        parts = [part.strip() for part in LEAFLET_TILE_URLS.split(",") if part.strip()]
+        parts = [p.strip() for p in LEAFLET_TILE_URLS.split(",") if p.strip()]
         if parts:
             url = parts[0]
     return json.dumps(url)
@@ -96,13 +94,14 @@ def _leaflet_tile_urls_js():
     """Return a JS array literal of tile URLs."""
     urls = []
     if LEAFLET_TILE_URLS:
-        parts = [part.strip() for part in LEAFLET_TILE_URLS.split(",") if part.strip()]
+        parts = [p.strip() for p in LEAFLET_TILE_URLS.split(",") if p.strip()]
         urls.extend(parts)
     if not urls and LEAFLET_TILE_URL:
         urls.append(LEAFLET_TILE_URL)
     return json.dumps(urls)
 
 
+@lru_cache(maxsize=1)
 def _site_lookup():
     return load_site_lookup()
 
@@ -112,6 +111,7 @@ def _region_lookup():
     return load_region_lookup()
 
 
+@lru_cache(maxsize=1)
 def _sites_by_id():
     """Return a mapping of site_id (int) -> site dict.
 
@@ -342,6 +342,7 @@ NSW_MAP_BOUNDS = {
     "south": -37.50528021,
     "north": -28.15701999,
 }
+NSW_STATES_GEOJSON = CURRENT_DIR / "assets" / "australian-states.json"
 BASE_FONT_FAMILY = '"Source Sans 3", "Aptos", "Segoe UI", Helvetica, Arial, sans-serif'
 INITIAL_MONITOR_ROWS = []
 INITIAL_MONITOR_STATUS = "Monitoring feed is loading."
@@ -359,10 +360,6 @@ _LAST_AQMS_SNAPSHOT = {"ts": None, "sites": {}}
 # Hold the prior snapshot for comparison so UI rendering can compare against the
 # snapshot immediately before the latest refresh (prevents overwriting arrows).
 _PRIOR_AQMS_SNAPSHOT = None
-_LAST_GOOD_MONITOR_MAP_ROWS = []
-_LAST_GOOD_MONITOR_MAP_HTML = None
-_LAST_GOOD_FORECAST_MAP_HTML = None
-_LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML = None
 # Attempt to seed from disk on import so arrows survive restarts
 try:
     disk_snap = _load_last_aqms_snapshot_from_disk()
@@ -370,6 +367,71 @@ try:
         _LAST_AQMS_SNAPSHOT = disk_snap
 except Exception:
     pass
+
+
+@lru_cache(maxsize=1)
+def _nsw_geojson_geometry():
+    try:
+        payload = json.loads(NSW_STATES_GEOJSON.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    for feature in payload.get("features") or []:
+        props = feature.get("properties") or {}
+        if str(props.get("STATE_NAME") or "").strip().lower() == "new south wales":
+            return feature.get("geometry") or None
+    return None
+
+
+def _point_in_ring(lon, lat, ring):
+    inside = False
+    if not ring:
+        return False
+    j = len(ring) - 1
+    for i, point in enumerate(ring):
+        xi, yi = point[:2]
+        xj, yj = ring[j][:2]
+        if (yi > lat) != (yj > lat):
+            cross_lon = (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi
+            if lon < cross_lon:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon(lon, lat, polygon):
+    if not polygon:
+        return False
+    if not _point_in_ring(lon, lat, polygon[0]):
+        return False
+    return not any(_point_in_ring(lon, lat, hole) for hole in polygon[1:])
+
+
+def _point_in_nsw(lat, lon):
+    try:
+        lat_num = float(lat)
+        lon_num = float(lon)
+    except (TypeError, ValueError):
+        return False
+
+    if not (
+        NSW_MAP_BOUNDS["west"] <= lon_num <= NSW_MAP_BOUNDS["east"]
+        and NSW_MAP_BOUNDS["south"] <= lat_num <= NSW_MAP_BOUNDS["north"]
+    ):
+        return False
+
+    geometry = _nsw_geojson_geometry()
+    if not geometry:
+        return True
+
+    coordinates = geometry.get("coordinates") or []
+    geom_type = geometry.get("type")
+    if geom_type == "Polygon":
+        return _point_in_polygon(lon_num, lat_num, coordinates)
+    if geom_type == "MultiPolygon":
+        return any(_point_in_polygon(lon_num, lat_num, polygon) for polygon in coordinates)
+    return True
+
+
 STATION_SERIES_PALETTE = [
     "#2563eb",
     "#16a34a",
@@ -442,221 +504,6 @@ DEFAULT_SELECTION = {
 }
 
 
-FORECAST_FIELD_KEYS = {
-    "date": "date",
-    "models": "models",
-    "pollutants": "pollutants",
-    "timeScopes": "timeScopes",
-    "regions": "regions",
-}
-
-
-def _complete_forecast_file_params():
-    return [
-        candidate
-        for candidate in FILE_KEY_PARAMS
-        if all(candidate.get(key) for key in ("date", "models", "pollutants", "timeScopes", "regions"))
-    ]
-
-
-def _forecast_params_for(date=None, model=None, pollutant=None, horizon=None, region=None):
-    records = []
-    for candidate in _complete_forecast_file_params():
-        if date and str(candidate.get("date") or "") != str(date):
-            continue
-        if model and str(candidate.get("models") or "") != str(model):
-            continue
-        if pollutant and str(candidate.get("pollutants") or "") != str(pollutant):
-            continue
-        if horizon and str(candidate.get("timeScopes") or "") != str(horizon):
-            continue
-        if region and str(candidate.get("regions") or "") != str(region):
-            continue
-        records.append(candidate)
-    return records
-
-
-def _sort_validation_dates(values):
-    return sorted(
-        {str(value) for value in values if value},
-        key=lambda value: (_parse_run_date(value) or datetime.min, value),
-        reverse=True,
-    )
-
-
-def _validation_date_options():
-    return [{"label": value, "value": value} for value in _sort_validation_dates(kp.get("date") for kp in _complete_forecast_file_params())]
-
-
-def _validation_pollutant_options(date=None):
-    values = sorted({str(kp.get("pollutants") or "") for kp in _forecast_params_for(date=date) if kp.get("pollutants")})
-    return [{"label": pollutant_display(value), "value": value} for value in values]
-
-
-def _validation_horizon_options(date=None, pollutant=None):
-    def sort_key(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 10**6
-
-    values = sorted(
-        {str(kp.get("timeScopes") or "") for kp in _forecast_params_for(date=date, pollutant=pollutant) if kp.get("timeScopes")},
-        key=sort_key,
-    )
-    return [{"label": f"{value} hours", "value": value} for value in values]
-
-
-def _validation_region_options(date=None, pollutant=None, horizon=None):
-    values = sorted(
-        {str(kp.get("regions") or "") for kp in _forecast_params_for(date=date, pollutant=pollutant, horizon=horizon) if kp.get("regions")}
-    )
-    return [{"label": value.replace("_", " "), "value": value} for value in values]
-
-
-def _validation_pick_value(options, current_value=None):
-    values = [option.get("value") for option in options or []]
-    if current_value in values:
-        return current_value
-    return values[0] if values else None
-
-
-def _validation_model_for_selection(date=None, pollutant=None, horizon=None, region=None):
-    matches = _forecast_params_for(date=date, pollutant=pollutant, horizon=horizon, region=region)
-    if not matches:
-        return DEFAULT_SELECTION.get("models")
-    preferred = str(DEFAULT_SELECTION.get("models") or "")
-    for candidate in matches:
-        model = str(candidate.get("models") or "")
-        if model == preferred:
-            return model
-    return sorted(str(candidate.get("models") or "") for candidate in matches if candidate.get("models"))[0]
-
-
-def _forecast_sort_values(field, values):
-    values = {str(value) for value in values if value}
-    if field == "date":
-        return _sort_validation_dates(values)
-    if field == "timeScopes":
-        def horizon_key(value):
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return 10**6
-
-        return sorted(values, key=horizon_key)
-    return sorted(values)
-
-
-def _forecast_option_label(field, value):
-    value = str(value)
-    if field == "pollutants":
-        return pollutant_display(value)
-    if field == "timeScopes":
-        return f"{value} hours"
-    if field == "regions":
-        return value.replace("_", " ")
-    return value
-
-
-def _forecast_options_for_field(field, selection):
-    records = _complete_forecast_file_params()
-    for other_field, key in FORECAST_FIELD_KEYS.items():
-        if other_field == field:
-            continue
-        value = selection.get(other_field)
-        if value:
-            records = [record for record in records if str(record.get(key) or "") == str(value)]
-    values = _forecast_sort_values(field, (record.get(FORECAST_FIELD_KEYS[field]) for record in records))
-    return [{"label": _forecast_option_label(field, value), "value": value} for value in values]
-
-
-def _forecast_selection_is_available(selection):
-    return bool(
-        _forecast_params_for(
-            date=selection.get("date"),
-            model=selection.get("models"),
-            pollutant=selection.get("pollutants"),
-            horizon=selection.get("timeScopes"),
-            region=selection.get("regions"),
-        )
-    )
-
-
-def _normalise_forecast_selection(selection, priority_field=None):
-    records = _complete_forecast_file_params()
-    if not records:
-        return dict(selection or {})
-
-    selected = {field: (selection or {}).get(field) for field in FORECAST_FIELD_KEYS}
-    priority_value = selected.get(priority_field) if priority_field else None
-    priority_matches = []
-    if priority_field and priority_value:
-        priority_matches = [
-            record
-            for record in records
-            if str(record.get(FORECAST_FIELD_KEYS[priority_field]) or "") == str(priority_value)
-        ]
-    pool = priority_matches or records
-
-    def score(record):
-        matched = 0
-        for field, key in FORECAST_FIELD_KEYS.items():
-            value = selected.get(field)
-            if value and str(record.get(key) or "") == str(value):
-                matched += 1
-        parsed_date = _parse_run_date(record.get("date")) or datetime.min
-        try:
-            horizon_value = int(record.get("timeScopes") or 0)
-        except (TypeError, ValueError):
-            horizon_value = 0
-        return (
-            1 if priority_matches else 0,
-            matched,
-            parsed_date,
-            horizon_value,
-            str(record.get("models") or ""),
-            str(record.get("pollutants") or ""),
-            str(record.get("regions") or ""),
-        )
-
-    chosen = max(pool, key=score)
-    return {
-        "date": str(chosen.get("date") or ""),
-        "models": str(chosen.get("models") or ""),
-        "pollutants": str(chosen.get("pollutants") or ""),
-        "timeScopes": str(chosen.get("timeScopes") or ""),
-        "regions": str(chosen.get("regions") or ""),
-    }
-
-
-INITIAL_FORECAST_SELECTION = _normalise_forecast_selection(DEFAULT_SELECTION, priority_field="date")
-DEFAULT_SELECTION.update(
-    {
-        "date": INITIAL_FORECAST_SELECTION.get("date") or DEFAULT_SELECTION.get("date"),
-        "models": INITIAL_FORECAST_SELECTION.get("models") or DEFAULT_SELECTION.get("models"),
-        "pollutants": INITIAL_FORECAST_SELECTION.get("pollutants") or DEFAULT_SELECTION.get("pollutants"),
-        "timeScopes": INITIAL_FORECAST_SELECTION.get("timeScopes") or DEFAULT_SELECTION.get("timeScopes"),
-        "regions": INITIAL_FORECAST_SELECTION.get("regions") or DEFAULT_SELECTION.get("regions"),
-    }
-)
-INITIAL_FORECAST_DATE_OPTIONS = _forecast_options_for_field("date", INITIAL_FORECAST_SELECTION)
-INITIAL_FORECAST_MODEL_OPTIONS = _forecast_options_for_field("models", INITIAL_FORECAST_SELECTION)
-INITIAL_FORECAST_POLLUTANT_OPTIONS = _forecast_options_for_field("pollutants", INITIAL_FORECAST_SELECTION)
-INITIAL_FORECAST_HORIZON_OPTIONS = _forecast_options_for_field("timeScopes", INITIAL_FORECAST_SELECTION)
-INITIAL_FORECAST_REGION_OPTIONS = _forecast_options_for_field("regions", INITIAL_FORECAST_SELECTION)
-
-
-INITIAL_VALIDATION_DATE_OPTIONS = _validation_date_options()
-INITIAL_VALIDATION_DATE = _validation_pick_value(INITIAL_VALIDATION_DATE_OPTIONS, DEFAULT_SELECTION.get("date"))
-INITIAL_VALIDATION_POLLUTANT_OPTIONS = _validation_pollutant_options(INITIAL_VALIDATION_DATE)
-INITIAL_VALIDATION_POLLUTANT = _validation_pick_value(INITIAL_VALIDATION_POLLUTANT_OPTIONS, DEFAULT_SELECTION.get("pollutants"))
-INITIAL_VALIDATION_HORIZON_OPTIONS = _validation_horizon_options(INITIAL_VALIDATION_DATE, INITIAL_VALIDATION_POLLUTANT)
-INITIAL_VALIDATION_HORIZON = _validation_pick_value(INITIAL_VALIDATION_HORIZON_OPTIONS, DEFAULT_SELECTION.get("timeScopes"))
-INITIAL_VALIDATION_REGION_OPTIONS = _validation_region_options(INITIAL_VALIDATION_DATE, INITIAL_VALIDATION_POLLUTANT, INITIAL_VALIDATION_HORIZON)
-INITIAL_VALIDATION_REGION = _validation_pick_value(INITIAL_VALIDATION_REGION_OPTIONS, DEFAULT_SELECTION.get("regions"))
-
-
 # Defaults for monitoring dropdowns (avoid import-time NameErrors)
 MONITOR_REGION_OPTIONS = [
     {"label": "All NSW", "value": "ALL"},
@@ -665,57 +512,11 @@ for r in sorted(set(OPTIONS.get("regions") or [])):
     if str(r).upper() != "ALL":
         MONITOR_REGION_OPTIONS.append({"label": str(r), "value": str(r)})
 
-MONITOR_DEFAULT_REGION = "ALL"
-_MONITOR_SITE_REGIONS = {
-    str((site or {}).get("Region") or "").strip()
-    for site in load_sites()
-    if str((site or {}).get("Region") or "").strip()
-}
-if MONITOR_DEFAULT_REGION not in _MONITOR_SITE_REGIONS:
-    MONITOR_DEFAULT_REGION = "ALL"
-elif MONITOR_DEFAULT_REGION not in {opt.get("value") for opt in MONITOR_REGION_OPTIONS}:
-    MONITOR_REGION_OPTIONS.append({"label": MONITOR_DEFAULT_REGION, "value": MONITOR_DEFAULT_REGION})
-
 MONITOR_POLLUTANT_OPTIONS = [
     {"label": "PM2.5", "value": "PM2.5"},
     {"label": "PM10", "value": "PM10"},
     {"label": "O3", "value": "O3"},
 ]
-
-MONITOR_REGION_SERIES_POLLUTANTS = ["PM2.5", "PM10", "O3"]
-MONITOR_REGION_SERIES_COLORS = [
-    "#2563eb",
-    "#7c3aed",
-    "#0f766e",
-    "#ea580c",
-    "#db2777",
-    "#16a34a",
-    "#ca8a04",
-    "#4f46e5",
-    "#0891b2",
-    "#dc2626",
-    "#475569",
-]
-MONITOR_REGION_SERIES_OPTIONS = [
-    {"label": title_case_station_name(site_region), "value": str(site_region).replace(" ", "_")}
-    for site_region in sorted(
-        {
-            str((site or {}).get("Region") or "").strip()
-            for site in load_sites()
-            if str((site or {}).get("Region") or "").strip()
-            and "offline" not in str((site or {}).get("Region") or "").strip().lower()
-        }
-    )
-]
-MONITOR_REGION_SERIES_PREFERRED_DEFAULT = "Sydney_East"
-MONITOR_REGION_SERIES_DEFAULT_VALUE = MONITOR_REGION_SERIES_PREFERRED_DEFAULT
-if MONITOR_REGION_SERIES_DEFAULT_VALUE not in {opt.get("value") for opt in MONITOR_REGION_SERIES_OPTIONS}:
-    MONITOR_REGION_SERIES_DEFAULT_VALUE = (MONITOR_REGION_SERIES_OPTIONS[0]["value"] if MONITOR_REGION_SERIES_OPTIONS else None)
-MONITOR_REGION_SERIES_PLOT_COLORS = {
-    "PM2.5": "#f59e0b",
-    "PM10": "#0ea5e9",
-    "O3": "#10b981",
-}
 
 MONITOR_CATEGORY_OPTIONS = [{"label": k.title().replace("_", " "), "value": k} for k in (MONITORING_CATEGORY_COLORS.keys() if 'MONITORING_CATEGORY_COLORS' in globals() else [])]
 
@@ -749,79 +550,30 @@ def _format_forecast_label(value):
     return f"{hour}{meridiem} / {parsed.day} {parsed.strftime('%b %Y')}"
 
 
-def _forecast_datetime_sydney(value):
-    parsed = _parse_forecast_timestamp(value)
-    if not parsed:
-        return None
-    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
-        return parsed.replace(tzinfo=SYDNEY_TZ)
-    return parsed.astimezone(SYDNEY_TZ)
+def _forecast_live_base_index(times):
+    index, _has_upcoming = _forecast_live_base_state(times)
+    return index
 
 
-def _forecast_live_base_index(times, now=None):
-    """Pick the forecast index that best matches the current Sydney hour."""
+def _forecast_live_base_state(times):
     if not times:
-        return 0
-    parsed_times = [_forecast_datetime_sydney(item) for item in times]
-    indexed_times = [(idx, dt) for idx, dt in enumerate(parsed_times) if dt is not None]
-    if not indexed_times:
-        return 0
-
-    now_dt = now or datetime.now(SYDNEY_TZ)
-    if now_dt.tzinfo is None or now_dt.tzinfo.utcoffset(now_dt) is None:
-        now_dt = now_dt.replace(tzinfo=SYDNEY_TZ)
-    else:
-        now_dt = now_dt.astimezone(SYDNEY_TZ)
-
-    future_times = [(idx, dt) for idx, dt in indexed_times if dt >= now_dt]
-    if future_times:
-        return min(future_times, key=lambda item: item[1])[0]
-
-    target_minutes = now_dt.hour * 60
-
-    def minute_delta(item):
-        _idx, dt = item
-        candidate_minutes = dt.hour * 60 + dt.minute
-        return (candidate_minutes - target_minutes) % (24 * 60)
-
-    return min(indexed_times, key=minute_delta)[0]
-
-
-def _forecast_hour_label(value):
-    parsed = _forecast_datetime_sydney(value)
-    if not parsed:
-        return str(value or "--")
-    hour = parsed.strftime("%I").lstrip("0") or "0"
-    return f"{hour}{parsed.strftime('%p')}"
-
-
-def _monitor_region_series_key(value):
-    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
-
-
-def _monitor_region_series_station_options(region_value):
-    region_key = _monitor_region_series_key(region_value)
-    if not region_key:
-        return []
-    site_lookup = _sites_by_id()
-    options = []
-    for site_id, site in sorted(
-        site_lookup.items(),
-        key=lambda item: title_case_station_name(item[1].get("SiteName") or f"Site {item[0]}")
-    ):
-        if _monitor_region_series_key((site or {}).get("Region")) != region_key:
+        return 0, False
+    now = datetime.now(SYDNEY_TZ)
+    target = now.replace(minute=0, second=0, microsecond=0)
+    if now.minute or now.second or now.microsecond:
+        target += timedelta(hours=1)
+    fallback = max(len(times) - 1, 0)
+    for index, value in enumerate(times):
+        parsed = _parse_forecast_timestamp(value)
+        if not parsed:
             continue
-        station_name = title_case_station_name(site.get("SiteName") or f"Site {site_id}")
-        options.append({"label": station_name, "value": f"aqms:{int(site_id)}"})
-    return options
-
-
-MONITOR_REGION_SERIES_DEFAULT_STATION_OPTIONS = _monitor_region_series_station_options(MONITOR_REGION_SERIES_DEFAULT_VALUE)
-MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE = (
-    MONITOR_REGION_SERIES_DEFAULT_STATION_OPTIONS[0]["value"]
-    if MONITOR_REGION_SERIES_DEFAULT_STATION_OPTIONS
-    else None
-)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=SYDNEY_TZ)
+        else:
+            parsed = parsed.astimezone(SYDNEY_TZ)
+        if parsed >= target:
+            return index, True
+    return fallback, False
 
 
 def _station_plot_axes():
@@ -887,6 +639,26 @@ def _parse_monitor_time(row):
             continue
     try:
         parsed_hour = int(hour_value)
+    except (TypeError, ValueError):
+        parsed_hour = -1
+    if not parsed_date:
+        return (datetime.min, parsed_hour)
+    return (parsed_date, parsed_hour)
+
+
+def _parse_raw_observation_time(item):
+    if not item:
+        return (datetime.min, -1)
+    date_value = str(item.get("Date") or item.get("date") or "").strip()
+    parsed_date = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            parsed_date = datetime.strptime(date_value, fmt)
+            break
+        except ValueError:
+            continue
+    try:
+        parsed_hour = int(item.get("Hour") or item.get("hour") or -1)
     except (TypeError, ValueError):
         parsed_hour = -1
     if not parsed_date:
@@ -1100,265 +872,30 @@ def _category_payload(pollutant_label, value, category_hint=None):
     return label, colour, key.replace("-", " ").upper()
 
 
-MONITOR_MAP_POLLUTANTS = ("PM2.5", "PM10", "O3", "NO2", "NO", "NOX", "SO2", "CO")
 
-
-def _monitor_category_severity(row):
-    key = str((row or {}).get("category") or "").strip().lower()
-    order = {"no data": -1, "good": 0, "fair": 1, "poor": 2, "very poor": 3, "extremely poor": 4}
-    return order.get(key, -1)
-
-
-def _monitor_display_value(row):
-    if not row:
-        return "--"
-    value_label = row.get("value_label")
-    if value_label not in (None, ""):
-        return str(value_label)
-    value = row.get("value")
-    if value is None:
-        return "--"
-    try:
-        return f"{float(value):.1f}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _monitor_has_numeric_value(row):
-    if not row:
-        return False
-    value = row.get("value")
-    if value is None:
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _as_dict(value):
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _aqms_parameter(item):
-    if not isinstance(item, dict):
-        return {}
-    param = item.get("Parameter")
-    if isinstance(param, str):
-        text = param.strip()
-        if text:
-            try:
-                param = json.loads(text)
-            except Exception:
-                param = {}
-        else:
-            param = {}
-    if not isinstance(param, dict):
-        param = {}
-    if not param.get("ParameterCode") and item.get("ParameterCode"):
-        param = dict(param)
-        param["ParameterCode"] = item.get("ParameterCode")
-    if not param.get("ParameterDescription") and item.get("ParameterDescription"):
-        param = dict(param)
-        param["ParameterDescription"] = item.get("ParameterDescription")
-    if not param.get("Frequency") and item.get("Frequency"):
-        param = dict(param)
-        param["Frequency"] = item.get("Frequency")
-    return param
-
-
-def _parse_aqms_time_point(item):
-    item = item or {}
-    date_text = item.get("Date") or item.get("date")
-    hour = item.get("Hour") if item.get("Hour") is not None else item.get("hour")
-    if not date_text:
-        return None
-    try:
-        base = datetime.strptime(str(date_text), "%Y-%m-%d")
-    except ValueError:
-        return None
-    try:
-        hour = int(hour)
-    except (TypeError, ValueError):
-        hour = None
-    if not hour:
-        return base.replace(tzinfo=SYDNEY_TZ)
-    return (base + timedelta(hours=max(hour - 1, 0))).replace(tzinfo=SYDNEY_TZ)
-
-
-def _monitor_latest_datetime(monitor_store):
-    monitor_store = monitor_store or {}
-    candidates = []
-    for key in ("aqmsRows", "aqmsPm25Rows", "aqmsPm10Rows", "aqmsO3Rows", "aqcRows"):
-        latest = _monitoring_time_row(monitor_store.get(key) or [])
-        ts = _parse_aqms_time_point(latest) if latest else None
-        if ts:
-            candidates.append((ts, latest))
-    if not candidates:
-        return None, {}
-    return max(candidates, key=lambda item: item[0])
-
-
-def _monitor_data_age_hours(monitor_store):
-    latest_dt, _latest = _monitor_latest_datetime(monitor_store)
-    if not latest_dt:
-        return None
-    now = datetime.now(SYDNEY_TZ)
-    if latest_dt.tzinfo is None:
-        latest_dt = latest_dt.replace(tzinfo=SYDNEY_TZ)
-    return (now - latest_dt.astimezone(SYDNEY_TZ)).total_seconds() / 3600.0
-
-
-def _monitor_data_is_stale(monitor_store, max_age_hours=4):
-    age_hours = _monitor_data_age_hours(monitor_store)
-    if age_hours is None:
-        return False
-    return age_hours > float(max_age_hours)
-
-
-def _monitor_time_window_label(row):
-    if not row:
-        return "--"
-    hour_desc = row.get("hour_description") or "--"
-    date_text = row.get("date") or ""
-    if date_text:
-        return f"{hour_desc} AEST, {date_text}"
-    return f"{hour_desc} AEST"
-
-
-def _monitor_updated_label(monitor_store):
-    monitor_store = monitor_store or {}
-    rows = monitor_store.get("aqmsPm25Rows") or []
-    latest = _monitoring_time_row(rows)
-    if not latest:
-        error = monitor_store.get("error")
-        if error:
-            return "Updated on: -- (AQMS feed offline)"
-        return "Updated on: -- (loading)"
-    label = _monitor_time_window_label(latest)
-    if _monitor_data_is_stale(monitor_store):
-        return f"Last cached: {label} (waiting for live AQMS)"
-    return f"Updated on: {label}"
-
-
-def _monitor_header_timestamp_label(monitor_store):
-    latest_dt, _latest = _monitor_latest_datetime(monitor_store)
-    if latest_dt:
-        return latest_dt.astimezone(SYDNEY_TZ).strftime("%d %b %H:%M %Z")
-    epoch = (monitor_store or {}).get("fetchedAtEpoch")
-    return _format_header_timestamp(epoch) if epoch is not None else "--"
-
-
-def _aqms_station_map_rows(row_groups, selected_pollutant="PM2.5"):
-    """Build AQMS map markers for stations with available selected pollutant data."""
-    row_groups = row_groups or {}
-    selected_pollutant = str(selected_pollutant or "PM2.5").strip() or "PM2.5"
-
-    rows_by_site = {}
-    sites = _sites_by_id()
-    site_ids = set()
-    for pollutant_label, rows in row_groups.items():
-        for row in rows or []:
-            site_id = row.get("site_id")
-            if site_id is None:
-                continue
-            try:
-                site_id = int(site_id)
-            except (TypeError, ValueError):
-                continue
-            site_ids.add(site_id)
-            rows_by_site.setdefault(site_id, {})[pollutant_label] = row
-
-    out = []
-    for site_id in sorted(site_ids):
-        site = sites.get(int(site_id), {})
-        site_rows = rows_by_site.get(int(site_id), {})
-        any_row = next((row for row in site_rows.values() if row), {})
-        lat = site.get("Latitude", any_row.get("lat"))
-        lon = site.get("Longitude", any_row.get("lon"))
-        station = title_case_station_name(site.get("SiteName") or any_row.get("station") or f"Site {site_id}")
-        region = site.get("Region") or any_row.get("region") or ""
-
-        selected_row = site_rows.get(selected_pollutant)
-        if not _monitor_has_numeric_value(selected_row):
-            continue
-        latest_row = max([row for row in site_rows.values() if row], key=_parse_monitor_time, default={})
-        aqc_row = site_rows.get("AQC")
-        ranked_rows = [row for label, row in site_rows.items() if label != "AQC" and row]
-        worst_row = max(ranked_rows, key=_monitor_category_severity, default={})
-        category_row = aqc_row or worst_row or selected_row or latest_row or {}
-
-        values = []
-        for pollutant_label in MONITOR_MAP_POLLUTANTS:
-            row = site_rows.get(pollutant_label)
-            if not _monitor_has_numeric_value(row):
-                continue
-            pollutant_meta = POLLUTANTS.get(pollutant_label) or {}
-            units = pollutant_meta.get("Units") or ""
-            values.append(
-                {
-                    "pollutant": pollutant_label,
-                    "value": _monitor_display_value(row),
-                    "units": units,
-                    "category": (row or {}).get("category") or "No data",
-                    "time": (row or {}).get("hour_description") or "",
-                    "date": (row or {}).get("date") or "",
-                }
-            )
-
-        out.append(
-            {
-                "site_id": int(site_id),
-                "station": station,
-                "lat": lat,
-                "lon": lon,
-                "region": region,
-                "date": latest_row.get("date") or category_row.get("date") or "",
-                "hour": latest_row.get("hour") or category_row.get("hour") or "",
-                "hour_description": latest_row.get("hour_description") or category_row.get("hour_description") or "",
-                "value": (selected_row or {}).get("value"),
-                "value_label": _monitor_display_value(selected_row),
-                "category": category_row.get("category") or "No data",
-                "category_key": category_row.get("category_key") or "NO DATA",
-                "category_color": category_row.get("category_color") or MONITORING_CATEGORY_COLORS["NO DATA"],
-                "determining_pollutant": category_row.get("determining_pollutant") or selected_pollutant,
-                "values": values,
-                "source": "AQMS",
-            }
-        )
-
-    return out
-
-
-
-def _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label):
+def _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label, source_label="AQMS"):
     raw_obs = raw_obs or []
     latest_by_site = {}
     for item in raw_obs:
-        param = _aqms_parameter(item)
+        param = item.get("Parameter") or {}
         if param.get("ParameterCode") != parameter_code:
             continue
         if (param.get("Frequency") or "").strip() != "Hourly average":
             continue
 
         site_id = item.get("Site_Id")
-        if site_id is None:
+        try:
+            site_id_int = int(site_id)
+        except (TypeError, ValueError):
             continue
         try:
             hour_value = int(item.get("Hour") or -1)
         except (TypeError, ValueError):
             hour_value = -1
-        existing = latest_by_site.get(site_id)
-        if existing is None or hour_value >= existing["_hour"]:
-            latest_by_site[site_id] = dict(item, _hour=hour_value)
+        observation_time = _parse_raw_observation_time(item)
+        existing = latest_by_site.get(site_id_int)
+        if existing is None or observation_time >= existing["_time"]:
+            latest_by_site[site_id_int] = dict(item, _hour=hour_value, _time=observation_time)
 
     rows = []
     for site_id, item in latest_by_site.items():
@@ -1385,7 +922,7 @@ def _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label):
                 "category_key": category_key,
                 "category_color": colour,
                 "determining_pollutant": item.get("DeterminingPollutant") or pollutant_label,
-                "source": "AQMS",
+                "source": source_label,
             }
         )
 
@@ -1398,68 +935,6 @@ def _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label):
     return rows
 
 
-def _aqms_previous_hour_values_by_site(raw_obs, history_rows=None):
-    raw_obs = raw_obs or []
-    history_rows = history_rows or []
-    code_to_label = {
-        (POLLUTANTS.get("PM2.5") or {}).get("ParameterCode"): "PM2.5",
-        (POLLUTANTS.get("PM10") or {}).get("ParameterCode"): "PM10",
-        (POLLUTANTS.get("O3") or {}).get("ParameterCode"): "O3",
-        (POLLUTANTS.get("CO") or {}).get("ParameterCode"): "CO",
-        (POLLUTANTS.get("NO2") or {}).get("ParameterCode"): "NO2",
-        (POLLUTANTS.get("SO2") or {}).get("ParameterCode"): "SO2",
-        "NO": "NO",
-        "NOX": "NOX",
-    }
-    series_by_site = {}
-    for item in list(history_rows) + list(raw_obs):
-        if not isinstance(item, dict):
-            continue
-        param = _aqms_parameter(item)
-        code = str(param.get("ParameterCode") or "").strip()
-        label = code_to_label.get(code)
-        if not label:
-            continue
-        if (param.get("Frequency") or "").strip() != "Hourly average":
-            continue
-        site_id = item.get("Site_Id")
-        if site_id is None:
-            continue
-        ts = _parse_aqms_time_point(item)
-        if ts is None:
-            continue
-        value = item.get("Value")
-        try:
-            value_num = float(value) if value is not None else None
-        except (TypeError, ValueError):
-            value_num = None
-        if value_num is None:
-            continue
-        try:
-            site_key = int(site_id)
-        except Exception:
-            continue
-        series_by_site.setdefault(site_key, {}).setdefault(label, {})[ts] = value_num
-
-    out = {}
-    for site_id, pollutant_map in series_by_site.items():
-        site_payload = {}
-        for label, ts_map in pollutant_map.items():
-            points = sorted(ts_map.items(), key=lambda item: item[0])
-            if not points:
-                continue
-            latest_value = points[-1][1]
-            previous_value = points[-2][1] if len(points) > 1 else None
-            site_payload[label] = {
-                "current": latest_value,
-                "previous": previous_value,
-                "delta": (latest_value - previous_value) if previous_value is not None else None,
-            }
-        if site_payload:
-            out[site_id] = site_payload
-    return out
-
-
 def _aqms_window_by_region(raw_obs, parameter_code, hours=6, aggregator="mean"):
     """Aggregate an AQMS parameter over the last `hours` for each region.
 
@@ -1470,7 +945,7 @@ def _aqms_window_by_region(raw_obs, parameter_code, hours=6, aggregator="mean"):
     buckets = {}
     units = ""
     for item in raw_obs:
-        param = _aqms_parameter(item)
+        param = item.get("Parameter") or {}
         if param.get("ParameterCode") != parameter_code:
             continue
         if (param.get("Frequency") or "").strip() != "Hourly average":
@@ -1542,14 +1017,13 @@ def _fetch_met_history(region_name, start_iso, end_iso):
 
 @lru_cache(maxsize=128)
 def _fetch_met_history_for_sites(site_ids_tuple, start_iso, end_iso):
-    return _monitor_history_rows_for_sites(
-        tuple(site_ids_tuple or ()),
-        ("TEMP", "HUMID", "WSP", "RAIN"),
-        start_iso,
-        end_iso,
-        live_timeout=6,
-        fallback_hours=24,
-    )
+    site_ids = [int(x) for x in (site_ids_tuple or ()) if x is not None]
+    if not site_ids:
+        return []
+    try:
+        return fetch_observation_history(site_ids, ["TEMP", "HUMID", "WSP", "RAIN"], start_iso, end_iso, timeout=6)
+    except Exception:
+        return []
 
 
 def _met_series_for_region(region_name, site_ids, hours=6):
@@ -1645,8 +1119,6 @@ def _purpleair_rows_for_pollutant(sensors, pollutant_label):
             value_num = float(value) if value is not None else None
         except (TypeError, ValueError):
             value_num = None
-        if value_num is None or not math.isfinite(value_num):
-            continue
         category_label, colour, category_key = _category_payload(pollutant_label, value_num, None)
         rows.append(
             {
@@ -1703,14 +1175,12 @@ def _monitor_kpi_payload(aqms_rows, purpleair_rows, clusters, latest_label, comp
     }
 
 
-def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, previous_by_site=None, max_rows=40):
+def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, max_rows=40):
     rows = []
     snapshot_by_site = snapshot_by_site or {}
-    previous_by_site = previous_by_site or {}
     for row in (aqms_rows or [])[: max_rows // 2]:
         site_id = row.get("site_id")
         bucket = snapshot_by_site.get(int(site_id)) if site_id is not None else {}
-        prev_bucket = previous_by_site.get(int(site_id)) if site_id is not None else {}
         pm25_r = bucket.get("PM2.5") if isinstance(bucket, dict) else None
         pm10_r = bucket.get("PM10") if isinstance(bucket, dict) else None
         o3_r = bucket.get("O3") if isinstance(bucket, dict) else None
@@ -1721,18 +1191,15 @@ def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, previo
                 "pollutant": row.get("determining_pollutant") or "--",
                 "hour": row.get("hour_description") or "--",
                 "source": "AQMS",
-                "pm25": (pm25_r or {}).get("value_label") or "--",
-                "pm10": (pm10_r or {}).get("value_label") or "--",
-                "o3": (o3_r or {}).get("value_label") or "--",
+                "pm25": _format_value_with_arrow(site_id, "PM2.5", (pm25_r or {}).get("value_label") or "--", (pm25_r or {}).get("value")),
+                "pm10": _format_value_with_arrow(site_id, "PM10", (pm10_r or {}).get("value_label") or "--", (pm10_r or {}).get("value")),
+                "o3": _format_value_with_arrow(site_id, "O3", (o3_r or {}).get("value_label") or "--", (o3_r or {}).get("value")),
                 "pm25_category": (pm25_r or {}).get("category") or "No data",
                 "pm10_category": (pm10_r or {}).get("category") or "No data",
                 "o3_category": (o3_r or {}).get("category") or "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"aqms:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
-                "pm25_previous": (prev_bucket or {}).get("PM2.5", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "pm10_previous": (prev_bucket or {}).get("PM10", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "o3_previous": (prev_bucket or {}).get("O3", {}).get("previous") if isinstance(prev_bucket, dict) else None,
             }
         )
     for row in (purpleair_rows or [])[: max_rows - len(rows)]:
@@ -1758,64 +1225,15 @@ def _monitor_table_rows(aqms_rows, purpleair_rows, snapshot_by_site=None, previo
     return rows
 
 
-def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None, previous_by_site=None):
+def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None):
     rows = []
     snapshot_by_site = snapshot_by_site or {}
-    previous_by_site = previous_by_site or {}
-    present_site_ids = set()
-
-    def _aqms_placeholder_row(site_id, site):
-        station = title_case_station_name(site.get("SiteName") or site.get("StationName") or f"Site {site_id}")
-        region = str(site.get("Region") or "--").strip() or "--"
-        return {
-            "station": station,
-            "region": region,
-            "pollutant": "--",
-            "hour": "--",
-            "source": "AQMS",
-            "pm25": "--",
-            "pm10": "--",
-            "o3": "--",
-            "co": "--",
-            "no": "--",
-            "no2": "--",
-            "nox": "--",
-            "pm25_category": "No data",
-            "pm10_category": "No data",
-            "o3_category": "No data",
-            "co_category": "No data",
-            "no_category": "No data",
-            "no2_category": "No data",
-            "nox_category": "No data",
-            "category": "No data",
-            "monitorKey": f"aqms:{site_id}",
-            "categoryColor": MONITORING_CATEGORY_COLORS["NO DATA"],
-            "is_placeholder": True,
-            "pm25_previous": None,
-            "pm10_previous": None,
-            "o3_previous": None,
-            "co_previous": None,
-            "no_previous": None,
-            "no2_previous": None,
-            "nox_previous": None,
-        }
-
     for row in aqms_rows or []:
         site_id = row.get("site_id")
         bucket = snapshot_by_site.get(int(site_id)) if site_id is not None else {}
-        prev_bucket = previous_by_site.get(int(site_id)) if site_id is not None else {}
-        if site_id is not None:
-            try:
-                present_site_ids.add(int(site_id))
-            except (TypeError, ValueError):
-                pass
         pm25_r = bucket.get("PM2.5") if isinstance(bucket, dict) else None
         pm10_r = bucket.get("PM10") if isinstance(bucket, dict) else None
         o3_r = bucket.get("O3") if isinstance(bucket, dict) else None
-        co_r = bucket.get("CO") if isinstance(bucket, dict) else None
-        no_r = bucket.get("NO") if isinstance(bucket, dict) else None
-        no2_r = bucket.get("NO2") if isinstance(bucket, dict) else None
-        nox_r = bucket.get("NOX") if isinstance(bucket, dict) else None
         rows.append(
             {
                 "station": row.get("station"),
@@ -1823,45 +1241,17 @@ def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None, pr
             "pollutant": row.get("determining_pollutant") or "--",
                 "hour": row.get("hour_description") or "--",
                 "source": "AQMS",
-                "pm25": (pm25_r or {}).get("value_label") or "--",
-                "pm10": (pm10_r or {}).get("value_label") or "--",
-                "o3": (o3_r or {}).get("value_label") or "--",
-                "co": (co_r or {}).get("value_label") or "--",
-                "no": (no_r or {}).get("value_label") or "--",
-                "no2": (no2_r or {}).get("value_label") or "--",
-                "nox": (nox_r or {}).get("value_label") or "--",
+                "pm25": _format_value_with_arrow(site_id, "PM2.5", (pm25_r or {}).get("value_label") or "--", (pm25_r or {}).get("value")),
+                "pm10": _format_value_with_arrow(site_id, "PM10", (pm10_r or {}).get("value_label") or "--", (pm10_r or {}).get("value")),
+                "o3": _format_value_with_arrow(site_id, "O3", (o3_r or {}).get("value_label") or "--", (o3_r or {}).get("value")),
                 "pm25_category": (pm25_r or {}).get("category") or "No data",
                 "pm10_category": (pm10_r or {}).get("category") or "No data",
                 "o3_category": (o3_r or {}).get("category") or "No data",
-                "co_category": (co_r or {}).get("category") or "No data",
-                "no_category": (no_r or {}).get("category") or "No data",
-                "no2_category": (no2_r or {}).get("category") or "No data",
-                "nox_category": (nox_r or {}).get("category") or "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"aqms:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
-                "pm25_previous": (prev_bucket or {}).get("PM2.5", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "pm10_previous": (prev_bucket or {}).get("PM10", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "o3_previous": (prev_bucket or {}).get("O3", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "co_previous": (prev_bucket or {}).get("CO", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "no_previous": (prev_bucket or {}).get("NO", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "no2_previous": (prev_bucket or {}).get("NO2", {}).get("previous") if isinstance(prev_bucket, dict) else None,
-                "nox_previous": (prev_bucket or {}).get("NOX", {}).get("previous") if isinstance(prev_bucket, dict) else None,
             }
         )
-
-    # Ensure every AQMS station from site metadata appears in "View all stations"
-    # even when the live feed returns only a subset of sites.
-    site_lookup = _sites_by_id()
-    for site_id, site in site_lookup.items():
-        try:
-            sid = int(site_id)
-        except (TypeError, ValueError):
-            continue
-        if sid in present_site_ids:
-            continue
-        rows.append(_aqms_placeholder_row(sid, site or {}))
-
     for row in purpleair_rows or []:
         rows.append(
             {
@@ -1873,17 +1263,9 @@ def _monitor_table_rows_all(aqms_rows, purpleair_rows, snapshot_by_site=None, pr
                 "pm25": row.get("value_label") or "--",
                 "pm10": "--",
                 "o3": "--",
-                "co": "--",
-                "no": "--",
-                "no2": "--",
-                "nox": "--",
                 "pm25_category": row.get("category") or "No data",
                 "pm10_category": "No data",
                 "o3_category": "No data",
-                "co_category": "No data",
-                "no_category": "No data",
-                "no2_category": "No data",
-                "nox_category": "No data",
                 "category": row.get("category") or "No data",
                 "monitorKey": f"purpleair:{row.get('site_id')}",
                 "categoryColor": row.get("category_color") or "#9ca3af",
@@ -1935,85 +1317,74 @@ def _monitor_kpi_cards(kpis):
 
 
 def _monitor_table_styles(_table_rows=None):
-    # Badge rendering is handled via per-cell HTML + CSS rather than DataTable
-    # conditional formatting.
-    return []
+    # Use value-based styling so sorting/paging doesn't break colours.
+    base = [
+        {
+            "if": {"filter_query": '{category} = "Good"', "column_id": "category"},
+            "backgroundColor": "#16a34a",
+            "color": "#ffffff",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+        {
+            "if": {"filter_query": '{category} = "Fair"', "column_id": "category"},
+            "backgroundColor": "#facc15",
+            "color": "#0f172a",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+        {
+            "if": {"filter_query": '{category} = "Poor"', "column_id": "category"},
+            "backgroundColor": "#f97316",
+            "color": "#ffffff",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+        {
+            "if": {"filter_query": '{category} = "Very poor"', "column_id": "category"},
+            "backgroundColor": "#ef4444",
+            "color": "#ffffff",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+        {
+            "if": {"filter_query": '{category} = "Extremely poor"', "column_id": "category"},
+            "backgroundColor": "#7f1d1d",
+            "color": "#ffffff",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+        {
+            "if": {"filter_query": '{category} = "No data"', "column_id": "category"},
+            "backgroundColor": "#9ca3af",
+            "color": "#0f172a",
+            "fontWeight": "900",
+            "borderRadius": "999px",
+        },
+    ]
+
+    # Add same category-based background colouring for PM2.5, PM10 and O3 columns
+    pollutants = [
+        ("pm25_category", "pm25"),
+        ("pm10_category", "pm10"),
+        ("o3_category", "o3"),
+    ]
+    for cat_field, col in pollutants:
+        base.extend(
+            [
+                {"if": {"filter_query": f'{{{cat_field}}} = "Good"', "column_id": col}, "backgroundColor": "#16a34a", "color": "#ffffff"},
+                {"if": {"filter_query": f'{{{cat_field}}} = "Fair"', "column_id": col}, "backgroundColor": "#facc15", "color": "#0f172a"},
+                {"if": {"filter_query": f'{{{cat_field}}} = "Poor"', "column_id": col}, "backgroundColor": "#f97316", "color": "#ffffff"},
+                {"if": {"filter_query": f'{{{cat_field}}} = "Very poor"', "column_id": col}, "backgroundColor": "#ef4444", "color": "#ffffff"},
+                {"if": {"filter_query": f'{{{cat_field}}} = "Extremely poor"', "column_id": col}, "backgroundColor": "#7f1d1d", "color": "#ffffff"},
+                {"if": {"filter_query": f'{{{cat_field}}} = "No data"', "column_id": col}, "backgroundColor": "#9ca3af", "color": "#0f172a"},
+            ]
+        )
+
+    return base
 
 
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-
-
-def _aq_badge_class(category_label: str) -> str:
-    key = str(category_label or "").strip().lower()
-    if key in {"good"}:
-        return "aq-badge--good"
-    if key in {"fair", "moderate"}:
-        return "aq-badge--fair"
-    if key in {"poor"}:
-        return "aq-badge--poor"
-    if key in {"very poor", "verypoor"}:
-        return "aq-badge--very-poor"
-    if key in {"extremely poor", "extreme", "extremelypoor"}:
-        return "aq-badge--extreme"
-    return "aq-badge--no-data"
-
-
-def _aq_badge_html(value_text, category_label) -> str:
-    text = str(value_text or "").strip()
-    if text and text != "--":
-        match = _NUMBER_RE.search(text)
-        if match:
-            text = match.group(0)
-    if not text or text == "--":
-        text = "--"
-    css = f"aq-badge {_aq_badge_class(category_label)}"
-    return f'<span class="{css}"><span class="aq-badge__value">{escape(text)}</span></span>'
-
-
-def _inject_badges_into_monitor_rows(rows):
-    out = []
-    for row in rows or []:
-        r = dict(row or {})
-        r["pm25_badge"] = _aq_badge_html(r.get("pm25"), r.get("pm25_category"))
-        r["pm10_badge"] = _aq_badge_html(r.get("pm10"), r.get("pm10_category"))
-        r["o3_badge"] = _aq_badge_html(r.get("o3"), r.get("o3_category"))
-        r["co_badge"] = _aq_badge_html(r.get("co"), r.get("co_category"))
-        r["no_badge"] = _aq_badge_html(r.get("no"), r.get("no_category"))
-        r["no2_badge"] = _aq_badge_html(r.get("no2"), r.get("no2_category"))
-        r["nox_badge"] = _aq_badge_html(r.get("nox"), r.get("nox_category"))
-        out.append(r)
-    return out
-
-
-def _ordered_monitor_outlook_rows(rows, source_value="both", compact=False, max_rows=None):
-    source_value = str(source_value or "both").strip().lower()
-    aqms_rows = []
-    purpleair_rows = []
-    other_rows = []
-    for row in rows or []:
-        source = str((row or {}).get("source") or "").strip().lower()
-        if source == "aqms":
-            aqms_rows.append(row)
-        elif source == "purpleair":
-            purpleair_rows.append(row)
-        else:
-            other_rows.append(row)
-
-    if source_value == "aqms":
-        ordered = aqms_rows + other_rows
-    elif source_value == "purpleair":
-        ordered = purpleair_rows
-    elif compact and (aqms_rows or other_rows):
-        ordered = aqms_rows + other_rows
-    else:
-        ordered = aqms_rows + other_rows + purpleair_rows
-
-    if max_rows is not None:
-        return ordered[: int(max_rows)]
-    return ordered
-
-
-def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=None):
+def _attach_arrows_to_table_rows(rows, snapshot_by_site=None):
     """Ensure each AQMS row's pm25/pm10/o3 fields include arrows based on the
     in-process `_LAST_AQMS_SNAPSHOT`. This augments rows passed from the store
     so UI interactions (region filter) still show arrows.
@@ -2021,7 +1392,6 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=N
     if not rows:
         return rows
     snapshot_by_site = snapshot_by_site or {}
-    previous_by_site = previous_by_site or {}
     # Prefer the prior snapshot (the state before the most recent refresh) when
     # available; fall back to the last snapshot.
     prev_snap = globals().get('_PRIOR_AQMS_SNAPSHOT') or globals().get("_LAST_AQMS_SNAPSHOT") or {}
@@ -2044,13 +1414,6 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=N
         except Exception:
             bucket = None
 
-        current_prev = {}
-        try:
-            if site_id is not None:
-                current_prev = previous_by_site.get(int(site_id)) or {}
-        except Exception:
-            current_prev = {}
-
         # Fallback to previously saved numeric snapshot
         prev_bucket = None
         try:
@@ -2067,21 +1430,8 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=N
             except Exception:
                 pass
             try:
-                if current_prev and isinstance(current_prev, dict) and current_prev.get(pollutant_label) and current_prev.get(pollutant_label).get("current") is not None:
-                    return current_prev.get(pollutant_label).get("current")
-            except Exception:
-                pass
-            try:
                 if prev_bucket and isinstance(prev_bucket, dict):
                     return prev_bucket.get(pollutant_label)
-            except Exception:
-                pass
-            return None
-
-        def _previous_value_for(pollutant_label):
-            try:
-                if current_prev and isinstance(current_prev, dict) and current_prev.get(pollutant_label):
-                    return current_prev.get(pollutant_label).get("previous")
             except Exception:
                 pass
             return None
@@ -2129,19 +1479,11 @@ def _attach_arrows_to_table_rows(rows, snapshot_by_site=None, previous_by_site=N
                 return False
 
         if not _has_arrow(r.get("pm25")):
-            r["pm25"] = _format_value_with_arrow(site_id, "PM2.5", (r.get("pm25") or "--"), _value_for("PM2.5"), previous_value=_previous_value_for("PM2.5"))
+            r["pm25"] = _format_value_with_arrow(site_id, "PM2.5", (r.get("pm25") or "--"), _value_for("PM2.5"))
         if not _has_arrow(r.get("pm10")):
-            r["pm10"] = _format_value_with_arrow(site_id, "PM10", (r.get("pm10") or "--"), _value_for("PM10"), previous_value=_previous_value_for("PM10"))
+            r["pm10"] = _format_value_with_arrow(site_id, "PM10", (r.get("pm10") or "--"), _value_for("PM10"))
         if not _has_arrow(r.get("o3")):
-            r["o3"] = _format_value_with_arrow(site_id, "O3", (r.get("o3") or "--"), _value_for("O3"), previous_value=_previous_value_for("O3"))
-        if not _has_arrow(r.get("co")) and "co" in r:
-            r["co"] = _format_value_with_arrow(site_id, "CO", (r.get("co") or "--"), _value_for("CO"), previous_value=_previous_value_for("CO"))
-        if not _has_arrow(r.get("no")) and "no" in r:
-            r["no"] = _format_value_with_arrow(site_id, "NO", (r.get("no") or "--"), _value_for("NO"), previous_value=_previous_value_for("NO"))
-        if not _has_arrow(r.get("no2")) and "no2" in r:
-            r["no2"] = _format_value_with_arrow(site_id, "NO2", (r.get("no2") or "--"), _value_for("NO2"), previous_value=_previous_value_for("NO2"))
-        if not _has_arrow(r.get("nox")) and "nox" in r:
-            r["nox"] = _format_value_with_arrow(site_id, "NOX", (r.get("nox") or "--"), _value_for("NOX"), previous_value=_previous_value_for("NOX"))
+            r["o3"] = _format_value_with_arrow(site_id, "O3", (r.get("o3") or "--"), _value_for("O3"))
         out.append(r)
     return out
 
@@ -2204,9 +1546,38 @@ def _hex_to_rgba(value, alpha):
     return f"rgba({r}, {g}, {b}, {alpha_num})"
 
 
-def _format_value_with_arrow(site_id, pollutant_label, value_label, value_num, previous_value=None):
-    """Return a plain display label for monitoring table cells (no trend arrows)."""
-    return str(value_label or "--")
+def _format_value_with_arrow(site_id, pollutant_label, value_label, value_num):
+    """Return a display label with an up/down arrow when value changed since last snapshot.
+
+    Compares against the in-process `_LAST_AQMS_SNAPSHOT` per-site values.
+    """
+    label = str(value_label or "--")
+    try:
+        val_num = float(value_num) if value_num is not None else None
+    except Exception:
+        val_num = None
+
+    prev_sites = (_LAST_AQMS_SNAPSHOT or {}).get("sites") or {}
+    prev_val = None
+    try:
+        if site_id is not None:
+            prev_entry = prev_sites.get(int(site_id))
+            if isinstance(prev_entry, dict):
+                prev_val = prev_entry.get(pollutant_label)
+    except Exception:
+        prev_val = None
+
+    arrow = ""
+    if prev_val is not None and val_num is not None:
+        try:
+            prev_num = float(prev_val)
+            diff = val_num - prev_num
+            if abs(diff) >= 0.1:
+                arrow = " ↑" if diff > 0 else " ↓"
+        except Exception:
+            arrow = ""
+
+    return f"{label}{arrow}"
 
 
 def _load_last_aqms_snapshot_from_disk():
@@ -2485,506 +1856,6 @@ def _overview_build_trends_figure(hours=48):
     return fig
 
 
-def _monitor_region_series_parameter_codes():
-    parameter_codes = []
-    for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
-        code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
-        if code and code not in parameter_codes:
-            parameter_codes.append(code)
-    return parameter_codes
-
-
-def _monitor_region_series_seed_site_id():
-    try:
-        if MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE:
-            return int(str(MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE).split(":", 1)[1])
-    except Exception:
-        pass
-    for site_id in sorted(_sites_by_id()):
-        try:
-            return int(site_id)
-        except Exception:
-            continue
-    return 0
-
-
-@lru_cache(maxsize=8)
-def _monitor_observation_cache_rows(cache_mtime):
-    rows = _load_observations_cache() or []
-    return tuple(row for row in rows if isinstance(row, dict))
-
-
-@lru_cache(maxsize=8)
-def _monitor_observation_cache_index(cache_mtime):
-    entries = []
-    for row in _monitor_observation_cache_rows(cache_mtime):
-        param_code = str(_aqms_parameter(row).get("ParameterCode") or row.get("ParameterCode") or "").strip()
-        if not param_code:
-            continue
-        ts = _parse_aqms_time_point(row)
-        if ts is None:
-            continue
-        try:
-            site_id = int(row.get("Site_Id") or row.get("site_id") or row.get("SiteId") or row.get("SiteID"))
-        except Exception:
-            site_id = None
-        entries.append((param_code, site_id, ts.replace(minute=0, second=0, microsecond=0), row))
-    return tuple(entries)
-
-
-@lru_cache(maxsize=8)
-def _monitor_observation_cache_by_site_param(cache_mtime):
-    grouped = {}
-    for param_code, site_id, ts, row in _monitor_observation_cache_index(cache_mtime):
-        if site_id is None:
-            continue
-        grouped.setdefault((site_id, param_code), []).append((ts, row))
-    return {key: tuple(values) for key, values in grouped.items()}
-
-
-def _monitor_cache_mtime():
-    try:
-        return int(os.path.getmtime(_OBS_CACHE_CSV))
-    except OSError:
-        return None
-
-
-def _monitor_window_bounds(start_iso, end_iso):
-    start_dt = _parse_forecast_timestamp(start_iso)
-    end_dt = _parse_forecast_timestamp(end_iso)
-    if start_dt is not None:
-        start_dt = start_dt.replace(tzinfo=SYDNEY_TZ) if start_dt.tzinfo is None else start_dt.astimezone(SYDNEY_TZ)
-    if end_dt is not None:
-        end_dt = end_dt.replace(tzinfo=SYDNEY_TZ) if end_dt.tzinfo is None else end_dt.astimezone(SYDNEY_TZ)
-    return start_dt, end_dt
-
-
-def _monitor_cached_history_window(parameter_codes_tuple, start_iso, end_iso, fallback_hours=None):
-    cache_mtime = _monitor_cache_mtime()
-    if cache_mtime is None:
-        return []
-    parameter_codes = {str(code or "").strip() for code in parameter_codes_tuple or () if str(code or "").strip()}
-    if not parameter_codes:
-        return []
-
-    start_dt, end_dt = _monitor_window_bounds(start_iso, end_iso)
-    entries = _monitor_observation_cache_index(cache_mtime)
-    filtered = []
-    latest_ts = None
-    for param_code, _site_id, ts, row in entries:
-        if param_code not in parameter_codes:
-            continue
-        if latest_ts is None or ts > latest_ts:
-            latest_ts = ts
-        if start_dt is not None and ts < start_dt:
-            continue
-        if end_dt is not None and ts > end_dt:
-            continue
-        filtered.append(row)
-
-    if filtered:
-        return filtered
-
-    if latest_ts is None or not fallback_hours:
-        return []
-    fallback_start = latest_ts - timedelta(hours=float(fallback_hours))
-    fallback = []
-    for param_code, _site_id, ts, row in entries:
-        if param_code not in parameter_codes:
-            continue
-        if fallback_start <= ts <= latest_ts:
-            fallback.append(row)
-    return fallback
-
-
-def _monitor_cached_history_rows_for_sites(site_ids, parameter_codes, start_iso, end_iso, fallback_hours=None):
-    cache_mtime = _monitor_cache_mtime()
-    if cache_mtime is None:
-        return []
-    site_id_set = set()
-    for site_id in site_ids or ():
-        try:
-            site_id_set.add(int(site_id))
-        except Exception:
-            continue
-    parameter_code_set = {str(code or "").strip() for code in parameter_codes or () if str(code or "").strip()}
-    if not site_id_set or not parameter_code_set:
-        return []
-
-    start_dt, end_dt = _monitor_window_bounds(start_iso, end_iso)
-    grouped = _monitor_observation_cache_by_site_param(cache_mtime)
-    filtered = []
-    latest_ts = None
-    for site_id in site_id_set:
-        for param_code in parameter_code_set:
-            for ts, row in grouped.get((site_id, param_code), ()):
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-                if start_dt is not None and ts < start_dt:
-                    continue
-                if end_dt is not None and ts > end_dt:
-                    continue
-                filtered.append(row)
-
-    if filtered:
-        return filtered
-
-    if latest_ts is None or not fallback_hours:
-        return []
-    fallback_start = latest_ts - timedelta(hours=float(fallback_hours))
-    fallback = []
-    for site_id in site_id_set:
-        for param_code in parameter_code_set:
-            for ts, row in grouped.get((site_id, param_code), ()):
-                if fallback_start <= ts <= latest_ts:
-                    fallback.append(row)
-    return fallback
-
-
-def _monitor_region_series_cached_window(parameter_codes_tuple, start_iso, end_iso):
-    # If the live API/cache lags the current clock, return a latest 24-hour
-    # slice from cache. The render callback already adjusts its x-axis to that
-    # latest timestamp.
-    return _monitor_cached_history_window(parameter_codes_tuple, start_iso, end_iso, fallback_hours=24)
-
-
-@lru_cache(maxsize=16)
-def _fetch_monitor_region_history_window(parameter_codes_tuple, start_iso, end_iso):
-    parameter_codes = list(parameter_codes_tuple or ())
-    if not parameter_codes:
-        return []
-
-    if str(os.environ.get("MONITOR_REGION_SERIES_CACHE_FIRST", "1")).strip().lower() not in {"0", "false", "no", "n"}:
-        cached_rows = _monitor_region_series_cached_window(tuple(parameter_codes), start_iso, end_iso)
-        if cached_rows:
-            return cached_rows
-
-    try:
-        timeout = float(os.environ.get("MONITOR_REGION_SERIES_HISTORY_TIMEOUT", "8"))
-    except (TypeError, ValueError):
-        timeout = 8
-
-    # The NSW history endpoint can return a broad payload even for a single site.
-    # Cache it by time window so changing station filters locally instead of
-    # redownloading the same large response.
-    try:
-        return fetch_observation_history([_monitor_region_series_seed_site_id()], parameter_codes, start_iso, end_iso, timeout=timeout)
-    except Exception:
-        return []
-
-
-@lru_cache(maxsize=256)
-def _monitor_history_rows_for_sites(site_ids_tuple, parameter_codes_tuple, start_iso, end_iso, live_timeout=8, fallback_hours=None):
-    site_ids = set()
-    for site_id in site_ids_tuple or ():
-        try:
-            site_ids.add(int(site_id))
-        except Exception:
-            continue
-    if not site_ids:
-        return []
-
-    parameter_codes = tuple(sorted({str(code or "").strip() for code in parameter_codes_tuple or () if str(code or "").strip()}))
-    if not parameter_codes:
-        return []
-
-    rows = _monitor_cached_history_rows_for_sites(site_ids, parameter_codes, start_iso, end_iso, fallback_hours=fallback_hours)
-    if not rows:
-        try:
-            rows = fetch_observation_history(list(site_ids), list(parameter_codes), start_iso, end_iso, timeout=float(live_timeout))
-        except Exception:
-            rows = []
-
-    filtered = []
-    parameter_code_set = set(parameter_codes)
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            row_site_id = int(row.get("Site_Id") or row.get("site_id") or row.get("SiteId") or row.get("SiteID"))
-        except Exception:
-            continue
-        if row_site_id not in site_ids:
-            continue
-        param_code = str(_aqms_parameter(row).get("ParameterCode") or row.get("ParameterCode") or "").strip()
-        if param_code and param_code not in parameter_code_set:
-            continue
-        filtered.append(row)
-    return tuple(filtered)
-
-
-@lru_cache(maxsize=256)
-def _fetch_purpleair_sensor_history_cached(sensor_index, start_ts, end_ts, average, fields_tuple, timeout):
-    try:
-        return fetch_purpleair_sensor_history(
-            int(sensor_index),
-            int(start_ts),
-            int(end_ts),
-            average=int(average),
-            fields=list(fields_tuple or ()),
-            timeout=float(timeout),
-        )
-    except Exception:
-        return {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
-
-
-@lru_cache(maxsize=128)
-def _fetch_monitor_region_history(site_ids_tuple, start_iso, end_iso):
-    return _monitor_history_rows_for_sites(
-        tuple(site_ids_tuple or ()),
-        tuple(_monitor_region_series_parameter_codes()),
-        start_iso,
-        end_iso,
-        live_timeout=float(os.environ.get("MONITOR_REGION_SERIES_HISTORY_TIMEOUT", "8") or 8),
-        fallback_hours=24,
-    )
-
-
-def _prewarm_monitor_observation_cache():
-    cache_mtime = _monitor_cache_mtime()
-    if cache_mtime is None:
-        return
-    try:
-        _monitor_observation_cache_rows(cache_mtime)
-        _monitor_observation_cache_index(cache_mtime)
-        _monitor_observation_cache_by_site_param(cache_mtime)
-    except Exception:
-        return
-
-
-_prewarm_monitor_observation_cache()
-
-
-def _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt):
-    pollutant_code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
-    values_by_time = {}
-    for item in history_rows or []:
-        if not isinstance(item, dict):
-            continue
-        param = _aqms_parameter(item)
-        if str(param.get("ParameterCode") or "").strip() != str(pollutant_code):
-            continue
-        ts = _parse_aqms_time_point(item)
-        if ts is None or ts < start_dt or ts > end_dt:
-            continue
-        value = item.get("Value")
-        try:
-            value = float(value) if value is not None else None
-        except (TypeError, ValueError):
-            value = None
-        if value is None:
-            continue
-        values_by_time[ts.replace(minute=0, second=0, microsecond=0)] = value
-    return values_by_time
-
-
-def _monitor_region_series_latest_timestamp(history_rows):
-    latest_ts = None
-    for row in history_rows or []:
-        ts = _parse_aqms_time_point(row)
-        if ts is None:
-            continue
-        ts = ts.replace(minute=0, second=0, microsecond=0)
-        if latest_ts is None or ts > latest_ts:
-            latest_ts = ts
-    return latest_ts
-
-
-def _monitor_region_series_figure(
-    history_rows,
-    pollutant_label,
-    start_dt,
-    end_dt,
-    region_label,
-    station_name,
-    purpleair_history=None,
-    purpleair_label=None,
-):
-    values_by_time = _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt)
-
-    x_times = []
-    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
-    end_cursor = end_dt.replace(minute=0, second=0, microsecond=0)
-    while cursor <= end_cursor:
-        x_times.append(cursor)
-        cursor = cursor + timedelta(hours=1)
-
-    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
-    y_values = [values_by_time.get(ts) for ts in x_times]
-    plot_color = MONITOR_REGION_SERIES_PLOT_COLORS.get(pollutant_label, "#6d28d9")
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=x_times,
-            y=y_values,
-            name=station_name,
-            mode="lines+markers",
-            line=dict(color=plot_color, width=3, shape="spline", smoothing=0.6),
-            marker=dict(size=7, color=plot_color, line=dict(color="#ffffff", width=1.2)),
-            fill="tozeroy",
-            fillcolor=_hex_to_rgba(plot_color, 0.16),
-            hovertemplate=f"<b>{station_name}</b><br>%{{x|%d %b %H:%M}}<br>%{{y:.1f}} {units}<extra></extra>",
-        )
-    )
-
-    if pollutant_label in {"PM2.5", "PM10"} and purpleair_history and purpleair_history.get("data"):
-        fields = purpleair_history.get("fields") or []
-        data = purpleair_history.get("data") or []
-        time_idx = fields.index("time_stamp") if "time_stamp" in fields else 0
-        field_name = "pm2.5_alt" if pollutant_label == "PM2.5" else "pm10.0_atm"
-        if field_name in fields:
-            val_idx = fields.index(field_name)
-            pa_xs = []
-            pa_ys = []
-            for row in data:
-                if not isinstance(row, list) or len(row) <= max(time_idx, val_idx):
-                    continue
-                try:
-                    ts = datetime.fromtimestamp(int(row[time_idx]), tz=SYDNEY_TZ)
-                except (TypeError, ValueError, OSError):
-                    continue
-                if ts < start_dt or ts > end_dt:
-                    continue
-                try:
-                    value = float(row[val_idx]) if row[val_idx] is not None else None
-                except (TypeError, ValueError):
-                    value = None
-                if value is None:
-                    continue
-                pa_xs.append(ts)
-                pa_ys.append(value)
-            if pa_xs:
-                fig.add_trace(
-                    go.Scatter(
-                        x=pa_xs,
-                        y=pa_ys,
-                        name=purpleair_label or "PurpleAir (nearest)",
-                        mode="lines+markers",
-                        line=dict(color=PURPLEAIR_COLOR, width=2.4, dash="dot"),
-                        marker=dict(size=6, color=PURPLEAIR_COLOR, symbol="circle-open"),
-                        hovertemplate=f"<b>{purpleair_label or 'PurpleAir (nearest)'}</b><br>%{{x|%d %b %H:%M}}<br>%{{y:.1f}} {units}<extra></extra>",
-                    )
-                )
-
-    fig.update_layout(
-        template="plotly_white",
-        height=210,
-        margin=dict(l=48, r=14, t=30, b=26),
-        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-        hovermode="x",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.01, font=dict(size=10)),
-        showlegend=True,
-        title=dict(text=f"{pollutant_label}", x=0.01, y=0.97, xanchor="left", font=dict(size=15, color=plot_color)),
-    )
-    fig.update_xaxes(
-        showgrid=True,
-        gridcolor="#e8eef8",
-        tickformat="%H:%M<br>%d %b",
-        nticks=6,
-        ticks="outside",
-        tickfont=dict(size=10),
-    )
-    fig.update_yaxes(
-        title_text=units,
-        showgrid=True,
-        gridcolor="#e8eef8",
-        zeroline=False,
-        tickfont=dict(size=11),
-    )
-
-    if not fig.data:
-        fig.add_annotation(
-            text="No AQMS observations found for this pollutant and region.",
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font=dict(family=BASE_FONT_FAMILY, size=14, color="#475569"),
-        )
-
-    return fig
-
-
-def _monitor_region_series_combined_figure(history_rows, start_dt, end_dt, region_label, station_name):
-    x_times = []
-    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
-    end_cursor = end_dt.replace(minute=0, second=0, microsecond=0)
-    while cursor <= end_cursor:
-        x_times.append(cursor)
-        cursor = cursor + timedelta(hours=1)
-
-    fig = make_subplots(
-        rows=len(MONITOR_REGION_SERIES_POLLUTANTS),
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.075,
-        subplot_titles=[
-            f"{pollutant_display(pollutant_label)} ({(POLLUTANTS.get(pollutant_label) or {}).get('Units') or 'Value'})"
-            for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS
-        ],
-    )
-
-    has_points = False
-    for row_idx, pollutant_label in enumerate(MONITOR_REGION_SERIES_POLLUTANTS, start=1):
-        values_by_time = _monitor_region_series_values(history_rows, pollutant_label, start_dt, end_dt)
-        y_values = [values_by_time.get(ts) for ts in x_times]
-        if any(value is not None for value in y_values):
-            has_points = True
-        units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
-        plot_color = MONITOR_REGION_SERIES_PLOT_COLORS.get(pollutant_label, "#2563eb")
-        fig.add_trace(
-            go.Scattergl(
-                x=x_times,
-                y=y_values,
-                name=pollutant_display(pollutant_label),
-                mode="lines+markers",
-                line=dict(color=plot_color, width=2.5),
-                marker=dict(size=5, color=plot_color),
-                connectgaps=False,
-                hovertemplate=(
-                    f"<b>{station_name}</b><br>"
-                    f"{pollutant_display(pollutant_label)}<br>"
-                    "%{x|%d %b %H:%M}<br>%{y:.1f} "
-                    f"{units}<extra></extra>"
-                ),
-            ),
-            row=row_idx,
-            col=1,
-        )
-        fig.update_yaxes(title_text=units, showgrid=True, gridcolor="#e8eef8", zeroline=False, row=row_idx, col=1)
-
-    if not has_points:
-        fig.add_annotation(
-            text="No hourly AQMS history returned for this station in the selected window.",
-            xref="paper",
-            yref="paper",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            font=dict(size=13, color="#64748b", family=BASE_FONT_FAMILY),
-        )
-
-    fig.update_layout(
-        template="plotly_white",
-        height=390,
-        margin=dict(l=56, r=18, t=42, b=34),
-        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-        paper_bgcolor="rgba(255,255,255,0)",
-        plot_bgcolor="#ffffff",
-        showlegend=False,
-        hovermode="x unified",
-        title=dict(
-            text=f"{region_label} · {station_name} · last 24 hours",
-            x=0,
-            xanchor="left",
-            font=dict(size=14, family=BASE_FONT_FAMILY, color="#0f172a"),
-        ),
-    )
-    fig.update_xaxes(showgrid=False, tickformat="%H:%M", ticks="outside", tickfont=dict(size=10))
-    return fig
-
-
 def _overview_build_forecast_trends_figure(region, selection_for_panel):
     """Build a regional forecast trends Plotly figure.
 
@@ -3196,20 +2067,8 @@ def _monitor_network_nodes(feeds):
     completeness_label = "--" if completeness is None else f"{float(completeness):.1f}%"
     return html.Div(
         [
-            html.Div(
-                [
-                    html.Span("AQMS feed", className="network-label network-label--aqms"),
-                    html.Span(aqms_status, className="network-value network-value--aqms"),
-                ],
-                className="network-row",
-            ),
-            html.Div(
-                [
-                    html.Span("PurpleAir feed", className="network-label network-label--purpleair"),
-                    html.Span(pa_status, className="network-value network-value--purpleair"),
-                ],
-                className="network-row",
-            ),
+            html.Div([html.Span("AQMS feed", className="network-label"), html.Span(aqms_status, className="network-value")], className="network-row"),
+            html.Div([html.Span("PurpleAir feed", className="network-label"), html.Span(pa_status, className="network-value")], className="network-row"),
             html.Hr(className="network-divider"),
             html.Div([html.Span("Data completeness", className="network-label"), html.Span(completeness_label, className="network-value")], className="network-row"),
         ],
@@ -3222,6 +2081,23 @@ def _build_file_path(selection):
     if len(chosen) != 5:
         return None
     return forecast_file_path(chosen)
+
+
+def _display_region_label(value):
+    text = str(value or "").strip()
+    if not text:
+        return "--"
+    if text.upper() == "ALL":
+        return "All stations"
+    return title_case_station_name(text.replace("_", " "))
+
+
+def _forecast_station_dropdown_options(parsed):
+    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
+    options = []
+    for station_name in sorted(stations, key=lambda name: title_case_station_name(str(name))):
+        options.append({"label": title_case_station_name(station_name), "value": station_name})
+    return options
 
 
 def _best_matching_file(selection):
@@ -3338,7 +2214,7 @@ def _overview_next3_values(selection):
     hours = min(2, max_hours)
     pollutants = ["PM2.5", "PM10", "O3"]
 
-    # Discover the forecast timestamps (use the first available parsed file).
+    # Discover the next-hour timestamps (use the first available parsed file).
     time_labels = []
     for region in regions or []:
         fp = forecast_file_path([str(region), "PM2.5", str(horizon), str(model_name), str(run_date)])
@@ -3353,24 +2229,16 @@ def _overview_next3_values(selection):
             continue
         times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
         if times:
-            time_labels = list(times)
+            time_labels = list(times[:hours])
             break
-
-    base_index = _forecast_live_base_index(time_labels)
-    if time_labels:
-        selected_indices = list(range(base_index, min(base_index + hours, len(time_labels))))
-        display_time_labels = [time_labels[idx] for idx in selected_indices]
-    else:
-        selected_indices = list(range(hours))
-        display_time_labels = []
 
     # Compute per pollutant, worst across stations for each hour index, plus contributing station counts
     # and the station name responsible for the maximum.
     rows = []
     for pollutant in pollutants:
-        maxima = [None for _ in selected_indices]
-        max_stations = [None for _ in selected_indices]
-        counts = [0 for _ in selected_indices]
+        maxima = [None for _ in range(hours)]
+        max_stations = [None for _ in range(hours)]
+        counts = [0 for _ in range(hours)]
         used_model = model_name
 
         def _iter_files_for_model(model_value):
@@ -3408,21 +2276,299 @@ def _overview_next3_values(selection):
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
                 values = (payload or {}).get("forecastValue") or []
-                for out_idx, hour_idx in enumerate(selected_indices):
-                    if hour_idx >= len(values):
+                for idx in range(hours):
+                    if idx >= len(values):
                         continue
                     try:
-                        val = float(values[hour_idx])
+                        val = float(values[idx])
                     except (TypeError, ValueError):
                         continue
-                    counts[out_idx] += 1
-                    current = maxima[out_idx]
+                    counts[idx] += 1
+                    current = maxima[idx]
                     if current is None or val > current:
-                        maxima[out_idx] = val
-                        max_stations[out_idx] = station_name
+                        maxima[idx] = val
+                        max_stations[idx] = station_name
 
         rows.append({"pollutant": pollutant, "values": maxima, "counts": counts, "stations": max_stations, "model": used_model})
-    return display_time_labels, rows
+    return time_labels, rows
+
+
+def _overview_station_outlook(selection):
+    """Return a compact station matrix for the next live forecast hour."""
+    selection_for_panel, regions = _overview_pick_multi_region_forecast_selection(selection or {})
+    model_name = selection_for_panel.get("models")
+    run_date = selection_for_panel.get("date")
+    horizon = selection_for_panel.get("timeScopes") or "12"
+
+    try:
+        max_hours = int(horizon)
+    except (TypeError, ValueError):
+        max_hours = 12
+
+    pollutants = ["PM2.5", "PM10", "O3"]
+    units_by_pollutant = {p: (POLLUTANTS.get(p) or {}).get("Units") or "" for p in pollutants}
+    station_rows = {}
+    station_order_scores = {}
+    time_labels = []
+    live_index = 0
+    any_upcoming = False
+    any_forecast_data = False
+    latest_available_time = None
+
+    def _files_for_pollutant(pollutant):
+        files = []
+        for region_name in regions or []:
+            fp = forecast_file_path([str(region_name), pollutant, str(horizon), str(model_name), str(run_date)])
+            if fp:
+                files.append(fp)
+        if files:
+            return files
+        for kp in FILE_KEY_PARAMS:
+            if kp.get("pollutants") != pollutant:
+                continue
+            if kp.get("timeScopes") != str(horizon) or kp.get("date") != str(run_date):
+                continue
+            region_name = kp.get("regions")
+            if region_name and regions and region_name not in regions:
+                continue
+            fp = forecast_file_path([kp.get("regions"), pollutant, kp.get("timeScopes"), kp.get("models"), kp.get("date")])
+            if fp:
+                files.append(fp)
+        return files
+
+    for pollutant in pollutants:
+        for fp in _files_for_pollutant(pollutant):
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                mtime = 0
+            parsed = _cached_parse_csv(fp, pollutant, max_hours, mtime)
+            if not parsed:
+                continue
+            times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
+            idx, has_upcoming = _forecast_live_base_state(times)
+            if times and not time_labels:
+                live_index = idx
+                time_labels = list(times)
+            for time_value in times:
+                parsed_time = _parse_forecast_timestamp(time_value)
+                if parsed_time is None:
+                    continue
+                if parsed_time.tzinfo is None:
+                    parsed_time = parsed_time.replace(tzinfo=SYDNEY_TZ)
+                else:
+                    parsed_time = parsed_time.astimezone(SYDNEY_TZ)
+                if latest_available_time is None or parsed_time > latest_available_time:
+                    latest_available_time = parsed_time
+            any_upcoming = any_upcoming or has_upcoming
+            stations = ((parsed.get("data") or {}).get("stations") or {})
+            for station_name, payload in stations.items():
+                values = (payload or {}).get("forecastValue") or []
+                if idx >= len(values):
+                    continue
+                try:
+                    value = float(values[idx])
+                except (TypeError, ValueError):
+                    continue
+                station_key = normalize_station_name(station_name)
+                if not station_key:
+                    continue
+                row = station_rows.setdefault(
+                    station_key,
+                    {"station": title_case_station_name(station_name), "values": {}},
+                )
+                row["values"][pollutant] = value
+                if pollutant == "PM2.5":
+                    station_order_scores[station_key] = value
+                any_forecast_data = True
+
+    if not any_forecast_data:
+        latest_label = ""
+        if latest_available_time is not None:
+            ended_at = latest_available_time + timedelta(hours=1)
+            latest_label = f" Latest available forecast ended at {ended_at.strftime('%-I%p')} / {ended_at.day} {ended_at.strftime('%b %Y')}."
+        return html.Div(f"No forecast station data is available from the loaded files.{latest_label}", className="card-hint"), "No forecast data"
+
+    if not station_rows:
+        return html.Div("No forecast station data available.", className="card-hint"), ""
+
+    ordered_keys = sorted(
+        station_rows,
+        key=lambda key: (station_order_scores.get(key) is None, -(station_order_scores.get(key) or -1), station_rows[key]["station"]),
+    )
+
+    def _time_label():
+        if not time_labels:
+            return ""
+        start_dt = _parse_forecast_timestamp(time_labels[min(live_index, len(time_labels) - 1)])
+        end_dt = None
+        if live_index + 1 < len(time_labels):
+            end_dt = _parse_forecast_timestamp(time_labels[live_index + 1])
+        if start_dt and not end_dt:
+            end_dt = start_dt + timedelta(hours=1)
+        if start_dt and end_dt:
+            start_hour = start_dt.strftime("%I").lstrip("0") or "0"
+            end_hour = end_dt.strftime("%I").lstrip("0") or "0"
+            label = f"@ {start_hour}{start_dt.strftime('%p')}-{end_hour}{end_dt.strftime('%p')} / {start_dt.day} {start_dt.strftime('%b %Y')}"
+        else:
+            label = f"@ {_format_forecast_label(time_labels[min(live_index, len(time_labels) - 1)])}"
+        return label if any_upcoming else f"Latest available {label}"
+
+    matrix_rows = []
+    station_count = len(ordered_keys)
+    grid_template = f"72px repeat({station_count}, var(--station-card-width))"
+    for pollutant in pollutants:
+        units = units_by_pollutant.get(pollutant) or ""
+        cards = [
+            html.Div(
+                [
+                    html.Div(pollutant, className="overview-station-matrix__pollutant-name"),
+                    html.Div(units, className="overview-station-matrix__pollutant-unit"),
+                ],
+                className="overview-station-matrix__pollutant",
+            )
+        ]
+        for station_key in ordered_keys:
+            station = station_rows[station_key]
+            value = station.get("values", {}).get(pollutant)
+            if value is None:
+                category_key, colour = "no-data", _leaflet_category_colour("No data")
+                value_text = "--"
+            else:
+                category_key, colour = category_for_value(pollutant, value)
+                value_text = f"{value:.1f} {units}".strip()
+            category_label = str(category_key or "no-data").replace("-", " ").upper()
+            cards.append(
+                html.Div(
+                    [
+                        html.Div(station["station"], className="overview-station-matrix__station"),
+                        html.Div(category_label, className="overview-station-matrix__category", style={"color": colour}),
+                        html.Div(value_text, className="overview-station-matrix__value"),
+                    ],
+                    className="overview-station-matrix__card",
+                    style={"borderLeftColor": colour},
+                )
+            )
+        matrix_rows.append(
+            html.Div(
+                cards,
+                className="overview-station-matrix__row",
+                style={"gridTemplateColumns": grid_template},
+            )
+        )
+
+    return (
+        html.Div(
+            html.Div(html.Div(matrix_rows, className="overview-station-matrix__rows"), className="overview-station-matrix__viewport"),
+            className="overview-station-matrix",
+        ),
+        _time_label(),
+    )
+
+
+def _overview_compact_forecast_time_label(value):
+    parsed = _parse_forecast_timestamp(value)
+    if not parsed:
+        return str(value or "--")
+    return f"{parsed.strftime('%b').upper()} {parsed.day} {parsed.strftime('%I').lstrip('0') or '0'}{parsed.strftime('%p')}"
+
+
+def _overview_region_bar_row(item):
+    item = item or {}
+    category = item.get("category") or "No data"
+    colour = item.get("categoryColor") or _leaflet_category_colour(category)
+    return html.Div(
+        [
+            html.Div(title_case_station_name(str(item.get("region") or "--").replace("_", " ")), className="overview-pm25-row__region"),
+            html.Div(html.Div(className="overview-forecast-bar__fill", style={"backgroundColor": colour}), className="overview-forecast-bar"),
+            html.Div(category, className="overview-pm25-row__category", style={"color": colour}),
+        ],
+        className="overview-pm25-row",
+    )
+
+
+def _overview_region_bar_section(pollutant, rows, empty_message="No regional data available."):
+    rows = rows or []
+    return html.Div(
+        [
+            html.H5(pollutant, className="overview-forecast-pollutant__title"),
+            html.Div(
+                [_overview_region_bar_row(row) for row in rows] if rows else [html.Div(empty_message, className="card-hint")],
+                className="overview-forecast-list",
+            ),
+        ],
+        className="overview-forecast-pollutant",
+    )
+
+
+def _overview_forecast_region_rows(selection, pollutant):
+    selection_for_panel, regions = _overview_pick_multi_region_forecast_selection(selection or {})
+    if not regions:
+        return [], "--"
+
+    horizon = str(selection_for_panel.get("timeScopes") or "12")
+    model_name = str(selection_for_panel.get("models") or "")
+    run_date = str(selection_for_panel.get("date") or "")
+    try:
+        max_hours = int(horizon)
+    except (TypeError, ValueError):
+        max_hours = 12
+
+    rows = []
+    time_label = "--"
+    any_upcoming = False
+    for region in sorted(regions, key=lambda value: title_case_station_name(str(value).replace("_", " "))):
+        fp = forecast_file_path([str(region), pollutant, horizon, model_name, run_date])
+        if not fp:
+            for kp in FILE_KEY_PARAMS:
+                if kp.get("regions") != region or kp.get("pollutants") != pollutant:
+                    continue
+                if str(kp.get("timeScopes")) != horizon or str(kp.get("date")) != run_date:
+                    continue
+                fp = forecast_file_path([kp.get("regions"), kp.get("pollutants"), kp.get("timeScopes"), kp.get("models"), kp.get("date")])
+                if fp:
+                    break
+        if not fp:
+            continue
+        try:
+            mtime = os.path.getmtime(fp)
+        except OSError:
+            mtime = 0
+        parsed = _cached_parse_csv(fp, pollutant, max_hours, mtime)
+        if not parsed:
+            continue
+        times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
+        idx, has_upcoming = _forecast_live_base_state(times)
+        any_upcoming = any_upcoming or has_upcoming
+        if time_label == "--" and times:
+            compact_label = _overview_compact_forecast_time_label(times[max(0, min(idx, len(times) - 1))])
+            time_label = compact_label if has_upcoming else f"Latest available {compact_label}"
+        values = []
+        for payload in ((parsed.get("data") or {}).get("stations") or {}).values():
+            forecast_values = (payload or {}).get("forecastValue") or []
+            if idx >= len(forecast_values):
+                continue
+            try:
+                values.append(float(forecast_values[idx]))
+            except (TypeError, ValueError):
+                continue
+        value = (sum(values) / float(len(values))) if values else None
+        category_key, colour = category_for_value(pollutant, value)
+        rows.append(
+            {
+                "region": region,
+                "value": value,
+                "valueLabel": "--" if value is None else f"{value:.1f}",
+                "category": str(category_key or "no-data").replace("-", " ").title(),
+                "categoryColor": colour,
+            }
+        )
+    rows.sort(key=lambda item: title_case_station_name(str(item.get("region") or "").replace("_", " ")))
+    if rows and not any_upcoming and time_label != "--" and not str(time_label).startswith("Latest available"):
+        time_label = f"Latest available {time_label}"
+    if not rows and time_label == "--":
+        time_label = "No forecast data"
+    return rows, time_label
 
 
 def _ranking_rows(parsed):
@@ -3443,11 +2589,28 @@ def _ranking_rows(parsed):
     return rows
 
 
-def _ranking_bar_figure(parsed, pollutant_label):
+def _safe_hour_index(value, length):
+    try:
+        idx = int(round(float(value or 0)))
+    except (TypeError, ValueError):
+        idx = 0
+    if length <= 0:
+        return 0
+    return max(0, min(idx, length - 1))
+
+
+def _ranking_bar_figure(parsed, pollutant_label, hour_index=0, limit=10):
     rows = []
     if parsed:
-        for station_name, payload in parsed.get("ranking", {}).items():
-            value = payload.get("maxValue")
+        stations = parsed.get("data", {}).get("stations", {}) or {}
+        times = parsed.get("data", {}).get("time", {}).get("forecastTime", []) or []
+        idx = _safe_hour_index(hour_index, len(times))
+        selected_time = times[idx] if idx < len(times) else None
+        for station_name, payload in stations.items():
+            series = (payload or {}).get("forecastValue") or []
+            if idx >= len(series):
+                continue
+            value = series[idx]
             if value is None:
                 continue
             value = float(value)
@@ -3457,14 +2620,14 @@ def _ranking_bar_figure(parsed, pollutant_label):
                     "station_key": station_name,
                     "station": title_case_station_name(station_name),
                     "value": value,
-                    "timestamp": _format_forecast_label(payload.get("timestamp")),
+                    "timestamp": _format_forecast_label(selected_time),
                     "category": category.replace("-", " ").title(),
                     "color": color,
                 }
             )
 
     rows.sort(key=lambda row: row["value"], reverse=True)
-    rows_for_chart = list(reversed(rows[:12]))
+    rows_for_chart = list(reversed(rows[: max(1, int(limit or 10))]))
     figure = go.Figure()
 
     if not rows_for_chart:
@@ -3475,7 +2638,7 @@ def _ranking_bar_figure(parsed, pollutant_label):
             font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
             annotations=[
                 dict(
-                    text="No ranked forecast values are available.",
+                    text="No station forecast values are available for this hour.",
                     x=0.5,
                     y=0.5,
                     xref="paper",
@@ -3493,7 +2656,7 @@ def _ranking_bar_figure(parsed, pollutant_label):
             y=[row["station"] for row in rows_for_chart],
             orientation="h",
             marker=dict(color=[row["color"] for row in rows_for_chart]),
-            text=[f"{row['value']:.2f}" for row in rows_for_chart],
+            text=[row["category"] for row in rows_for_chart],
             textposition="outside",
             cliponaxis=False,
             customdata=[
@@ -3502,7 +2665,7 @@ def _ranking_bar_figure(parsed, pollutant_label):
             ],
             hovertemplate=(
                 "<b>%{y}</b><br>"
-                "Max value: %{x:.2f}<br>"
+                "Forecast value: %{x:.2f}<br>"
                 "Category: %{customdata[1]}<br>"
                 "Time: %{customdata[2]}<extra></extra>"
             ),
@@ -3510,18 +2673,20 @@ def _ranking_bar_figure(parsed, pollutant_label):
     )
     figure.update_layout(
         template="plotly_white",
-        height=340,
-        margin=dict(l=108, r=34, t=16, b=36),
+        height=360,
+        margin=dict(l=118, r=54, t=16, b=24),
         font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(255,255,255,0.86)",
         showlegend=False,
         bargap=0.28,
         xaxis=dict(
-            title="Max value",
+            title="",
             gridcolor="#e2e8f0",
             zeroline=False,
             fixedrange=True,
+            showticklabels=False,
+            showgrid=False,
         ),
         yaxis=dict(
             title="",
@@ -3532,492 +2697,177 @@ def _ranking_bar_figure(parsed, pollutant_label):
     return figure
 
 
-def _forecast_hour_options(parsed):
-    times = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
-    if not times:
-        return [{"label": "--", "value": 0}]
-    options = []
-    for idx, timestamp in enumerate(times):
-        options.append(
-            {
-                "label": _format_forecast_label(timestamp),
-                "value": idx,
-            }
-        )
-    return options
-
-
-def _coerce_forecast_hour_index(parsed, hour_index):
-    times = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
-    if not times:
-        return 0
-    try:
-        hour_index = int(hour_index)
-    except (TypeError, ValueError):
-        hour_index = 0
-    return max(0, min(hour_index, len(times) - 1))
-
-
-def _station_pollutant_value_map(parsed, pollutant_label, hour_index):
-    if not parsed:
-        return {}, None
-
-    hour_index = _coerce_forecast_hour_index(parsed, hour_index)
-    stations = ((parsed.get("data") or {}).get("stations") or {})
-    times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime", [])
-    selected_time = times[hour_index] if hour_index < len(times) else None
-    rows = {}
-
-    for station_name, payload in stations.items():
-        values = (payload or {}).get("forecastValue") or []
-        if hour_index >= len(values):
-            continue
-        try:
-            value = float(values[hour_index])
-        except (TypeError, ValueError):
-            continue
-        category, color = category_for_value(pollutant_label, value)
-        rows[station_name] = {
-            "station_key": station_name,
-            "station": title_case_station_name(station_name),
-            "value": value,
-            "category": category.replace("-", " ").title(),
-            "color": color,
-            "units": (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "",
-            "pollutant": pollutant_label,
-        }
-
-    return rows, selected_time
-
-
-def _forecast_station_rows(selection, hour_index, focus_pollutant):
-    if not selection:
-        return [], None
-
-    selection = {
-        "regions": str(selection.get("regions") or ""),
-        "timeScopes": str(selection.get("timeScopes") or ""),
-        "models": str(selection.get("models") or ""),
-        "date": str(selection.get("date") or ""),
-    }
-    pollutants = ("PM2.5", "PM10", "O3")
-    merged_rows = {}
-    selected_time = None
-
-    for pollutant_label in pollutants:
-        forecast_selection = dict(selection)
-        forecast_selection["pollutants"] = pollutant_label
-        parsed, _message = _load_forecast(forecast_selection)
-        if not parsed:
-            continue
-        pollutant_rows, pollutant_time = _station_pollutant_value_map(parsed, pollutant_label, hour_index)
-        if selected_time is None:
-            selected_time = pollutant_time
-        for station_key, payload in pollutant_rows.items():
-            entry = merged_rows.setdefault(
-                station_key,
-                {
-                    "station_key": station_key,
-                    "station": payload["station"],
-                    "pollutants": {},
-                },
-            )
-            entry["pollutants"][pollutant_label] = payload
-
-    rows = []
-    focus_key = str(focus_pollutant or "PM2.5")
-    for entry in merged_rows.values():
-        focus_payload = entry["pollutants"].get(focus_key)
-        focus_value = focus_payload["value"] if focus_payload else float("-inf")
-        focus_category = focus_payload["category"] if focus_payload else "No data"
-        focus_color = focus_payload["color"] if focus_payload else "#94a3b8"
-        rows.append(
-            {
-                "station_key": entry["station_key"],
-                "station": entry["station"],
-                "pollutants": entry["pollutants"],
-                "focus_value": focus_value,
-                "focus_category": focus_category,
-                "focus_color": focus_color,
-            }
-        )
-
-    rows.sort(key=lambda row: row["focus_value"], reverse=True)
-    return rows, selected_time
-
-
-FORECAST_ALL_STATION_HORIZONS = (1, 3, 6, 12)
-
-
-def _forecast_horizon_indices(times, base_index, offsets=FORECAST_ALL_STATION_HORIZONS):
-    times = times or []
-    if not times:
-        return []
-    try:
-        base_index = int(base_index or 0)
-    except (TypeError, ValueError):
-        base_index = 0
-    base_index = max(0, min(base_index, len(times) - 1))
-
-    parsed_times = [_parse_forecast_timestamp(item) for item in times]
-    base_dt = parsed_times[base_index] if base_index < len(parsed_times) else None
-    out = []
-    for offset in offsets:
-        try:
-            offset_hours = int(offset)
-        except (TypeError, ValueError):
-            offset_hours = 1
-        idx = min(base_index + max(offset_hours, 0), len(times) - 1)
-        if base_dt:
-            target_dt = base_dt + timedelta(hours=offset_hours)
-            later_candidates = [
-                (i, parsed_dt)
-                for i, parsed_dt in enumerate(parsed_times)
-                if i > base_index and parsed_dt is not None and parsed_dt >= target_dt
-            ]
-            if later_candidates:
-                idx = later_candidates[0][0]
-            else:
-                future_candidates = [
-                    (i, parsed_dt)
-                    for i, parsed_dt in enumerate(parsed_times)
-                    if i > base_index and parsed_dt is not None
-                ]
-                if future_candidates:
-                    idx = min(future_candidates, key=lambda item: abs((item[1] - target_dt).total_seconds()))[0]
-        out.append({"offset": offset_hours, "index": idx})
-    return out
-
-
-def _forecast_horizon_label(times, base_index, horizon):
-    idx = horizon.get("index", 0)
-    requested_offset = horizon.get("offset", 0)
-    label = _format_forecast_label(times[idx] if idx < len(times) else None)
-    lead_label = f"t+{requested_offset}"
-    return f"{lead_label} · {label}"
-
-
-def _format_forecast_table_time_label(value):
-    parsed = _parse_forecast_timestamp(value)
-    if not parsed:
-        return str(value or "--")
-    hour = parsed.strftime("%I").lstrip("0") or "0"
-    return f"{hour}{parsed.strftime('%p')} / {parsed.strftime('%b')} {parsed.day}"
-
-
-def _forecast_horizon_table_label(times, horizon):
-    idx = horizon.get("index", 0)
-    return _format_forecast_table_time_label(times[idx] if idx < len(times) else None)
-
-
-def _load_exact_forecast(selection):
-    file_path = _build_file_path(selection or {})
-    if not file_path:
-        return None
-    try:
-        max_forecast_hours = int((selection or {}).get("timeScopes"))
-    except (TypeError, ValueError):
-        max_forecast_hours = None
-    parsed = parse_csv(file_path, (selection or {}).get("pollutants"), max_forecast_hours=max_forecast_hours)
-    if isinstance(parsed, dict) and parsed.get("error"):
-        return None
-    if isinstance(parsed, dict):
-        parsed["_sourceFile"] = file_path
-        parsed["_exactMatch"] = True
-        parsed["_region"] = (selection or {}).get("regions")
-    return parsed
-
-
-def _forecast_all_station_regions(selection):
-    regions = _overview_available_forecast_regions(selection or {})
-    if regions:
-        return regions
-    selected_region = (selection or {}).get("regions")
-    return [selected_region] if selected_region else []
-
-
-def _forecast_all_station_table(selection, hour_index):
+def _forecast_file_for_pollutant(selection, pollutant_label):
     selection = selection or {}
-    pollutant_label = str(selection.get("pollutants") or "PM2.5")
-    selected_parsed = _load_exact_forecast(selection) or (_load_forecast(selection)[0] if selection else None)
-    if not selected_parsed:
-        return [], [], "All station forecast", "No exact forecast file is available for this selection."
+    region = str(selection.get("regions") or "")
+    horizon = str(selection.get("timeScopes") or "")
+    model = str(selection.get("models") or "")
+    run_date = str(selection.get("date") or "")
+    file_path = forecast_file_path([region, pollutant_label, horizon, model, run_date])
+    if file_path:
+        return file_path
+    for kp in FILE_KEY_PARAMS:
+        if str(kp.get("regions") or "") != region:
+            continue
+        if str(kp.get("pollutants") or "") != str(pollutant_label):
+            continue
+        if str(kp.get("timeScopes") or "") != horizon:
+            continue
+        if str(kp.get("date") or "") != run_date:
+            continue
+        file_path = forecast_file_path([kp.get("regions"), kp.get("pollutants"), kp.get("timeScopes"), kp.get("models"), kp.get("date")])
+        if file_path:
+            return file_path
+    return None
 
-    times = ((selected_parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
-    if not times:
-        return [], [], "All station forecast", "No forecast time axis is available for this selection."
 
-    base_index = _coerce_forecast_hour_index(selected_parsed, hour_index)
-    base_time = _parse_forecast_timestamp(times[base_index]) if base_index < len(times) else None
-    horizons = _forecast_horizon_indices(times, base_index)
-    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or ""
-    region_lookup = load_region_lookup()
-    selected_region_code = str(selection.get("regions") or "")
-    selected_region_label = region_lookup.get(selected_region_code) or title_case_station_name(selected_region_code.replace("_", " "))
+def _forecast_regions_for_map(selection, pollutant_label):
+    selection = selection or {}
+    horizon = str(selection.get("timeScopes") or "")
+    run_date = str(selection.get("date") or "")
+    if not horizon or not run_date or not pollutant_label:
+        return []
+    regions = set()
+    for kp in FILE_KEY_PARAMS:
+        if str(kp.get("pollutants") or "") != str(pollutant_label):
+            continue
+        if str(kp.get("timeScopes") or "") != horizon:
+            continue
+        if str(kp.get("date") or "") != run_date:
+            continue
+        region = kp.get("regions")
+        if region:
+            regions.add(region)
+    if "Sydney" in regions and any(str(region).startswith("Sydney_") for region in regions):
+        regions.discard("Sydney")
+    return sorted(regions)
 
-    columns = [
-        {"name": "Station", "id": "station"},
-        {"name": "Region", "id": "region"},
-    ]
-    for horizon in horizons:
-        col_id = f"h{horizon['offset']}_{horizon['index']}"
-        columns.append(
-            {
-                "name": _forecast_horizon_table_label(times, horizon),
-                "id": col_id,
-                "presentation": "markdown",
-            }
-        )
 
-    rows = []
-    included_regions = []
-    for region_code in _forecast_all_station_regions(selection):
-        region_selection = dict(selection)
-        region_selection["regions"] = region_code
-        parsed = _load_exact_forecast(region_selection)
+def _merged_forecast_map_payload(selection, pollutant_label):
+    selection = dict(selection or {})
+    pollutant_label = pollutant_label or selection.get("pollutants") or "PM2.5"
+    horizon = str(selection.get("timeScopes") or "")
+    run_date = str(selection.get("date") or "")
+    model = str(selection.get("models") or "")
+    try:
+        max_hours = int(horizon)
+    except (TypeError, ValueError):
+        max_hours = None
+
+    merged_stations = {}
+    merged_times = []
+    time_block = None
+    for region in _forecast_regions_for_map(selection, pollutant_label):
+        region_selection = dict(selection, regions=region, pollutants=pollutant_label)
+        file_path = forecast_file_path([region, pollutant_label, horizon, model, run_date]) if model else None
+        if not file_path:
+            file_path = _forecast_file_for_pollutant(region_selection, pollutant_label)
+        if not file_path:
+            continue
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = 0
+        parsed = _cached_parse_csv(file_path, pollutant_label, max_hours, mtime)
         if not parsed:
             continue
-        region_times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
-        stations = ((parsed.get("data") or {}).get("stations") or {})
-        if not region_times or not stations:
-            continue
+        parsed_time_block = (parsed.get("data") or {}).get("time") or {}
+        if time_block is None and parsed_time_block:
+            time_block = dict(parsed_time_block)
+        for ts in parsed_time_block.get("forecastTime", []) or []:
+            if ts not in merged_times:
+                merged_times.append(ts)
+        for station_name, payload in ((parsed.get("data") or {}).get("stations") or {}).items():
+            if station_name not in merged_stations:
+                merged_stations[station_name] = payload
 
-        if base_time is not None:
-            region_parsed_times = [_parse_forecast_timestamp(item) for item in region_times]
-            matching_indices = [
-                idx
-                for idx, parsed_time in enumerate(region_parsed_times)
-                if parsed_time is not None and parsed_time == base_time
-            ]
-            region_base_index = matching_indices[0] if matching_indices else min(base_index, len(region_times) - 1)
-        else:
-            region_base_index = min(base_index, len(region_times) - 1)
-        region_horizons = _forecast_horizon_indices(region_times, region_base_index)
-        horizon_pairs = list(zip(horizons, region_horizons))
-        region_label = region_lookup.get(str(region_code)) or title_case_station_name(str(region_code).replace("_", " "))
-        included_regions.append(region_label)
-
-        for station_name, payload in stations.items():
-            values = (payload or {}).get("forecastValue") or []
-            row = {
-                "station": title_case_station_name(station_name),
-                "region": region_label,
-            }
-            sort_value = None
-            has_value = False
-            for display_horizon, region_horizon in horizon_pairs:
-                idx = region_horizon["index"]
-                col_id = f"h{display_horizon['offset']}_{display_horizon['index']}"
-                value = None
-                if idx < len(values):
-                    try:
-                        value = float(values[idx])
-                    except (TypeError, ValueError):
-                        value = None
-                if value is None:
-                    row[col_id] = "--"
-                    continue
-                category_key, _colour = category_for_value(pollutant_label, value)
-                category_label = category_key.replace("-", " ").title()
-                row[col_id] = _aq_badge_html(f"{value:.2f}", category_label)
-                has_value = True
-                if sort_value is None:
-                    sort_value = value
-            if has_value:
-                row["_sort_value"] = sort_value if sort_value is not None else float("-inf")
-                rows.append(row)
-
-    rows.sort(key=lambda row: (-(row.get("_sort_value") or float("-inf")), row.get("station") or ""))
-    for row in rows:
-        row.pop("_sort_value", None)
-
-    base_label = _format_forecast_table_time_label(times[base_index])
-    title = f"All available station forecast · {pollutant_display(pollutant_label)}"
-    if rows:
-        subtitle = f"All available regions for run {selection.get('date') or '--'} · base hour {base_label} · {len(rows)} stations across {len(set(included_regions))} regions"
-    else:
-        subtitle = f"No station forecast values are available across regions for run {selection.get('date') or '--'}."
-    if selected_region_label:
-        subtitle = f"{subtitle} · opened from {selected_region_label}"
-    if units:
-        subtitle = f"{subtitle} · {units}"
-    return columns, rows, title, subtitle
+    if time_block is None:
+        time_block = {}
+    if merged_times:
+        time_block["forecastTime"] = merged_times
+    return {"data": {"time": time_block, "stations": merged_stations}}
 
 
-def _forecast_overview_allstations_table(selection):
-    """Forecast-tab version of the Overview all-stations table."""
+def _station_rank_bars_for_pollutants(parsed, selection, hour_index=0, limit=10):
     selection = dict(selection or {})
-    selection["pollutants"] = "PM2.5"
-    selection_for_panel, regions = _overview_pick_multi_region_forecast_selection(selection)
-    columns, rows = _overview_allstations_offsets_rows(selection_for_panel, offsets=(1, 3, 6, 12))
+    pollutants = ["PM2.5", "PM10", "O3"]
 
-    title = "All station forecast"
-    if rows:
-        subtitle = (
-            "PM2.5, PM10 and O3 for all available regions"
-            f" · run {selection_for_panel.get('date') or '--'}"
-            f" · {len(rows)} stations across {len(set(regions or [])) or '--'} regions"
-        )
-    else:
-        subtitle = f"No all-station forecast values are available for run {selection_for_panel.get('date') or '--'}."
-    return columns, rows, title, subtitle
+    def _severity(category_key):
+        order = {"no-data": -1, "good": 0, "fair": 1, "poor": 2, "very-poor": 3, "extremely-poor": 4}
+        return order.get(str(category_key or "no-data"), -1)
 
+    sections = []
+    for pollutant in pollutants:
+        parsed_for_pollutant = parsed if pollutant == selection.get("pollutants") else None
+        if parsed_for_pollutant is None:
+            file_path = _forecast_file_for_pollutant(selection, pollutant)
+            if file_path:
+                try:
+                    max_hours = int(selection.get("timeScopes") or 0) or None
+                except (TypeError, ValueError):
+                    max_hours = None
+                try:
+                    mtime = os.path.getmtime(file_path)
+                except OSError:
+                    mtime = 0
+                parsed_for_pollutant = _cached_parse_csv(file_path, pollutant, max_hours, mtime)
 
-def _default_ranking_station(selection, hour_index):
-    rows, _selected_time = _forecast_station_rows(selection, hour_index, selection.get("pollutants"))
-    return rows[0]["station_key"] if rows else None
-
-
-@lru_cache(maxsize=96)
-def _forecast_region_mean_series(region_code, pollutant_label, time_scope, model_name, run_date):
-    if not region_code or not pollutant_label or not time_scope or not model_name or not run_date:
-        return tuple()
-
-    selection = {
-        "regions": str(region_code),
-        "pollutants": str(pollutant_label),
-        "timeScopes": str(time_scope),
-        "models": str(model_name),
-        "date": str(run_date),
-    }
-    parsed, _message = _load_forecast(selection)
-    if not parsed:
-        return tuple()
-
-    times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime", [])
-    stations = ((parsed.get("data") or {}).get("stations") or {})
-    if not times or not stations:
-        return tuple()
-
-    sums = [0.0] * len(times)
-    counts = [0] * len(times)
-    for payload in stations.values():
-        values = (payload or {}).get("forecastValue") or []
-        for idx, raw_value in enumerate(values[: len(times)]):
+        stations = (((parsed_for_pollutant or {}).get("data") or {}).get("stations") or {})
+        times = (((parsed_for_pollutant or {}).get("data") or {}).get("time") or {}).get("forecastTime") or []
+        idx = _safe_hour_index(hour_index, len(times))
+        rows = []
+        for station_name, payload in stations.items():
+            series = (payload or {}).get("forecastValue") or []
+            if idx >= len(series):
+                continue
             try:
-                value = float(raw_value)
+                value = float(series[idx])
             except (TypeError, ValueError):
                 continue
-            sums[idx] += value
-            counts[idx] += 1
+            category_key, colour = category_for_value(pollutant, value)
+            category_label = str(category_key or "no-data").replace("-", " ").title()
+            rows.append(
+                {
+                    "station": title_case_station_name(station_name),
+                    "value": value,
+                    "categoryKey": category_key,
+                    "category": category_label,
+                    "colour": colour,
+                }
+            )
+        rows.sort(key=lambda row: (-_severity(row.get("categoryKey")), -row.get("value", 0), row.get("station") or ""))
+        rows = rows[: max(1, int(limit or 10))]
 
-    means = []
-    for idx in range(len(times)):
-        if counts[idx] > 0:
-            means.append(sums[idx] / float(counts[idx]))
+        if rows:
+            body = [
+                html.Div(
+                    [
+                        html.Div(row["station"], className="station-rank-bars__station"),
+                        html.Div(
+                            html.Div(className="station-rank-bars__fill", style={"backgroundColor": row["colour"]}),
+                            className="station-rank-bars__track",
+                        ),
+                        html.Div(row["category"], className="station-rank-bars__category", style={"color": row["colour"]}),
+                    ],
+                    className="station-rank-bars__row",
+                    title=f"{row['station']}: {row['value']:.2f}",
+                )
+                for row in rows
+            ]
         else:
-            means.append(None)
-    return tuple(means)
+            body = [html.Div("No station forecast values are available for this pollutant.", className="forecast-rank-empty")]
 
-
-def _station_prediction_cards_unused(selection, hour_index):
-    rows, selected_time = _forecast_station_rows(selection, hour_index, selection.get("pollutants"))
-    if not rows:
-        return html.Div("No forecast values are available for this selection.", className="forecast-rank-empty")
-
-    focus_pollutant = selection.get("pollutants") or "PM2.5"
-    pollutant_order = ("PM2.5", "PM10", "O3")
-
-    return html.Div(
-        [
+        sections.append(
             html.Div(
                 [
-                    html.Button(
-                        "All station forecast",
-                        n_clicks=0,
-                        className="forecast-rank-eyebrow forecast-all-stations-link table-link",
-                    ),
-                    html.Div(_format_forecast_label(selected_time), className="forecast-rank-time"),
+                    html.Div(pollutant, className="station-rank-bars__pollutant"),
+                    html.Div(body, className="station-rank-bars__rows"),
                 ],
-                className="forecast-rank-summary",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Span(f"#{rank}", className="forecast-station-card__rank"),
-                                    html.Span(row["focus_category"], className="forecast-station-card__badge"),
-                                ],
-                                className="forecast-station-card__top",
-                            ),
-                            html.Div(row["station"], className="forecast-station-card__station"),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                [
-                                                    html.Div((row["pollutants"].get(pollutant_label) or {}).get("pollutant", pollutant_label), className="forecast-pollutant-box__label"),
-                                                    html.Div(
-                                                        [
-                                                            html.Span(
-                                                                "--" if (row["pollutants"].get(pollutant_label) or {}).get("value") is None else f"{(row['pollutants'].get(pollutant_label) or {}).get('value'):.2f}",
-                                                                className="forecast-pollutant-box__value",
-                                                            ),
-                                                            html.Span(
-                                                                (row["pollutants"].get(pollutant_label) or {}).get("units") or "",
-                                                                className="forecast-pollutant-box__unit",
-                                                            ),
-                                                        ],
-                                                        className="forecast-pollutant-box__metric",
-                                                    ),
-                                                    html.Span(
-                                                        (row["pollutants"].get(pollutant_label) or {}).get("category") or "No data",
-                                                        className="forecast-pollutant-box__badge",
-                                                    ),
-                                                ],
-                                                className="forecast-pollutant-box forecast-pollutant-box--focus",
-                                                style={"--pollutant-color": row["focus_color"]},
-                                            ),
-                                        ],
-                                        className="forecast-pollutant-boxes",
-                                    ),
-                                ],
-                                className="forecast-station-card__pollutants",
-                            ),
-                        ],
-                        className="forecast-station-card",
-                        style={"--rank-color": row["focus_color"]},
-                    )
-                    for rank, row in enumerate(rows, start=1)
-                ],
-                className="forecast-rank-grid forecast-rank-grid--stations",
-            ),
-        ],
-        className="forecast-rank-panel",
-    )
+                className="station-rank-bars__section",
+            )
+        )
 
-
-def _selected_station_details(parsed, pollutant_label, station_name, hour_index):
-    if not parsed or not station_name:
-        return "Choose a station from the list to inspect its forecast profile."
-
-    stations = ((parsed.get("data") or {}).get("stations") or {})
-    payload = stations.get(station_name) or {}
-    values = payload.get("forecastValue") or []
-    times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime", [])
-    if not values or not times:
-        return f"{title_case_station_name(station_name)} selected. No forecast series available."
-
-    idx = _coerce_forecast_hour_index(parsed, hour_index)
-    if idx >= len(values):
-        idx = len(values) - 1
-
-    try:
-        value = float(values[idx])
-        value_text = f"{value:.2f}"
-    except (TypeError, ValueError):
-        value = None
-        value_text = "--"
-
-    category, _color = category_for_value(pollutant_label, value)
-    category_text = category.replace("-", " ").title()
-    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or ""
-    time_text = _format_forecast_label(times[idx] if idx < len(times) else None)
-
-    return f"{title_case_station_name(station_name)} · {pollutant_label}: {value_text} {units} · {category_text} · {time_text}".strip()
+    return html.Div(sections, className="station-rank-bars")
 
 
 def _station_series_colour(station_name):
@@ -4029,156 +2879,178 @@ def _station_series_colour(station_name):
 
 
 def _station_trend_figure(parsed, pollutant_label, station_name):
-    selection = (parsed or {}).get("_selection") or {}
-    return _region_forecast_figure(parsed, selection, pollutant_label)
-
-
-def _region_forecast_figure(parsed, selection, pollutant_label):
     figure = go.Figure()
-    trend_margin = dict(l=54, r=18, t=42, b=98)
-    if not parsed or not selection:
+    if not parsed or not station_name:
         figure.update_layout(
             template="plotly_white",
-            height=340,
-            margin=trend_margin,
+            height=320,
+            margin=dict(l=20, r=20, t=30, b=20),
             font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="#ffffff",
         )
         return figure
 
-    region_code = str(selection.get("regions") or "")
-    region_name = load_region_lookup().get(region_code) or title_case_station_name(region_code) or "Selected region"
-    time_scope = str(selection.get("timeScopes") or "12")
-    times = parsed.get("data", {}).get("time", {}).get("forecastTime", [])
     stations = parsed.get("data", {}).get("stations", {})
-    if not times or not stations:
+    payload = None
+    target = normalize_station_name(station_name)
+    for key, value in stations.items():
+        if normalize_station_name(key) == target:
+            payload = value
+            break
+    if not payload:
         figure.update_layout(
             template="plotly_white",
-            height=340,
-            margin=trend_margin,
+            height=320,
+            margin=dict(l=20, r=20, t=30, b=20),
             font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="#ffffff",
         )
         return figure
 
-    station_series = []
-    max_len = len(times)
-    for station_name, payload in sorted(stations.items(), key=lambda item: title_case_station_name(item[0])):
-        values = []
-        for raw_value in ((payload or {}).get("forecastValue") or [])[:max_len]:
-            try:
-                values.append(float(raw_value))
-            except (TypeError, ValueError):
-                values.append(None)
-        if not any(value is not None for value in values):
-            continue
-        station_series.append((station_name, values))
-
-    if not station_series:
-        figure.update_layout(
-            template="plotly_white",
-            height=340,
-            margin=trend_margin,
-            font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="#ffffff",
+    times = parsed.get("data", {}).get("time", {}).get("forecastTime", [])
+    values = payload.get("forecastValue", [])
+    colour = _station_series_colour(station_name)
+    figure.add_trace(
+        go.Scatter(
+            x=times[: len(values)],
+            y=values,
+            mode="lines+markers",
+            line=dict(color=colour, width=3),
+            marker=dict(size=7, color=colour),
+            name=title_case_station_name(station_name),
         )
-        return figure
-
-    for station_name, values in station_series:
-        station_label = title_case_station_name(station_name)
-        colour = _station_series_colour(station_name)
-        figure.add_trace(
-            go.Scatter(
-                x=times[: len(values)],
-                y=values,
-                mode="lines+markers",
-                line=dict(color=colour, width=2.2, shape="spline", smoothing=0.55),
-                marker=dict(size=5.5, color=colour, line=dict(color="#ffffff", width=0.8)),
-                name=station_label,
-                hovertemplate=f"<b>{station_label}</b><br>%{{x}}<br>%{{y:.2f}}<extra></extra>",
-            )
-        )
-
-    means = []
-    for idx in range(max_len):
-        values_at_time = [
-            values[idx]
-            for _station_name, values in station_series
-            if idx < len(values) and values[idx] is not None
-        ]
-        means.append(sum(values_at_time) / len(values_at_time) if values_at_time else None)
-    if any(value is not None for value in means):
-        figure.add_trace(
-            go.Scatter(
-                x=times[: len(means)],
-                y=means,
-                mode="lines",
-                line=dict(color="#0f172a", width=3.0, dash="dash"),
-                name="Region average",
-                hovertemplate="<b>Region average</b><br>%{x}<br>%{y:.2f}<extra></extra>",
-            )
-        )
-
+    )
     pollutant = POLLUTANTS.get(pollutant_label, {})
     figure.update_layout(
         template="plotly_white",
-        height=340,
-        margin=trend_margin,
-        title=dict(
-            text=f"{region_name} @ {time_scope} hr forecast",
-            font=dict(family=BASE_FONT_FAMILY, color="#64748b", size=18),
-        ),
+        height=300,
+        margin=dict(l=52, r=18, t=42, b=42),
+        title=f"{title_case_station_name(station_name)} forecast",
         font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#ffffff",
         hovermode="x unified",
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.30,
-            xanchor="center",
-            x=0.5,
-            font=dict(family=BASE_FONT_FAMILY, size=10, color="#475569"),
-            title=dict(text="Stations", font=dict(family=BASE_FONT_FAMILY, size=11, color="#334155")),
-            itemclick="toggle",
-            itemdoubleclick="toggleothers",
-            traceorder="normal",
-        ),
-        annotations=[
-            dict(
-                text=f"{len(station_series)} station forecasts in selected region",
-                x=0.0,
-                y=1.08,
-                xref="paper",
-                yref="paper",
-                showarrow=False,
-                font=dict(family=BASE_FONT_FAMILY, size=12, color="#94a3b8"),
-                align="left",
-            )
-        ],
+        showlegend=False,
         xaxis=dict(
-            title=dict(text="Forecast time", font=dict(family=BASE_FONT_FAMILY, color="#0f172a"), standoff=12),
-            tickfont=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-            gridcolor="#e8eef8",
-            zeroline=False,
-            automargin=True,
+            title="",
+            tickformat="%H:%M",
+            nticks=5,
+            showgrid=False,
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=10),
         ),
         yaxis=dict(
             title=dict(text=pollutant.get("Units", "Value"), font=dict(family=BASE_FONT_FAMILY, color="#0f172a")),
-            tickfont=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-            gridcolor="#e8eef8",
+            gridcolor="#e2e8f0",
             zeroline=False,
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=10),
+        ),
+    )
+    return figure
+
+
+def _all_stations_trend_figure(parsed, pollutant_label, forecast_horizon=None):
+    figure = go.Figure()
+    stations = parsed.get("data", {}).get("stations", {}) if parsed else {}
+    times = parsed.get("data", {}).get("time", {}).get("forecastTime", []) if parsed else []
+    pollutant = POLLUTANTS.get(pollutant_label, {})
+
+    if not stations or not times:
+        figure.update_layout(
+            template="plotly_white",
+            height=300,
+            margin=dict(l=52, r=18, t=42, b=42),
+            font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
+        )
+        return figure
+
+    def _station_peak(item):
+        _station_name, payload = item
+        values = payload.get("forecastValue", []) if isinstance(payload, dict) else []
+        numeric = []
+        for value in values:
+            try:
+                numeric.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return max(numeric) if numeric else float("-inf")
+
+    ranked_stations = sorted(stations.items(), key=lambda item: (-_station_peak(item), title_case_station_name(item[0])))[:8]
+    parsed_times = [_parse_forecast_timestamp(ts) or ts for ts in times]
+    time_axis = _forecast_time_tick_axis(times)
+    horizon_text = f"{forecast_horizon}H" if forecast_horizon not in (None, "") else f"{len(times)}H"
+    title_text = f"Regional Time Series for {pollutant_label} @ {horizon_text} Forecast Horizon"
+
+    for index, (station_name, payload) in enumerate(ranked_stations):
+        values = payload.get("forecastValue", [])
+        if not values:
+            continue
+        colour = STATION_SERIES_PALETTE[index % len(STATION_SERIES_PALETTE)]
+        figure.add_trace(
+            go.Scatter(
+                x=parsed_times[: len(values)],
+                y=values,
+                mode="lines+markers",
+                line=dict(color=colour, width=0.8),
+                marker=dict(size=2.4, color=colour, line=dict(width=0.45, color="#ffffff")),
+                opacity=0.86,
+                name=title_case_station_name(station_name),
+                hovertemplate="<b>%{fullData.name}</b><br>%{x|%d %b %H:%M}<br>%{y:.2f}<extra></extra>",
+            )
+        )
+
+    figure.update_layout(
+        template="plotly_white",
+        height=310,
+        margin=dict(l=56, r=18, t=54, b=58),
+        title=dict(text=title_text, x=0, xanchor="left", font=dict(size=13.5, color="#0f172a")),
+        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(255,255,255,0.92)",
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.2,
+            xanchor="left",
+            x=0,
+            font=dict(size=7.5, color="#334155"),
+            itemsizing="trace",
+            itemwidth=30,
+        ),
+        xaxis=dict(
+            title="",
+            showgrid=False,
+            ticks="outside",
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=10),
+            **time_axis,
+        ),
+        yaxis=dict(
+            title=dict(text=pollutant.get("Units", "Value"), font=dict(family=BASE_FONT_FAMILY, color="#0f172a", size=11)),
+            gridcolor="#e2e8f0",
+            zeroline=False,
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=10.5),
         ),
     )
     return figure
 
 
 def _all_stations_details(parsed):
-    return ""
+    stations = parsed.get("data", {}).get("stations", {}) if parsed else {}
+    station_count = len(stations)
+    step_count = 0
+    latest_values = []
+    for payload in stations.values():
+        values = payload.get("forecastValue", [])
+        step_count = max(step_count, len(values))
+        if values:
+            latest_values.append(values[-1])
+
+    details = [
+        html.Div(["Showing: ", html.Strong("All stations")]),
+        html.Div(["Stations: ", html.Strong(str(station_count))]),
+        html.Div(["Forecast steps: ", html.Strong(str(step_count))]),
+    ]
+    if latest_values:
+        details.append(html.Div(["Latest range: ", html.Strong(f"{min(latest_values):.2f} to {max(latest_values):.2f}")]))
+    return details
 
 
 def _overview_allstations_value_styles():
@@ -4243,6 +3115,35 @@ def _station_from_hash(parsed, url_hash):
     return None
 
 
+def _forecast_time_tick_axis(times):
+    parsed_times = []
+    for value in times or []:
+        parsed = _parse_forecast_timestamp(value)
+        if parsed is None:
+            continue
+        parsed_times.append(parsed)
+    if not parsed_times:
+        return {}
+
+    step = max(1, math.ceil(len(parsed_times) / 7))
+    tickvals = []
+    ticktext = []
+    last_date = None
+    for index, parsed in enumerate(parsed_times):
+        is_day_change = last_date is not None and parsed.date() != last_date
+        if index % step != 0 and not is_day_change and index != len(parsed_times) - 1:
+            last_date = parsed.date()
+            continue
+        hour = parsed.strftime("%I").lstrip("0") or "0"
+        label = f"{hour}{parsed.strftime('%p')}"
+        if index == 0 or is_day_change:
+            label = f"{label}<br>{parsed.day} {parsed.strftime('%b')}"
+        tickvals.append(parsed)
+        ticktext.append(label)
+        last_date = parsed.date()
+    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext}
+
+
 def _monitor_from_hash(url_hash):
     params = _parse_hash_params(url_hash)
     monitor = (params.get("monitor") or "").strip()
@@ -4256,77 +3157,95 @@ def _monitor_from_hash(url_hash):
     return None
 
 
-def _station_prediction_cards(selection, hour_index):
-    rows, selected_time = _forecast_station_rows(selection, hour_index, selection.get("pollutants"))
+def _mapbox_view(rows):
     if not rows:
-        return html.Div("No forecast values are available for this selection.", className="forecast-rank-empty")
+        return NSW_MAP_CENTER, 6.0
 
-    focus_pollutant = selection.get("pollutants") or "PM2.5"
-    pollutant_order = ("PM2.5", "PM10", "O3")
+    lats = [row["lat"] for row in rows if row.get("lat") is not None]
+    lons = [row["lon"] for row in rows if row.get("lon") is not None]
+    if not lats or not lons:
+        return NSW_MAP_CENTER, 6.0
 
-    cards = []
-    for rank, row in enumerate(rows, start=1):
-        pollutant_boxes = []
-        for pollutant_label in pollutant_order:
-            payload = row["pollutants"].get(pollutant_label)
-            pollutant_boxes.append(
-                html.Div(
-                    [
-                        html.Div(pollutant_label, className="forecast-pollutant-box__label"),
-                        html.Div(
-                            [
-                                html.Span(
-                                    "--" if payload is None or payload.get("value") is None else f"{payload['value']:.2f}",
-                                    className="forecast-pollutant-box__value",
-                                ),
-                                html.Span(
-                                    payload.get("units") if payload else "",
-                                    className="forecast-pollutant-box__unit",
-                                ),
-                            ],
-                            className="forecast-pollutant-box__metric",
-                        ),
-                        html.Span(
-                            payload.get("category") if payload else "No data",
-                            className="forecast-pollutant-box__badge",
-                        ),
-                    ],
-                    className="forecast-pollutant-box",
-                    style={"--pollutant-color": (payload or {}).get("color") or "#94a3b8"},
-                )
-            )
+    lat_span = max(lats) - min(lats)
+    lon_span = max(lons) - min(lons)
+    span = max(lat_span, lon_span)
 
-        focus_payload = row["pollutants"].get(focus_pollutant)
-        focus_value = "--" if focus_payload is None or focus_payload.get("value") is None else f"{focus_payload['value']:.2f}"
-        focus_units = focus_payload.get("units") if focus_payload else ""
+    if span <= 0.25:
+        zoom = 8.0
+    elif span <= 0.5:
+        zoom = 7.3
+    elif span <= 1.0:
+        zoom = 6.8
+    elif span <= 2.0:
+        zoom = 6.2
+    elif span <= 4.0:
+        zoom = 5.8
+    else:
+        zoom = 5.6
 
-        cards.append(
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Span(f"#{rank}", className="forecast-station-card__rank"),
-                            html.Span(row["focus_category"], className="forecast-station-card__badge"),
-                        ],
-                        className="forecast-station-card__top",
-                    ),
-                    html.Div(row["station"], className="forecast-station-card__station"),
-                    html.Div(pollutant_boxes, className="forecast-pollutant-boxes"),
-                    html.Div(
-                        [
-                            html.Span(focus_pollutant, className="forecast-station-card__focus-label"),
-                            html.Span(focus_value, className="forecast-station-card__focus-value"),
-                            html.Span(focus_units, className="forecast-station-card__focus-unit"),
-                        ],
-                        className="forecast-station-card__focus",
-                    ),
-                ],
-                className="forecast-station-card",
-                style={"--rank-color": row["focus_color"]},
-            )
+    return NSW_MAP_CENTER, zoom
+
+
+def _map_figure(parsed, pollutant_label, hour_index):
+    rows = _station_rows(parsed, pollutant_label, hour_index)
+    figure = go.Figure()
+    map_center, map_zoom = _mapbox_view(rows)
+    if not rows:
+        figure.update_layout(
+            **_geo_map_layout(620),
         )
+        figure.add_annotation(
+            text="No forecast stations could be mapped for this selection.",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(family=BASE_FONT_FAMILY, size=16, color="#475569"),
+        )
+        return figure
 
-    return html.Div(cards, className="forecast-rank-grid forecast-rank-grid--stations")
+    lats = [row["lat"] for row in rows]
+    lons = [row["lon"] for row in rows]
+    values = [row["value"] for row in rows]
+    colors = [row["color"] for row in rows]
+    names = [row["station"] for row in rows]
+    categories = [row["category"] for row in rows]
+    if len(values) > 1 and max(values) != min(values):
+        min_value = min(values)
+        max_value = max(values)
+        marker_sizes = [18 + ((value - min_value) / (max_value - min_value)) * 12 for value in values]
+    else:
+        marker_sizes = [22 for _ in values]
+    hover_data = [
+        {
+            "station": name,
+            "value": value,
+            "category": category,
+            "region": row["region"],
+        }
+        for name, value, category, row in zip(names, values, categories, rows)
+    ]
+    value_labels = [f"{value:.1f}" for value in values]
+
+    figure.add_trace(
+        go.Scattergeo(
+            lon=lons,
+            lat=lats,
+            mode="markers+text",
+            marker=dict(size=marker_sizes, color=colors, opacity=0.97),
+            text=value_labels,
+            textposition="top center",
+            textfont=dict(size=14, color="#0f172a", family=BASE_FONT_FAMILY),
+            customdata=hover_data,
+            hovertemplate="<b>%{customdata.station}</b><br>Value: %{customdata.value:.2f}<br>Category: %{customdata.category}<br>Region: %{customdata.region}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        **_geo_map_layout(620),
+    )
+    return figure
+
 
 def _best_station_for_hour(parsed, hour_index):
     stations = parsed.get("data", {}).get("stations", {}) if parsed else {}
@@ -4353,53 +3272,15 @@ def _best_station_for_hour(parsed, hour_index):
     return best_station
 
 
-def _forecast_station_region(station_name, fallback_region=None):
-    site = _site_lookup().get(normalize_station_name(station_name)) or {}
-    region = site.get("Region") or fallback_region
-    return str(region or "").replace(" ", "_").strip()
-
-
-def _forecast_station_options(parsed, region_value=None):
-    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
-    region_key = _monitor_region_series_key(region_value)
-    options = []
-    for station_name in sorted(stations, key=lambda name: title_case_station_name(name)):
-        station_region = _forecast_station_region(station_name, (parsed or {}).get("_region"))
-        if region_key and _monitor_region_series_key(station_region) != region_key:
-            continue
-        options.append({"label": title_case_station_name(station_name), "value": station_name})
-    return options
-
-
-def _forecast_region_options(parsed, selected_region=None):
-    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
-    regions = []
-    for station_name in stations:
-        station_region = _forecast_station_region(station_name, selected_region or (parsed or {}).get("_region"))
-        if station_region and station_region not in regions:
-            regions.append(station_region)
-    if selected_region and selected_region not in regions:
-        regions.insert(0, selected_region)
-    return [{"label": str(region).replace("_", " "), "value": region} for region in sorted(regions)]
-
-
-def _default_forecast_station(parsed, region_value=None):
-    options = _forecast_station_options(parsed, region_value)
-    if options:
-        return options[0]["value"]
-    all_options = _forecast_station_options(parsed, None)
-    return all_options[0]["value"] if all_options else None
-
-
-def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_index, region_value=None):
+def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_index):
     figure = go.Figure()
     if not parsed:
-        figure.update_layout(template="plotly_white", height=380, margin=dict(l=20, r=20, t=40, b=20))
+        figure.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=40, b=20))
         return figure
 
-    station_name = station_name or _default_forecast_station(parsed, region_value)
+    station_name = station_name or _best_station_for_hour(parsed, hour_index)
     if not station_name:
-        figure.update_layout(template="plotly_white", height=380, margin=dict(l=20, r=20, t=40, b=20))
+        figure.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=40, b=20))
         return figure
 
     stations = parsed.get("data", {}).get("stations", {})
@@ -4411,7 +3292,7 @@ def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_ind
             station_name = key
             break
     if not payload:
-        figure.update_layout(template="plotly_white", height=380, margin=dict(l=20, r=20, t=40, b=20))
+        figure.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=40, b=20))
         return figure
 
     hist_times_raw = parsed.get("data", {}).get("time", {}).get("histTime", [])
@@ -4428,12 +3309,10 @@ def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_ind
 
     hist_times = _parse_list(hist_times_raw[: len(hist_values)])
     forecast_times = _parse_list(forecast_times_raw[: len(forecast_values)])
-    first_forecast_time = forecast_times[0] if forecast_times else None
-    joined_forecast_times = list(forecast_times)
-    joined_forecast_values = list(forecast_values[: len(forecast_times)])
-    if hist_times and hist_values and first_forecast_time:
-        joined_forecast_times = [hist_times[-1]] + joined_forecast_times
-        joined_forecast_values = [hist_values[min(len(hist_times), len(hist_values)) - 1]] + joined_forecast_values
+    all_times = hist_times + forecast_times
+
+    observed_colour = "#b45309"
+    forecast_colour = "#2563eb"
 
     # Observed monitoring (hist portion in the CSV)
     if hist_times and hist_values:
@@ -4442,26 +3321,32 @@ def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_ind
                 x=hist_times,
                 y=hist_values[: len(hist_times)],
                 mode="lines+markers",
-                line=dict(color="#0f172a", width=3.3, shape="spline", smoothing=0.55),
-                marker=dict(size=7, color="#0f172a", line=dict(color="#ffffff", width=1.4)),
+                line=dict(color=observed_colour, width=0.95),
+                marker=dict(size=2.8, color=observed_colour, line=dict(width=0.5, color="#ffffff")),
                 name="Observed (monitoring)",
-                hovertemplate="<b>Observed</b><br>%{x|%d %b %Y, %I:%M %p}<br>%{y:.2f}<extra></extra>",
+                hovertemplate="<b>Observed</b><br>%{x|%d %b %H:%M}<br>%{y:.2f}<extra></extra>",
             )
         )
 
     # Forecast mean
-    if joined_forecast_times and joined_forecast_values:
+    if forecast_times and forecast_values:
+        if hist_times:
+            figure.add_vrect(
+                x0=forecast_times[0],
+                x1=forecast_times[-1],
+                fillcolor="rgba(37, 99, 235, 0.065)",
+                line_width=0,
+                layer="below",
+            )
         figure.add_trace(
             go.Scatter(
-                x=joined_forecast_times,
-                y=joined_forecast_values[: len(joined_forecast_times)],
+                x=forecast_times,
+                y=forecast_values[: len(forecast_times)],
                 mode="lines+markers",
-                line=dict(color="#2563eb", width=4, shape="spline", smoothing=0.62),
-                marker=dict(size=8, color="#2563eb", line=dict(color="#ffffff", width=1.6)),
-                fill="tozeroy",
-                fillcolor="rgba(37, 99, 235, 0.10)",
-                name="Forecast",
-                hovertemplate="<b>Forecast</b><br>%{x|%d %b %Y, %I:%M %p}<br>%{y:.2f}<extra></extra>",
+                line=dict(color=forecast_colour, width=1.05),
+                marker=dict(size=3.0, color=forecast_colour, line=dict(width=0.5, color="#ffffff")),
+                name="Forecast (mean)",
+                hovertemplate="<b>Forecast</b><br>%{x|%d %b %H:%M}<br>%{y:.2f}<extra></extra>",
             )
         )
 
@@ -4490,555 +3375,69 @@ def _forecast_time_series_figure(parsed, pollutant_label, station_name, hour_ind
         figure.add_trace(
             go.Scatter(
                 x=forecast_times,
-                y=upper,
+                y=lower,
                 mode="lines",
-                line=dict(color="rgba(96, 165, 250, 0.0)", width=0),
+                line=dict(color="rgba(37, 99, 235, 0)", width=0),
                 hoverinfo="skip",
                 showlegend=False,
-                name="Upper bound",
+                name="Lower bound",
             )
         )
         figure.add_trace(
             go.Scatter(
                 x=forecast_times,
-                y=lower,
+                y=upper,
                 mode="lines",
-                line=dict(color="rgba(96, 165, 250, 0.55)", width=2, dash="dot"),
+                line=dict(color="rgba(37, 99, 235, 0)", width=0),
                 fill="tonexty",
-                fillcolor="rgba(96, 165, 250, 0.18)",
-                name="Forecast range",
-                hovertemplate="<b>Lower range</b><br>%{x|%d %b %Y, %I:%M %p}<br>%{y:.2f}<extra></extra>",
+                fillcolor="rgba(37, 99, 235, 0.16)",
+                hoverinfo="skip",
+                name="10th-90th range",
             )
         )
 
-    # Forecast start marker (use raw string so Plotly shape helpers don't choke on datetimes)
-    forecast_start_raw = forecast_times_raw[0] if forecast_times_raw else None
-    if forecast_start_raw is not None:
-        figure.add_shape(
-            type="line",
-            x0=forecast_start_raw,
-            x1=forecast_start_raw,
-            xref="x",
-            y0=0,
-            y1=1,
-            yref="paper",
-            line=dict(color="#94a3b8", width=2, dash="dash"),
-        )
-        figure.add_annotation(
-            x=forecast_start_raw,
-            xref="x",
-            y=1,
-            yref="paper",
-            text="Forecast start",
-            showarrow=False,
-            xanchor="left",
-            yanchor="bottom",
-            font=dict(color="#64748b", size=11, family=BASE_FONT_FAMILY),
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor="rgba(148, 163, 184, 0.65)",
-            borderwidth=1,
-            borderpad=3,
-        )
+    selected_time = _selected_time_label(parsed, hour_index)
+    marker_time = _parse_forecast_timestamp(selected_time) if selected_time else None
+    if marker_time is not None:
+        figure.add_vline(x=marker_time, line=dict(color="#64748b", width=1.5, dash="dot"))
 
     pollutant = POLLUTANTS.get(pollutant_label, {})
-    units = pollutant.get("Units") or "Value"
     station_title = title_case_station_name(station_name)
-    region_title = str(region_value or _forecast_station_region(station_name) or "").replace("_", " ")
-    title_text = f"{station_title} observed + forecast"
-
+    time_axis = _forecast_time_tick_axis(all_times)
     figure.update_layout(
         template="plotly_white",
-        height=390,
-        margin=dict(l=62, r=24, t=64, b=56),
-        title=dict(
-            text=f"{title_text}<br><sup>{region_title} • {pollutant_display(pollutant_label)}</sup>",
-            x=0.01,
-            xanchor="left",
-            font=dict(family=BASE_FONT_FAMILY, size=17, color="#0f172a"),
-        ),
+        height=270,
+        margin=dict(l=62, r=22, t=32, b=42),
+        title=dict(text=f"{station_title} forecast", x=0, xanchor="left", font=dict(size=15, color="#0f172a")),
         font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#ffffff",
         hovermode="x unified",
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.03,
+            yanchor="top",
+            y=1.14,
             xanchor="right",
             x=1,
-            font=dict(size=11),
-            bgcolor="rgba(255,255,255,0.72)",
+            font=dict(size=8, color="#334155"),
+            itemsizing="trace",
+            itemwidth=30,
         ),
         xaxis=dict(
-            title=dict(text="Time (AEST)", font=dict(family=BASE_FONT_FAMILY, color="#0f172a")),
-            gridcolor="#e6eef8",
-            zeroline=False,
-            tickformat="%H:%M<br>%b %d",
+            title=dict(text="Time (AEST)", font=dict(size=12, color="#334155")),
+            showgrid=False,
+            ticks="outside",
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=11),
+            **time_axis,
         ),
         yaxis=dict(
-            title=dict(text=units, font=dict(family=BASE_FONT_FAMILY, color="#0f172a")),
-            gridcolor="#e6eef8",
-            zerolinecolor="#dbeafe",
-            rangemode="tozero",
+            title=dict(text=pollutant.get("Units", "Value"), font=dict(family=BASE_FONT_FAMILY, color="#0f172a", size=12)),
+            gridcolor="#e2e8f0",
+            zeroline=False,
+            tickfont=dict(family=BASE_FONT_FAMILY, color="#334155", size=12),
         ),
     )
     return figure
-
-
-def _safe_metric_value(value, digits=2):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return "--"
-    if not math.isfinite(number):
-        return "--"
-    return f"{number:.{digits}f}"
-
-
-def _validation_station_stats(parsed, station_name):
-    stats = (parsed or {}).get("stats") or {}
-    if station_name in stats:
-        return stats.get(station_name) or {}
-    target = normalize_station_name(station_name)
-    for key, value in stats.items():
-        if normalize_station_name(key) == target:
-            return value or {}
-    return {}
-
-
-def _validation_time_key(value):
-    ts = value if isinstance(value, datetime) else _parse_forecast_timestamp(value)
-    if ts is None:
-        return None
-    if ts.tzinfo is not None:
-        ts = ts.astimezone(SYDNEY_TZ).replace(tzinfo=None)
-    return ts.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:00")
-
-
-def _validation_forecast_window(parsed):
-    times_raw = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
-    parsed_times = []
-    for item in times_raw or []:
-        ts = _parse_forecast_timestamp(item)
-        if ts is not None:
-            if ts.tzinfo is not None:
-                ts = ts.astimezone(SYDNEY_TZ).replace(tzinfo=None)
-            parsed_times.append(ts.replace(minute=0, second=0, microsecond=0))
-    if not parsed_times:
-        return None, None
-    start_dt = min(parsed_times)
-    latest_observed_dt = datetime.now(SYDNEY_TZ).replace(minute=0, second=0, microsecond=0, tzinfo=None)
-    end_dt = min(max(parsed_times), latest_observed_dt)
-    if start_dt > end_dt:
-        return None, None
-    return start_dt.strftime("%Y-%m-%dT%H:00:00"), end_dt.strftime("%Y-%m-%dT%H:00:00")
-
-
-@lru_cache(maxsize=96)
-def _fetch_validation_observed_history(site_ids_tuple, parameter_code, start_iso, end_iso):
-    site_ids = []
-    for site_id in site_ids_tuple or ():
-        try:
-            site_ids.append(int(site_id))
-        except (TypeError, ValueError):
-            continue
-    if not site_ids or not parameter_code or not start_iso or not end_iso:
-        return []
-    try:
-        return fetch_observation_history(site_ids, [parameter_code], start_iso, end_iso, timeout=18)
-    except Exception:
-        return []
-
-
-def _validation_observed_by_station(parsed, pollutant_label, region_value=None):
-    station_options = _forecast_station_options(parsed, region_value)
-    if not station_options:
-        return {}
-
-    station_by_site = {}
-    for option in station_options:
-        station_name = option["value"]
-        site = _site_lookup().get(normalize_station_name(station_name)) or {}
-        site_id = site.get("Site_Id")
-        if site_id is None:
-            continue
-        try:
-            station_by_site[int(site_id)] = station_name
-        except (TypeError, ValueError):
-            continue
-    if not station_by_site:
-        return {}
-
-    start_iso, end_iso = _validation_forecast_window(parsed)
-    if not start_iso or not end_iso:
-        return {station_name: {} for station_name in station_by_site.values()}
-    parameter_code = (POLLUTANTS.get(pollutant_label) or {}).get("ParameterCode") or pollutant_label
-    rows = _fetch_validation_observed_history(tuple(sorted(station_by_site)), parameter_code, start_iso, end_iso)
-    observed = {station_name: {} for station_name in station_by_site.values()}
-    for item in rows or []:
-        if not isinstance(item, dict):
-            continue
-        param = _aqms_parameter(item)
-        if str(param.get("ParameterCode") or "").strip() != str(parameter_code):
-            continue
-        if (param.get("Frequency") or "").strip() != "Hourly average":
-            continue
-        try:
-            site_id = int(item.get("Site_Id"))
-        except (TypeError, ValueError):
-            continue
-        station_name = station_by_site.get(site_id)
-        if not station_name:
-            continue
-        key = _validation_time_key(_parse_aqms_time_point(item))
-        if not key:
-            continue
-        try:
-            value = float(item.get("Value")) if item.get("Value") is not None else None
-        except (TypeError, ValueError):
-            value = None
-        if value is None:
-            continue
-        observed.setdefault(station_name, {})[key] = value
-    return observed
-
-
-def _validation_station_matched_pairs(parsed, station_name, observed_map=None):
-    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
-    payload = stations.get(station_name) or {}
-    forecast_times_raw = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
-    forecast_values = payload.get("forecastValue", []) if isinstance(payload, dict) else []
-    pairs = []
-
-    for idx, raw_time in enumerate(forecast_times_raw[: len(forecast_values)]):
-        key = _validation_time_key(raw_time)
-        if not key:
-            continue
-        try:
-            forecast_value = float(forecast_values[idx])
-            observed_value = float((observed_map or {}).get(key))
-        except (TypeError, ValueError):
-            continue
-        if not (math.isfinite(forecast_value) and math.isfinite(observed_value)):
-            continue
-        pairs.append((_parse_forecast_timestamp(raw_time) or raw_time, observed_value, forecast_value))
-
-    return pairs
-
-
-def _validation_figure(parsed, pollutant_label, hour_index, region_value=None):
-    figure = go.Figure()
-    if not parsed:
-        figure.update_layout(template="plotly_white", height=430, margin=dict(l=24, r=24, t=44, b=42))
-        return figure
-
-    station_options = _forecast_station_options(parsed, region_value)
-    station_names = [option["value"] for option in station_options]
-    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
-    hist_times_raw = ((parsed or {}).get("data") or {}).get("time", {}).get("histTime", [])
-    forecast_times_raw = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
-
-    def _parse_list(items):
-        parsed_items = []
-        for item in items or []:
-            parsed_ts = _parse_forecast_timestamp(item)
-            parsed_items.append(parsed_ts or item)
-        return parsed_items
-
-    hist_times = _parse_list(hist_times_raw)
-    forecast_times = _parse_list(forecast_times_raw)
-    hour_index = _coerce_forecast_hour_index(parsed, hour_index)
-    selected_time = forecast_times[hour_index] if hour_index < len(forecast_times) else None
-
-    palette = ["#2563eb", "#ef4444", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#ec4899", "#84cc16"]
-    for idx, station_name in enumerate(station_names):
-        payload = stations.get(station_name) or {}
-        colour = palette[idx % len(palette)]
-        hist_values = payload.get("histValue", []) if isinstance(payload, dict) else []
-        forecast_values = payload.get("forecastValue", []) if isinstance(payload, dict) else []
-        station_label = title_case_station_name(station_name)
-        hist_x = hist_times[: len(hist_values)]
-        forecast_x = forecast_times[: len(forecast_values)]
-        forecast_y = list(forecast_values[: len(forecast_x)])
-        if hist_x and hist_values and forecast_x:
-            forecast_x = [hist_x[-1]] + list(forecast_x)
-            forecast_y = [hist_values[min(len(hist_x), len(hist_values)) - 1]] + forecast_y
-
-        if hist_x and hist_values:
-            figure.add_trace(
-                go.Scatter(
-                    x=hist_x,
-                    y=hist_values[: len(hist_x)],
-                    mode="lines+markers",
-                    line=dict(color=colour, width=2.4, shape="spline", smoothing=0.55),
-                    marker=dict(size=6, color=colour, line=dict(color="#ffffff", width=1.2)),
-                    name=f"{station_label} observed",
-                    legendgroup=station_label,
-                    hovertemplate=f"<b>{station_label}</b><br>Observed<br>%{{x|%d %b %Y, %I:%M %p}}<br>%{{y:.2f}}<extra></extra>",
-                )
-            )
-        if forecast_x and forecast_y:
-            figure.add_trace(
-                go.Scatter(
-                    x=forecast_x,
-                    y=forecast_y,
-                    mode="lines+markers",
-                    line=dict(color=colour, width=3.1, dash="dash", shape="spline", smoothing=0.6),
-                    marker=dict(size=7, color=colour, symbol="diamond", line=dict(color="#ffffff", width=1.2)),
-                    name=f"{station_label} forecast",
-                    legendgroup=station_label,
-                    hovertemplate=f"<b>{station_label}</b><br>Forecast<br>%{{x|%d %b %Y, %I:%M %p}}<br>%{{y:.2f}}<extra></extra>",
-                )
-            )
-
-    if forecast_times_raw:
-        figure.add_shape(
-            type="line",
-            x0=forecast_times_raw[0],
-            x1=forecast_times_raw[0],
-            xref="x",
-            y0=0,
-            y1=1,
-            yref="paper",
-            line=dict(color="#64748b", width=2, dash="dot"),
-        )
-
-    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
-    title_region = str(region_value or (parsed or {}).get("_region") or "Selected region").replace("_", " ")
-    figure.update_layout(
-        template="plotly_white",
-        height=460,
-        margin=dict(l=62, r=26, t=72, b=54),
-        title=dict(
-            text=f"Validation time series<br><sup>{title_region} • {pollutant_display(pollutant_label)} • observed and forecast where available</sup>",
-            x=0.01,
-            xanchor="left",
-            font=dict(family=BASE_FONT_FAMILY, size=18, color="#0f172a"),
-        ),
-        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#ffffff",
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.03,
-            xanchor="right",
-            x=1,
-            font=dict(size=10),
-            bgcolor="rgba(255,255,255,0.78)",
-        ),
-        xaxis=dict(title="Time (AEST)", gridcolor="#e6eef8", zeroline=False, tickformat="%H:%M<br>%b %d"),
-        yaxis=dict(title=units, gridcolor="#e6eef8", zerolinecolor="#dbeafe", rangemode="tozero"),
-    )
-    return figure
-
-
-def _validation_station_comparison_stats(parsed, station_name, observed_map=None):
-    pairs = [(observed_value, forecast_value) for _, observed_value, forecast_value in _validation_station_matched_pairs(parsed, station_name, observed_map)]
-
-    if not pairs:
-        return _validation_station_stats(parsed, station_name), 0
-
-    errors = [forecast_value - observed_value for observed_value, forecast_value in pairs]
-    rmse = math.sqrt(sum(error * error for error in errors) / len(errors))
-    mae = sum(abs(error) for error in errors) / len(errors)
-    pearson = None
-    if len(pairs) >= 2:
-        observed_values = [observed_value for observed_value, _ in pairs]
-        forecast_values = [forecast_value for _, forecast_value in pairs]
-        observed_mean = sum(observed_values) / len(observed_values)
-        forecast_mean = sum(forecast_values) / len(forecast_values)
-        numerator = sum((observed_value - observed_mean) * (forecast_value - forecast_mean) for observed_value, forecast_value in pairs)
-        observed_ss = sum((observed_value - observed_mean) ** 2 for observed_value in observed_values)
-        forecast_ss = sum((forecast_value - forecast_mean) ** 2 for forecast_value in forecast_values)
-        denominator = math.sqrt(observed_ss * forecast_ss)
-        if denominator:
-            pearson = numerator / denominator
-
-    return {"PEARSON_R": pearson, "RMSE": rmse, "MAE": mae}, len(pairs)
-
-
-def _validation_station_figure(parsed, pollutant_label, region_value, station_name, colour, observed_by_station=None):
-    figure = go.Figure()
-    observed_map = (observed_by_station or {}).get(station_name) or {}
-    matched_pairs = _validation_station_matched_pairs(parsed, station_name, observed_map)
-    matched_x = [item[0] for item in matched_pairs]
-    observed_y = [item[1] for item in matched_pairs]
-    forecast_y = [item[2] for item in matched_pairs]
-
-    station_label = title_case_station_name(station_name)
-    if matched_pairs:
-        figure.add_trace(
-            go.Scatter(
-                x=matched_x,
-                y=observed_y,
-                mode="lines+markers",
-                line=dict(color="#0f172a", width=2.4, shape="spline", smoothing=0.55),
-                marker=dict(size=6, color="#0f172a", line=dict(color="#ffffff", width=1.1)),
-                name="Observed",
-                hovertemplate="<b>Observed</b><br>%{x|%d %b %Y, %I:%M %p}<br>%{y:.2f}<extra></extra>",
-            )
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=matched_x,
-                y=forecast_y,
-                mode="lines+markers",
-                line=dict(color=colour, width=3.2, shape="spline", smoothing=0.6),
-                marker=dict(size=7, color=colour, symbol="diamond", line=dict(color="#ffffff", width=1.2)),
-                fill="tozeroy",
-                fillcolor=_hex_to_rgba(colour, 0.10),
-                name="Forecast",
-                hovertemplate="<b>Forecast</b><br>%{x|%d %b %Y, %I:%M %p}<br>%{y:.2f}<extra></extra>",
-            )
-        )
-    else:
-        figure.add_annotation(
-            text="No observed values are available for this forecast window yet",
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font=dict(size=12, color="#64748b", family=BASE_FONT_FAMILY),
-            bgcolor="rgba(248,250,252,0.86)",
-            bordercolor="#dbeafe",
-            borderwidth=1,
-            borderpad=5,
-        )
-
-    stats, matched_count = _validation_station_comparison_stats(parsed, station_name, observed_map)
-    if matched_count:
-        matched_label = f" · {matched_count} matched hours"
-    else:
-        matched_label = " · observed unavailable"
-    subtitle = f"R {_safe_metric_value(stats.get('PEARSON_R'), 2)} · RMSE {_safe_metric_value(stats.get('RMSE'), 2)}{matched_label}"
-    units = (POLLUTANTS.get(pollutant_label) or {}).get("Units") or "Value"
-    figure.update_layout(
-        template="plotly_white",
-        height=310,
-        margin=dict(l=48, r=16, t=54, b=38),
-        title=dict(
-            text=f"{station_label}<br><sup>{subtitle}</sup>",
-            x=0.01,
-            xanchor="left",
-            font=dict(family=BASE_FONT_FAMILY, size=15, color="#0f172a"),
-        ),
-        font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#ffffff",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-        xaxis=dict(gridcolor="#e6eef8", zeroline=False, tickformat="%H:%M<br>%b %d"),
-        yaxis=dict(title=units, gridcolor="#e6eef8", zerolinecolor="#dbeafe", rangemode="tozero"),
-    )
-    return figure
-
-
-def _validation_station_plot_grid(parsed, pollutant_label, region_value=None):
-    if not parsed:
-        return html.Div("No validation time-series data is available for this selection.", className="validation-empty")
-
-    station_options = _forecast_station_options(parsed, region_value)
-    observed_by_station = _validation_observed_by_station(parsed, pollutant_label, region_value)
-    station_names = [
-        option["value"]
-        for option in station_options
-        if _validation_station_matched_pairs(parsed, option["value"], (observed_by_station or {}).get(option["value"]) or {})
-    ]
-    if not station_names:
-        return html.Div(
-            "No observed forecast-hour matches are available for this validation selection yet.",
-            className="validation-empty",
-        )
-
-    palette = ["#2563eb", "#ef4444", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#ec4899", "#84cc16"]
-    count = len(station_names)
-    if count == 1:
-        size_class = "validation-station-grid--1"
-    elif count == 2:
-        size_class = "validation-station-grid--2"
-    elif count == 3:
-        size_class = "validation-station-grid--3"
-    else:
-        size_class = "validation-station-grid--many"
-
-    cards = []
-    for idx, station_name in enumerate(station_names):
-        cards.append(
-            html.Div(
-                dcc.Graph(
-                    figure=_validation_station_figure(
-                        parsed,
-                        pollutant_label,
-                        region_value,
-                        station_name,
-                        palette[idx % len(palette)],
-                        observed_by_station,
-                    ),
-                    config={"displayModeBar": False},
-                ),
-                className="validation-station-plot-card",
-            )
-        )
-
-    return html.Div(cards, className=f"validation-station-grid {size_class}")
-
-
-def _validation_metric_cards(parsed, pollutant_label, hour_index, region_value=None):
-    if not parsed:
-        return html.Div("No validation data is available for this selection.", className="validation-empty")
-
-    station_options = _forecast_station_options(parsed, region_value)
-    observed_by_station = _validation_observed_by_station(parsed, pollutant_label, region_value)
-    matched_station_options = [
-        option
-        for option in station_options
-        if _validation_station_matched_pairs(parsed, option["value"], (observed_by_station or {}).get(option["value"]) or {})
-    ]
-    station_count = len(matched_station_options)
-    if station_count == 1:
-        size_class = "validation-metric-grid--1"
-    elif station_count == 2:
-        size_class = "validation-metric-grid--2"
-    elif station_count == 3:
-        size_class = "validation-metric-grid--3"
-    else:
-        size_class = "validation-metric-grid--many"
-    cards = []
-    for option in matched_station_options:
-        station_name = option["value"]
-        stats, matched_count = _validation_station_comparison_stats(parsed, station_name, (observed_by_station or {}).get(station_name) or {})
-        pearson = _safe_metric_value(stats.get("PEARSON_R"), 2)
-        rmse = _safe_metric_value(stats.get("RMSE"), 2)
-        mae = _safe_metric_value(stats.get("MAE"), 2)
-        footnote = f"{matched_count} observed forecast-hour matches"
-        cards.append(
-            html.Div(
-                [
-                    html.Div(title_case_station_name(station_name), className="validation-metric-card__station"),
-                    html.Div(
-                        [
-                            html.Div([html.Span("R"), html.Strong(pearson)], className="validation-metric-card__metric"),
-                            html.Div([html.Span("RMSE"), html.Strong(rmse)], className="validation-metric-card__metric"),
-                            html.Div([html.Span("MAE"), html.Strong(mae)], className="validation-metric-card__metric"),
-                        ],
-                        className="validation-metric-card__grid",
-                    ),
-                    html.Div(footnote, className="validation-metric-card__footnote"),
-                ],
-                className="validation-metric-card",
-            )
-        )
-
-    if not cards:
-        return html.Div(
-            "No observed forecast-hour matches are available for this validation selection yet.",
-            className="validation-empty",
-        )
-    return html.Div(cards, className=f"validation-metric-grid {size_class}")
-
 
 def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
     """Return full station list across selected regions for PM2.5/PM10/O3 for specific hour offsets.
@@ -5070,7 +3469,6 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
     rows = []
     station_index = {}
     time_labels = []
-    base_index = 0
 
     def _ensure_row(station_name, region_name):
         station_norm = normalize_station_name(station_name)
@@ -5146,7 +3544,6 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
                 times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
                 if times:
                     time_labels = list(times)
-                    base_index = _forecast_live_base_index(time_labels)
 
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
@@ -5155,7 +3552,7 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
                     continue
                 series = (payload or {}).get("forecastValue") or []
                 for off in offsets:
-                    hour_idx = base_index + off - 1
+                    hour_idx = off - 1
                     value_num = None
                     if 0 <= hour_idx < len(series):
                         value_num = _coerce_float(series[hour_idx])
@@ -5174,9 +3571,11 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
         label = f"+{off}h"
         # try to compute exact time if available
         if time_labels:
-            time_index = base_index + off - 1
-            if 0 <= time_index < len(time_labels):
-                label = _forecast_hour_label(time_labels[time_index])
+            if len(time_labels) >= off:
+                dt = _parse_forecast_timestamp(time_labels[off - 1])
+                if dt:
+                    pretty = dt.strftime("%H:%M")
+                    label = f"{pretty}"
         pretty_labels.append(label)
 
     columns = [
@@ -5202,6 +3601,200 @@ def _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12)):
 
     rows.sort(key=lambda item: (-_row_score(item), str(item.get("station") or "")))
     return columns, rows
+
+
+def _forecast_all_hour_table(parsed, pollutant_label, selection=None):
+    """Region-grouped multi-pollutant HTML table for the All Stations modal.
+
+    Mirrors the NSW Government AQ page layout:
+      - Region header row (name + worst-AQ-category badge)
+      - Station data rows beneath each region
+      - Columns: Station | [time-slot × pollutant …]
+    """
+    from collections import defaultdict
+
+    selection = dict(selection or DEFAULT_SELECTION)
+    pollutants_list = ["PM2.5", "PM10", "O3"]
+    p_units   = {"PM2.5": "µg/m³",  "PM10": "µg/m³",  "O3": "pphm"}
+    p_label   = {"PM2.5": "Particles (PM2.5)", "PM10": "Particles (PM10)", "O3": "Ozone"}
+
+    # ---- load all-region merged data for every pollutant ----
+    parsed_by_p = {}
+    all_times   = []
+    for p in pollutants_list:
+        sel    = dict(selection, pollutants=p)
+        merged = _merged_forecast_map_payload(sel, p)
+        parsed_by_p[p] = merged
+        p_times = ((merged.get("data") or {}).get("time") or {}).get("forecastTime") or []
+        if len(p_times) > len(all_times):
+            all_times = p_times
+
+    if not all_times and parsed:
+        all_times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
+        if pollutant_label:
+            parsed_by_p[pollutant_label] = parsed
+
+    if not all_times:
+        return (
+            html.Div("No forecast data available.", className="all-fc-no-data"),
+            "All Stations Nowcasting",
+            "No forecast data available.",
+        )
+
+    # ---- choose up to MAX_SLOTS evenly-spaced time points ----
+    MAX_SLOTS = 4
+    n = len(all_times)
+    if n <= MAX_SLOTS:
+        slot_indices = list(range(n))
+    else:
+        slot_indices = [round(i * (n - 1) / (MAX_SLOTS - 1)) for i in range(MAX_SLOTS)]
+        seen = set()
+        slot_indices = [x for x in slot_indices if not (x in seen or seen.add(x))]
+
+    time_labels = []
+    for tidx in slot_indices:
+        parsed_ts = _parse_forecast_timestamp(all_times[tidx])
+        if parsed_ts:
+            hr = parsed_ts.strftime("%I").lstrip("0") or "0"
+            time_labels.append(f"{hr}{parsed_ts.strftime('%p').upper()}")
+        else:
+            time_labels.append(f"+{tidx + 1}h")
+
+    # ---- AQ colour maps ----
+    cat_bg = {
+        "good":           "#16a34a",
+        "fair":           "#eab308",
+        "poor":           "#f97316",
+        "very-poor":      "#dc2626",
+        "extremely-poor": "#7e0023",
+        "no-data":        "#e5e7eb",
+    }
+    cat_fg = {
+        "good":           "#ffffff",
+        "fair":           "#111827",
+        "poor":           "#111827",
+        "very-poor":      "#ffffff",
+        "extremely-poor": "#ffffff",
+        "no-data":        "#9ca3af",
+    }
+    cat_order = list(cat_bg.keys())          # used to rank severity
+
+    # ---- collect all stations ----
+    station_info = {}
+    for p in pollutants_list:
+        merged = parsed_by_p.get(p) or {}
+        for sname, payload in ((merged.get("data") or {}).get("stations") or {}).items():
+            snorm = normalize_station_name(sname)
+            if snorm not in station_info:
+                site   = _site_lookup().get(snorm) or {}
+                region = str(
+                    site.get("Region") or (payload or {}).get("region") or "Unknown"
+                ).replace("_", " ")
+                station_info[snorm] = {
+                    "station": title_case_station_name(sname),
+                    "region":  region,
+                    "data":    {},
+                }
+            station_info[snorm]["data"][p] = (payload or {}).get("forecastValue") or []
+
+    # group by region
+    regions_dict = defaultdict(list)
+    for snorm, info in sorted(station_info.items(), key=lambda x: x[1]["station"]):
+        regions_dict[info["region"]].append(info)
+
+    # ---- helpers ----
+    def _val_cat(info, p, tidx):
+        vals = info["data"].get(p) or []
+        try:
+            v = float(vals[tidx]) if tidx < len(vals) else None
+        except (TypeError, ValueError):
+            v = None
+        if v is None:
+            return None, "no-data"
+        ck, _ = category_for_value(p, v)
+        return v, str(ck or "no-data")
+
+    def _region_cat(stations):
+        worst = 0
+        for info in stations:
+            for p in pollutants_list:
+                _, ck = _val_cat(info, p, slot_indices[0] if slot_indices else 0)
+                idx = cat_order.index(ck) if ck in cat_order else 0
+                if ck != "no-data" and idx > worst:
+                    worst = idx
+        return cat_order[worst]
+
+    # ---- build <thead> ----
+    # row-1: empty station-col (rowspan 2) + time labels (colspan = n_pollutants)
+    tr1_cells = [html.Th("", rowSpan=2, className="all-fc-th all-fc-station-col")]
+    for tl in time_labels:
+        tr1_cells.append(
+            html.Th(tl, colSpan=len(pollutants_list), className="all-fc-th all-fc-time-header")
+        )
+    # row-2: pollutant sub-headers repeated for each slot
+    tr2_cells = []
+    for _ in time_labels:
+        for p in pollutants_list:
+            tr2_cells.append(html.Th(
+                [
+                    html.Span(p_label[p],          className="all-fc-p-name"),
+                    html.Span(p_units[p],           className="all-fc-p-unit"),
+                    html.Span("Hourly average",     className="all-fc-p-avg"),
+                ],
+                className="all-fc-th all-fc-pollutant-header",
+            ))
+
+    thead = html.Thead([html.Tr(tr1_cells), html.Tr(tr2_cells)])
+
+    # ---- build <tbody> ----
+    total_cols = 1 + len(time_labels) * len(pollutants_list)
+    tbody_rows = []
+
+    for region_name in sorted(regions_dict.keys()):
+        stations = regions_dict[region_name]
+        reg_cat  = _region_cat(stations)
+        reg_bg   = cat_bg.get(reg_cat, "#e5e7eb")
+        reg_fg   = cat_fg.get(reg_cat, "#9ca3af")
+
+        # region header row — name only, no badge
+        tbody_rows.append(html.Tr(
+            html.Td(
+                html.Span(region_name, className="all-fc-region-name"),
+                colSpan=total_cols,
+                className="all-fc-region-header-cell",
+            ),
+            className="all-fc-region-row",
+        ))
+
+        # station rows — coloured dot, plain cell background
+        for info in stations:
+            cells = [html.Td(info["station"], className="all-fc-station-name")]
+            for tidx in slot_indices:
+                for p in pollutants_list:
+                    v, ck = _val_cat(info, p, tidx)
+                    dot_colour = cat_bg.get(ck, "#e5e7eb")
+                    val_str    = f"{v:.1f}" if v is not None else "--"
+                    cells.append(html.Td(
+                        [
+                            html.Span("●", className="all-fc-dot",
+                                      style={"color": dot_colour}),
+                            val_str,
+                        ],
+                        className="all-fc-data-cell",
+                    ))
+            tbody_rows.append(html.Tr(cells, className="all-fc-station-row"))
+
+    tbody = html.Tbody(tbody_rows)
+
+    container = html.Div(
+        html.Table([thead, tbody], className="all-fc-table"),
+        className="all-fc-scroll-container",
+    )
+
+    n_stations = sum(len(v) for v in regions_dict.values())
+    title    = "All Stations Nowcasting"
+    subtitle = f"{n_stations} stations · PM2.5, PM10, O3"
+    return container, title, subtitle
 
 
 def _leaflet_category_colour(category):
@@ -5301,6 +3894,7 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 
     marker_json = json.dumps(markers)
     times_json = json.dumps(forecast_times)
+    initial_hour_index_json = json.dumps(max(0, int(hour_index or 0)))
     if not markers:
         body_message = "No forecast stations could be mapped for this selection."
     else:
@@ -5319,51 +3913,37 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
     <style>
         html, body, #map {{ height: 100%; width: 100%; margin: 0; padding: 0; }}
         body {{ font-family: {BASE_FONT_FAMILY}; }}
-        .station-marker {{
-            width: 34px;
-            height: 34px;
-            border: none;
-            border-radius: 50%;
-            box-sizing: border-box;
-            display: flex;
+	        .station-marker {{
+	            width: 22px;
+	            height: 22px;
+			            border: 2px solid #cbd5e1;
+	            border-radius: 50%;
+	            box-sizing: border-box;
+	            display: flex;
             align-items: center;
             justify-content: center;
-            color: #ffffff;
-            font-weight: 800;
-            font-size: 12px;
-            line-height: 1;
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
-            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.22);
-        }}
-        .purpleair-marker {{
-            width: 22px;
-            height: 22px;
-            border: none;
-            border-radius: 50%;
-            box-sizing: border-box;
-            background: {PURPLEAIR_COLOR};
-            color: #fff;
+	            color: #ffffff;
+	            font-weight: 800;
+	            font-size: 7px;
+	            line-height: 1;
+	            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+	            box-shadow: 0 2px 5px rgba(15, 23, 42, 0.18);
+	        }}
+	        .purpleair-marker {{
+	            width: 22px;
+	            height: 22px;
+		            border: 2px solid #cbd5e1;
+	            border-radius: 4px;
+	            box-sizing: border-box;
+	            color: #fff;
             display: flex;
             align-items: center;
             justify-content: center;
             font-size: 9px;
             font-weight: 900;
             line-height: 1;
-            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.24);
-        }}
-        .purpleair-cluster {{
-            width: 38px;
-            height: 38px;
-            border-radius: 50%;
-            background: {PURPLEAIR_COLOR};
-            color: #fff;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 900;
-            font-size: 13px;
-            box-shadow: 0 5px 14px rgba(15, 23, 42, 0.28);
-        }}
+	            box-shadow: 0 2px 5px rgba(15, 23, 42, 0.18);
+	        }}
         .leaflet-tooltip.station-label {{
             font-size: 12px;
             font-weight: 700;
@@ -5391,6 +3971,7 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
     <script>
         const markers = {marker_json};
         const forecastTimes = {times_json};
+        const initialHourIndex = {initial_hour_index_json};
         const purpleAirFields = [
             "name",
             "location_type",
@@ -5414,7 +3995,6 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
         }}).setView([-33.0, 147.032179], 6);
 
         const nswBounds = [[{NSW_MAP_BOUNDS["south"]}, {NSW_MAP_BOUNDS["west"]}], [{NSW_MAP_BOUNDS["north"]}, {NSW_MAP_BOUNDS["east"]}]];
-        try {{ map.fitBounds(nswBounds, {{ padding: [18, 18] }}); }} catch (e) {{}}
 
             function addTileLayerCandidates(urls) {{
                 let idx = 0;
@@ -5486,25 +4066,14 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 
         const group = L.featureGroup().addTo(map);
         const aqmsGroup = L.featureGroup().addTo(group);
-        const sensorGroup = L.markerClusterGroup({{
-            iconCreateFunction: function(cluster) {{
-                return L.divIcon({{
-                    html: `<div class="purpleair-cluster">${{cluster.getChildCount()}}</div>`,
-                    className: "",
-                    iconSize: [38, 38],
-                    iconAnchor: [19, 19]
-                }});
-            }},
-            showCoverageOnHover: false,
-            maxClusterRadius: 60
-        }}).addTo(group);
+        const sensorGroup = L.featureGroup().addTo(group);
         const purpleAirMarkers = new Map();
         const forecastMarkers = [];
 
         function purpleAirCategory(value) {{
-            if (value == null || Number.isNaN(Number(value))) {{
-                return {{ label: "PurpleAir sensor", colour: "{PURPLEAIR_COLOR}" }};
-            }}
+	            if (value == null || Number.isNaN(Number(value))) {{
+	                return {{ label: "No data", colour: "#9ca3af" }};
+	            }}
             const pm25 = Number(value);
             if (pm25 < 25) return {{ label: "Good", colour: "#16a34a" }};
             if (pm25 < 50) return {{ label: "Fair", colour: "#facc15" }};
@@ -5513,19 +4082,16 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
             return {{ label: "Extremely poor", colour: "#7f1d1d" }};
         }}
 
-        function purpleAirSize(value) {{
-            if (value == null || Number.isNaN(Number(value))) return 22;
-            const pm25 = Math.max(Number(value), 0);
-            return Math.max(22, Math.min(44, 22 + Math.sqrt(pm25) * 2.3));
-        }}
+	        function purpleAirSize(value) {{
+	            return 22;
+	        }}
 
         function purpleAirIcon(item) {{
             const size = purpleAirSize(item.pm25);
             const category = purpleAirCategory(item.pm25);
-            const label = item.pm25 == null ? "" : formatPaValue(item.pm25);
             return L.divIcon({{
-                className: "",
-                html: `<div class="purpleair-marker" style="width:${{size}}px;height:${{size}}px;background:${{category.colour}};font-size:${{size > 30 ? 10 : 9}}px">${{label}}</div>`,
+		                className: "",
+		                html: `<div class="purpleair-marker" style="width:${{size}}px;height:${{size}}px;background:${{category.colour}};font-size:${{size > 30 ? 10 : 9}}px"></div>`,
                 iconSize: [size, size],
                 iconAnchor: [size / 2, size / 2],
                 popupAnchor: [0, -(size / 2)]
@@ -5534,11 +4100,11 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 
         function purpleAirPopupHtml(item, loadingText) {{
             return `
-                <strong>${{item.station}}</strong><br>
-                Source: <strong>PurpleAir</strong><br>
-                Sensor ID: ${{item.siteId}}<br>
-                PM2.5: <strong>${{item.pm25 == null ? "--" : formatPaValue(item.pm25)}}</strong><br>
-                Category: <strong>${{item.paCategory || "PurpleAir sensor"}}</strong><br>
+	        <strong>${{item.station}}</strong><br>
+	        Source: <strong>PurpleAir</strong><br>
+	        Sensor ID: ${{item.siteId}}<br>
+	        PM2.5: <strong>${{(item.sensorValue == null && item.pm25 == null) ? "--" : formatPaValue(item.sensorValue == null ? item.pm25 : item.sensorValue)}}</strong><br>
+	        Category: <strong>${{item.paCategory || item.category || "No data"}}</strong><br>
                 Lat/Lon: ${{item.lat.toFixed(5)}}, ${{item.lon.toFixed(5)}}<br>
                 <div id="purpleair-${{item.siteId}}" style="margin-top:8px;">${{loadingText || ""}}</div>
             `;
@@ -5568,12 +4134,12 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 
         function forecastIcon(item) {{
             return L.divIcon({{
-                className: "",
-                html: `<div class="station-marker" style="background:${{item.colour}}">${{item.valueLabel}}</div>`,
-                iconSize: [34, 34],
-                iconAnchor: [17, 17],
-                popupAnchor: [0, -18]
-            }});
+	                className: "",
+		                html: `<div class="station-marker" style="background:${{item.colour}}"></div>`,
+		                iconSize: [22, 22],
+		                iconAnchor: [11, 11],
+		                popupAnchor: [0, -12]
+	            }});
         }}
 
         function barsHtml(item) {{
@@ -5646,7 +4212,10 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 
         markers.forEach((item) => {{
             if (item.lat == null || item.lon == null) return;
-            const marker = L.marker([item.lat, item.lon], {{ icon: item.source === "PurpleAir" ? purpleAirIcon(item) : forecastIcon(item) }});
+            const marker = L.marker([item.lat, item.lon], {{
+                icon: item.source === "PurpleAir" ? purpleAirIcon(item) : forecastIcon(item),
+                zIndexOffset: item.source === "PurpleAir" ? 100 : 500
+            }});
             if (item.source === "PurpleAir") {{
                 marker.addTo(sensorGroup);
                 purpleAirMarkers.set(String(item.siteId), {{ item, marker }});
@@ -5674,6 +4243,29 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
             }}
         }});
 
+        function fitToVisibleMarkers() {{
+            try {{
+                const layers = group.getLayers ? group.getLayers() : [];
+                if (!layers || layers.length === 0) {{
+                    map.fitBounds(nswBounds, {{ padding: [18, 18] }});
+                    return;
+                }}
+                const bounds = group.getBounds();
+                if (!bounds || !bounds.isValid || !bounds.isValid()) {{
+                    map.fitBounds(nswBounds, {{ padding: [18, 18] }});
+                    return;
+                }}
+                if (layers.length === 1) {{
+                    const latLng = layers[0].getLatLng ? layers[0].getLatLng() : bounds.getCenter();
+                    map.setView(latLng, 10);
+                    return;
+                }}
+                map.fitBounds(bounds, {{ padding: [34, 34], maxZoom: 11 }});
+            }} catch (e) {{
+                try {{ map.fitBounds(nswBounds, {{ padding: [18, 18] }}); }} catch (err) {{}}
+            }}
+        }}
+
         // Ensure popups can scroll when content grows (bars section).
         try {{
             if (L && L.DomUtil) {{
@@ -5683,7 +4275,7 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
             }}
         }} catch (err) {{}}
 
-        applyForecastHourIndex(0);
+        applyForecastHourIndex(initialHourIndex);
 
         function formatPaValue(value) {{
             if (value == null || Number.isNaN(Number(value))) return "--";
@@ -5720,12 +4312,16 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
         }}
 
         function updatePurpleAirMarker(item, sensor) {{
-            const pm25 = sensor["pm2.5_alt"];
-            if (pm25 != null && !Number.isNaN(Number(pm25))) {{
-                item.pm25 = Math.max(Number(pm25), 0.2);
-            }}
-            const category = purpleAirCategory(item.pm25);
-            item.paCategory = category.label;
+	      const pm25 = sensor["pm2.5_alt"];
+	      if (pm25 != null && !Number.isNaN(Number(pm25))) {{
+	        item.pm25 = Math.max(Number(pm25), 0.2);
+	        item.sensorValue = item.pm25;
+	        item.valueLabel = formatPaValue(item.pm25);
+	      }}
+	      const category = purpleAirCategory(item.sensorValue == null ? item.pm25 : item.sensorValue);
+	      item.paCategory = category.label;
+	      item.category = category.label;
+	      item.colour = category.colour;
             const entry = purpleAirMarkers.get(String(item.siteId));
             if (entry) {{
                 entry.marker.setIcon(purpleAirIcon(item));
@@ -5760,11 +4356,9 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
                 .catch((error) => {{}});
         }}
 
-        // PurpleAir rows are injected from the server/cache. Avoid a browser-side
-        // API refresh here because public clients may not have a valid API quota.
+        fetchPurpleAirSnapshot();
 
-        // Keep view anchored on NSW rather than tightly fitting station clusters.
-        try {{ map.fitBounds(nswBounds, {{ padding: [18, 18] }}); }} catch (e) {{}}
+        fitToVisibleMarkers();
 
         const legend = L.control({{ position: "bottomright" }});
         legend.onAdd = function() {{
@@ -5775,8 +4369,7 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
                 <div class="legend-row"><span class="legend-swatch" style="background:#e47400"></span>Poor</div>
                 <div class="legend-row"><span class="legend-swatch" style="background:#ba0029"></span>Very poor</div>
                 <div class="legend-row"><span class="legend-swatch" style="background:#590019"></span>Extremely poor</div>
-                <div class="legend-row"><span class="legend-swatch" style="background:#242424"></span>No data</div>
-                <div class="legend-row"><span class="legend-swatch" style="background:{PURPLEAIR_COLOR}; border-radius:50%"></span>PurpleAir sensor / cluster</div>
+	                <div class="legend-row"><span class="legend-swatch" style="background:#242424"></span>No data</div>
             `;
             return div;
         }};
@@ -5789,25 +4382,13 @@ def _leaflet_forecast_map_html(parsed, pollutant_label, hour_index, extra_by_sta
 def _leaflet_monitoring_map_html(rows):
     rows = rows or []
     markers = []
-
-    def _leaflet_value_label(row):
-        value_label = row.get("value_label")
-        if value_label not in (None, ""):
-            return str(value_label)
-        if row.get("value") is None:
-            return "--"
-        try:
-            return f"{float(row.get('value')):.1f}"
-        except (TypeError, ValueError):
-            return str(row.get("value"))
-
     if rows:
         for row in rows:
             lat = row.get("lat")
             lon = row.get("lon")
             if lat is None or lon is None:
                 continue
-            if not _monitor_has_numeric_value(row):
+            if not _point_in_nsw(lat, lon):
                 continue
             category = row.get("category") or "No data"
             markers.append(
@@ -5823,10 +4404,8 @@ def _leaflet_monitoring_map_html(rows):
                     "hour": row.get("hour_description") or "",
                     "date": row.get("date") or "",
                     "pollutant": row.get("determining_pollutant") or "",
-                    "pm25": row.get("value") if row.get("source") == "PurpleAir" else None,
-                    "paCategory": category if row.get("source") == "PurpleAir" else None,
-                    "valueLabel": _leaflet_value_label(row),
-                    "values": row.get("values") or [],
+                    "valueLabel": "--" if row.get("value") is None else f"{float(row.get('value')):.1f}",
+                    "sensorValue": row.get("value"),
                 }
             )
 
@@ -5843,52 +4422,57 @@ def _leaflet_monitoring_map_html(rows):
   <style>
     html, body, #map {{ height: 100%; width: 100%; margin: 0; padding: 0; }}
     body {{ font-family: {BASE_FONT_FAMILY}; }}
-    .station-marker {{
-      width: 34px;
-      height: 34px;
-      border: none;
-      border-radius: 50%;
-      box-sizing: border-box;
+	    .station-marker {{
+	      width: 22px;
+		      height: 22px;
+			      border: 2px solid #cbd5e1;
+	      border-radius: 50%;
+	      box-sizing: border-box;
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #ffffff;
-      font-weight: 800;
-      font-size: 12px;
-      line-height: 1;
-      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
-      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.22);
-    }}
-    .purpleair-marker {{
-      width: 22px;
-      height: 22px;
-      border: none;
-      border-radius: 50%;
-      box-sizing: border-box;
-      background: {PURPLEAIR_COLOR};
-      color: #fff;
+	      color: #ffffff;
+	      font-weight: 800;
+	      font-size: 7px;
+	      line-height: 1;
+	      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+	      box-shadow: 0 2px 5px rgba(15, 23, 42, 0.18);
+	    }}
+		    .purpleair-marker {{
+		      width: 22px;
+		      height: 22px;
+		      border: 2px solid #cbd5e1;
+		      border-radius: 4px;
+		      box-sizing: border-box;
+		      color: #fff;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 9px;
       font-weight: 900;
       line-height: 1;
-      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.24);
-    }}
-    .purpleair-cluster {{
-      width: 38px;
-      height: 38px;
-      border-radius: 50%;
-      background: {PURPLEAIR_COLOR};
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 900;
-      font-size: 13px;
-      box-shadow: 0 5px 14px rgba(15, 23, 42, 0.28);
-    }}
-    .leaflet-tooltip.station-label {{
+		      box-shadow: 0 2px 5px rgba(15, 23, 42, 0.18);
+		    }}
+		    .dustwatch-marker {{
+		      position: relative;
+		      width: 22px;
+			      height: 22px;
+		      box-sizing: border-box;
+		      display: flex;
+		      align-items: center;
+		      justify-content: center;
+		      color: #ffffff;
+		      font-weight: 900;
+		      font-size: 7px;
+		      line-height: 1;
+		      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+		      filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.18));
+		    }}
+			    .dustwatch-marker svg {{
+			      position: absolute;
+			      inset: 0;
+			    }}
+	    .leaflet-tooltip.station-label {{
       font-size: 12px;
       font-weight: 700;
       color: #0f172a;
@@ -5904,13 +4488,12 @@ def _leaflet_monitoring_map_html(rows):
       line-height: 1.4;
       box-shadow: 0 6px 18px rgba(15, 23, 42, 0.14);
     }}
-    .legend-row {{ display: flex; align-items: center; gap: 8px; white-space: nowrap; }}
-    .legend-swatch {{ width: 13px; height: 13px; border: 2px solid rgba(0,0,0,0.4); display: inline-block; }}
-    .aqms-popup-values {{ border-collapse: collapse; margin-top: 8px; min-width: 260px; }}
-    .aqms-popup-values th, .aqms-popup-values td {{ border-bottom: 1px solid #e2e8f0; padding: 4px 6px; text-align: left; font-size: 12px; }}
-    .aqms-popup-values th {{ color: #475569; font-weight: 900; }}
-    .aqms-popup-values td:nth-child(2) {{ font-weight: 900; color: #0f172a; }}
-  </style>
+	    .legend-row {{ display: flex; align-items: center; gap: 8px; white-space: nowrap; }}
+	    .legend-swatch {{ width: 13px; height: 13px; border: 2px solid rgba(0,0,0,0.4); display: inline-block; }}
+		    .legend-source-circle {{ width: 13px; height: 13px; border-radius: 50%; border: 2px solid #cbd5e1; display: inline-block; background:#f8fafc; }}
+		    .legend-source-square {{ width: 13px; height: 13px; border-radius: 3px; border: 2px solid #cbd5e1; display: inline-block; background:#f8fafc; }}
+		    .legend-source-triangle {{ width: 16px; height: 15px; display: inline-block; background: no-repeat center / contain url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2015'%3E%3Cpolygon%20points='8,1%2015,14%201,14'%20fill='%23f8fafc'%20stroke='%23cbd5e1'%20stroke-width='2'/%3E%3C/svg%3E"); }}
+	  </style>
 </head>
 <body>
   <div id="map"></div>
@@ -6010,25 +4593,27 @@ def _leaflet_monitoring_map_html(rows):
     addStateOutlines();
 
     const group = L.featureGroup().addTo(map);
+    const sensorGroup = L.featureGroup().addTo(group);
+    const dustWatchGroup = L.featureGroup().addTo(group);
     const aqmsGroup = L.featureGroup().addTo(group);
-    const sensorGroup = L.markerClusterGroup({{
-      iconCreateFunction: function(cluster) {{
-        return L.divIcon({{
-          html: `<div class="purpleair-cluster">${{cluster.getChildCount()}}</div>`,
-          className: "",
-          iconSize: [38, 38],
-          iconAnchor: [19, 19]
-        }});
-      }},
-      showCoverageOnHover: false,
-      maxClusterRadius: 60
-    }}).addTo(group);
-    const purpleAirMarkers = new Map();
+	    const purpleAirMarkers = new Map();
 
-    function purpleAirCategory(value) {{
-      if (value == null || Number.isNaN(Number(value))) {{
-        return {{ label: "PurpleAir sensor", colour: "{PURPLEAIR_COLOR}" }};
-      }}
+	    function sourceName(item) {{
+	      return String((item && item.source) || "").toLowerCase();
+	    }}
+
+	    function isPurpleAir(item) {{
+	      return sourceName(item) === "purpleair";
+	    }}
+
+	    function isDustWatch(item) {{
+	      return sourceName(item).replace(/\s+/g, "") === "dustwatch";
+	    }}
+
+	    function purpleAirCategory(value) {{
+	      if (value == null || Number.isNaN(Number(value))) {{
+	        return {{ label: "No data", colour: "#9ca3af" }};
+	      }}
       const pm25 = Number(value);
       if (pm25 < 25) return {{ label: "Good", colour: "#16a34a" }};
       if (pm25 < 50) return {{ label: "Fair", colour: "#facc15" }};
@@ -6037,109 +4622,92 @@ def _leaflet_monitoring_map_html(rows):
       return {{ label: "Extremely poor", colour: "#7f1d1d" }};
     }}
 
-    function purpleAirSize(value) {{
-      if (value == null || Number.isNaN(Number(value))) return 22;
-      const pm25 = Math.max(Number(value), 0);
-      return Math.max(22, Math.min(44, 22 + Math.sqrt(pm25) * 2.3));
-    }}
+		    function purpleAirSize(value) {{
+		      return 22;
+		    }}
 
     function purpleAirIcon(item) {{
-      const size = purpleAirSize(item.pm25);
-      const category = purpleAirCategory(item.pm25);
-      const label = item.pm25 == null ? "" : formatPaValue(item.pm25);
+      const sensorValue = item.sensorValue == null ? item.pm25 : item.sensorValue;
+      const size = purpleAirSize(sensorValue);
+      const category = purpleAirCategory(sensorValue);
       return L.divIcon({{
         className: "",
-        html: `<div class="purpleair-marker" style="width:${{size}}px;height:${{size}}px;background:${{category.colour}};font-size:${{size > 30 ? 10 : 9}}px">${{label}}</div>`,
+	        html: `<div class="purpleair-marker" style="width:${{size}}px;height:${{size}}px;background:${{category.colour}};font-size:${{size > 30 ? 10 : 9}}px"></div>`,
         iconSize: [size, size],
         iconAnchor: [size / 2, size / 2],
         popupAnchor: [0, -(size / 2)]
-      }});
-    }}
+	      }});
+	    }}
+
+	    function aqmsIcon(item) {{
+		      return L.divIcon({{
+		        className: "",
+			        html: `<div class="station-marker" style="background:${{item.colour}}"></div>`,
+		        iconSize: [22, 22],
+		        iconAnchor: [11, 11],
+		        popupAnchor: [0, -12]
+		      }});
+		    }}
+
+	    function dustWatchIcon(item) {{
+		      return L.divIcon({{
+		        className: "",
+		        html: `<div class="dustwatch-marker"><svg viewBox="0 0 22 22" aria-hidden="true"><polygon points="11,1 21,21 1,21" fill="${{item.colour}}" stroke="#cbd5e1" stroke-width="2"/></svg></div>`,
+		        iconSize: [22, 22],
+		        iconAnchor: [11, 19],
+		        popupAnchor: [0, -20]
+		      }});
+		    }}
 
     function purpleAirPopupHtml(item, loadingText) {{
       return `
-        <strong>${{item.station}}</strong><br>
-        Source: <strong>PurpleAir</strong><br>
-        Sensor ID: ${{item.siteId}}<br>
-        PM2.5: <strong>${{item.pm25 == null ? "--" : formatPaValue(item.pm25)}}</strong><br>
-        Category: <strong>${{item.paCategory || "PurpleAir sensor"}}</strong><br>
+	        <strong>${{item.station}}</strong><br>
+	        Source: <strong>PurpleAir</strong><br>
+	        Sensor ID: ${{item.siteId}}<br>
+	        PM2.5: <strong>${{(item.sensorValue == null && item.pm25 == null) ? "--" : formatPaValue(item.sensorValue == null ? item.pm25 : item.sensorValue)}}</strong><br>
+	        Category: <strong>${{item.paCategory || item.category || "No data"}}</strong><br>
         Lat/Lon: ${{item.lat.toFixed(5)}}, ${{item.lon.toFixed(5)}}<br>
         <div id="purpleair-${{item.siteId}}" style="margin-top:8px;">${{loadingText || ""}}</div>
       `;
     }}
-
-    function escapeHtml(value) {{
-      return String(value == null ? "" : value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-    }}
-
-    function aqmsValuesHtml(item) {{
-      if (!Array.isArray(item.values) || item.values.length === 0) {{
-        return "";
-      }}
-      const rows = item.values.map((entry) => {{
-        const units = entry.units ? ` ${{escapeHtml(entry.units)}}` : "";
-        const time = entry.time ? `<div style="color:#64748b;font-size:11px;">${{escapeHtml(entry.time)}} ${{escapeHtml(entry.date || "")}}</div>` : "";
-        return `
-          <tr>
-            <td>${{escapeHtml(entry.pollutant || "")}}</td>
-            <td>${{escapeHtml(entry.value || "--")}}${{units}}</td>
-            <td>${{escapeHtml(entry.category || "No data")}}${{time}}</td>
-          </tr>
-        `;
-      }}).join("");
-      return `
-        <table class="aqms-popup-values">
-          <thead><tr><th>Pollutant</th><th>Value</th><th>Category / time</th></tr></thead>
-          <tbody>${{rows}}</tbody>
-        </table>
-      `;
-    }}
-
-    markers.forEach((item) => {{
-      if (item.lat == null || item.lon == null) return;
-      const icon = L.divIcon({{
-        className: "",
-        html: item.source === "PurpleAir"
-          ? `<div class="purpleair-marker"></div>`
-          : `<div class="station-marker" style="background:${{item.colour}}">${{item.valueLabel}}</div>`,
-        iconSize: item.source === "PurpleAir" ? [22, 22] : [34, 34],
-        iconAnchor: item.source === "PurpleAir" ? [11, 11] : [17, 17],
-        popupAnchor: [0, -18]
-      }});
-      const marker = L.marker([item.lat, item.lon], {{ icon: item.source === "PurpleAir" ? purpleAirIcon(item) : icon }});
-      if (item.source === "PurpleAir") {{
-        marker.addTo(sensorGroup);
-        purpleAirMarkers.set(String(item.siteId), {{ item, marker }});
-      }} else {{
+	    markers.forEach((item) => {{
+	      if (item.lat == null || item.lon == null) return;
+	      const markerIcon = isPurpleAir(item) ? purpleAirIcon(item) : (isDustWatch(item) ? dustWatchIcon(item) : aqmsIcon(item));
+	      const marker = L.marker([item.lat, item.lon], {{
+	        icon: markerIcon,
+	        zIndexOffset: isPurpleAir(item) ? 100 : (isDustWatch(item) ? 200 : 500)
+	      }});
+	      if (isPurpleAir(item)) {{
+	        marker.addTo(sensorGroup);
+	        purpleAirMarkers.set(String(item.siteId), {{ item, marker }});
+	      }} else if (isDustWatch(item)) {{
+	        marker.addTo(dustWatchGroup);
+	      }} else {{
         marker.addTo(aqmsGroup);
-      }}
-      marker.bindTooltip(item.station, {{ direction: "top", className: "station-label" }});
-      const purpleAirPanelId = `purpleair-${{item.siteId}}`;
-      marker.bindPopup(item.source === "PurpleAir" ? purpleAirPopupHtml(item, "Click opened. Loading PurpleAir values...") : `
-        <strong>${{escapeHtml(item.station)}}</strong><br>
-        Source: <strong>${{escapeHtml(item.source || "AQMS")}}</strong><br>
-        Category: <strong>${{escapeHtml(item.category || "No data")}}</strong><br>
-        Latest time: ${{escapeHtml(item.hour || "--")}}<br>
-        Latest date: ${{escapeHtml(item.date || "--")}}<br>
-        Region: ${{escapeHtml(item.region || "--")}}
-        ${{aqmsValuesHtml(item)}}
+	      }}
+	      marker.bindTooltip(item.station, {{ direction: "top", className: "station-label" }});
+	      const purpleAirPanelId = `purpleair-${{item.siteId}}`;
+	      marker.bindPopup(isPurpleAir(item) ? purpleAirPopupHtml(item, "Click opened. Loading PurpleAir values...") : `
+	        <strong>${{item.station}}</strong><br>
+	        Source: <strong>${{item.source || "AQMS"}}</strong><br>
+	        Value: <strong>${{item.valueLabel}}</strong><br>
+        Category: <strong>${{item.category}}</strong><br>
+        Time: ${{item.hour || "--"}}<br>
+        Date: ${{item.date || "--"}}<br>
+        Pollutant: ${{item.pollutant || "--"}}<br>
+        Region: ${{item.region || "--"}}
       `);
-      marker.on("click", () => {{
-        if (!item.siteId) return;
-        const key = item.source === "PurpleAir" ? `purpleair:${{item.siteId}}` : `aqms:${{item.siteId}}`;
-        try {{
-          window.parent.postMessage({{ type: "monitor-site-select", monitor: key }}, "*");
-        }} catch (err) {{}}
-      }});
-      if (item.source === "PurpleAir") {{
-        marker.on("popupopen", () => fetchPurpleAirValues(item, purpleAirPanelId));
-      }}
-    }});
+	      marker.on("click", () => {{
+	        if (!item.siteId) return;
+	        const key = isPurpleAir(item) ? `purpleair:${{item.siteId}}` : `aqms:${{item.siteId}}`;
+	        try {{
+	          window.parent.postMessage({{ type: "monitor-site-select", monitor: key }}, "*");
+	        }} catch (err) {{}}
+	      }});
+	      if (isPurpleAir(item)) {{
+	        marker.on("popupopen", () => fetchPurpleAirValues(item, purpleAirPanelId));
+	      }}
+	    }});
 
     function formatPaValue(value) {{
       if (value == null || Number.isNaN(Number(value))) return "--";
@@ -6176,12 +4744,16 @@ def _leaflet_monitoring_map_html(rows):
     }}
 
     function updatePurpleAirMarker(item, sensor) {{
-      const pm25 = sensor["pm2.5_alt"];
-      if (pm25 != null && !Number.isNaN(Number(pm25))) {{
-        item.pm25 = Math.max(Number(pm25), 0.2);
-      }}
-      const category = purpleAirCategory(item.pm25);
-      item.paCategory = category.label;
+	      const pm25 = sensor["pm2.5_alt"];
+	      if (pm25 != null && !Number.isNaN(Number(pm25))) {{
+	        item.pm25 = Math.max(Number(pm25), 0.2);
+	        item.sensorValue = item.pm25;
+	        item.valueLabel = formatPaValue(item.pm25);
+	      }}
+	      const category = purpleAirCategory(item.sensorValue == null ? item.pm25 : item.sensorValue);
+	      item.paCategory = category.label;
+	      item.category = category.label;
+	      item.colour = category.colour;
       const entry = purpleAirMarkers.get(String(item.siteId));
       if (entry) {{
         entry.marker.setIcon(purpleAirIcon(item));
@@ -6216,8 +4788,7 @@ def _leaflet_monitoring_map_html(rows):
         .catch((error) => {{}});
     }}
 
-    // PurpleAir rows are injected from the server/cache. Avoid a browser-side
-    // API refresh here because public clients may not have a valid API quota.
+    fetchPurpleAirSnapshot();
 
     try {{ map.fitBounds(nswBounds, {{ padding: [18, 18] }}); }} catch (e) {{}}
 
@@ -6229,9 +4800,12 @@ def _leaflet_monitoring_map_html(rows):
         <div class="legend-row"><span class="legend-swatch" style="background:#eec900"></span>Fair</div>
         <div class="legend-row"><span class="legend-swatch" style="background:#e47400"></span>Poor</div>
         <div class="legend-row"><span class="legend-swatch" style="background:#ba0029"></span>Very poor</div>
-        <div class="legend-row"><span class="legend-swatch" style="background:#590019"></span>Extremely poor</div>
-        <div class="legend-row"><span class="legend-swatch" style="background:{PURPLEAIR_COLOR}; border-radius:50%"></span>PurpleAir sensor / cluster</div>
-      `;
+	        <div class="legend-row"><span class="legend-swatch" style="background:#590019"></span>Extremely poor</div>
+	        <div class="legend-row"><span class="legend-swatch" style="background:#242424"></span>No data</div>
+	        <div class="legend-row"><span class="legend-source-circle"></span>AQMS</div>
+	        <div class="legend-row"><span class="legend-source-triangle"></span>DustWatch</div>
+	        <div class="legend-row"><span class="legend-source-square"></span>PurpleAir</div>
+	      `;
       return div;
     }};
     legend.addTo(map);
@@ -6297,7 +4871,8 @@ def _make_summary_cards(parsed, selection, hour_index, loaded_file_path=None):
         )
 
     region_code = selection.get("regions") or "--"
-    region_name = load_region_lookup().get(str(region_code).strip()) or ""
+    region_label = title_case_station_name(str(region_code).replace("_", " "))
+    region_name = _region_lookup().get(str(region_code).strip()) or ""
     region_subtitle = region_name or ""
 
     time_scope = selection.get("timeScopes")
@@ -6337,47 +4912,8 @@ def _make_summary_cards(parsed, selection, hour_index, loaded_file_path=None):
     max_subtitle = f"At {title_case_station_name(max_station)}" if max_station else ""
     mean_subtitle = "Average forecast"
 
-    pollutant_tiles = []
-    target_idx = 0
-    try:
-        target_idx = int(hour_index or 0)
-    except (TypeError, ValueError):
-        target_idx = 0
-    if target_idx < 0:
-        target_idx = 0
-
-    tile_colors = {
-        "PM2.5": "orange",
-        "PM10": "purple",
-        "O3": "blue",
-    }
-    for pollutant_name in ("PM2.5", "PM10", "O3"):
-        mean_series = _forecast_region_mean_series(
-            str(region_code or ""),
-            pollutant_name,
-            str(time_scope or ""),
-            str(selection.get("models") or ""),
-            str(selection.get("date") or ""),
-        )
-        value = mean_series[target_idx] if target_idx < len(mean_series) else None
-        category_key, _category_color = category_for_value(pollutant_name, value)
-        category_label = category_key.replace("-", " ").title()
-        units_local = (POLLUTANTS.get(pollutant_name) or {}).get("Units") or ""
-        value_text = "--" if value is None else f"{value:.2f}"
-        pollutant_tiles.append(
-            _metric_tile(
-                "pollutant",
-                f"{pollutant_name} (region)",
-                value_text,
-                category_label,
-                color=tile_colors.get(pollutant_name, "blue"),
-                units=units_local,
-            )
-        )
-
     return [
-        _metric_tile("region", "Selected region", str(region_code), region_subtitle, color="blue"),
-        *pollutant_tiles,
+        _metric_tile("region", "Selected region", region_label, region_subtitle, color="blue"),
         _metric_tile("active", "Active stations", str(station_count), "Monitoring sites", color="blue"),
         _metric_tile("ranked", "Stations ranked", str(ranked_count), "With forecast", color="green"),
         _metric_tile("steps", "Forecast steps", str(len(times)), horizon_label, color="purple"),
@@ -6393,111 +4929,43 @@ def _activity_guide_panel():
             className="activity-guide-panel activity-guide-panel--empty",
         )
 
-    def _category_colour(category):
-        category_name = str(category.get("name") or "").strip().lower()
-        for pollutant in ("PM2.5", "PM10", "O3"):
-            for item in (POLLUTANTS.get(pollutant) or {}).get("categories") or []:
-                if str(item.get("label") or "").strip().lower() == category_name:
-                    return item.get("color") or "#64748b"
-        return "#64748b"
-
-    def _clean_actions(actions, fallback):
-        cleaned = [str(item or "").strip() for item in actions or [] if str(item or "").strip()]
-        return cleaned or [fallback]
-
-    category_cards = []
-    action_cards = []
+    header_cells = [
+        html.Th("Air quality category", rowSpan=2),
+        html.Th("Recommended actions"),
+        html.Th(""),
+    ]
+    subheader_cells = [
+        html.Th(
+            [
+                "Sensitive groups including:",
+                html.Br(),
+                "people with a heart or lung condition, including asthma",
+                html.Br(),
+                "people over the age of 65",
+                html.Br(),
+                "infants and children",
+                html.Br(),
+                "pregnant women",
+            ]
+        ),
+        html.Th("Everyone else"),
+    ]
+    rows = []
     for category in GENERAL_HEALTH_GUIDE:
-        category_name = str(category.get("name") or "").strip()
-        category_key = str(category.get("class") or "").strip()
-        colour = _category_colour(category)
-        sensitive_actions = _clean_actions(category.get("sensitiveGroups"), "Continue normal activities and monitor local air quality.")
-        everyone_actions = _clean_actions(category.get("everyoneElse"), "Continue normal activities.")
-        category_cards.append(
-            html.Div(
+        row_class = f"activity-guide__row-header activity-guide__row-header--{category.get('class', '').strip()}"
+        rows.append(
+            html.Tr(
                 [
-                    html.Div(category_name, className="aq-standard-category-card__name"),
-                    html.Div("Air quality category", className="aq-standard-category-card__label"),
-                ],
-                className=f"aq-standard-category-card aq-standard-category-card--{category_key}",
-                style={"--aq-standard-color": colour},
-            )
-        )
-        action_cards.append(
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(className="aq-standard-action-card__stripe", style={"backgroundColor": colour}),
-                            html.Div(
-                                [
-                                    html.Div(category_name, className="aq-standard-action-card__title"),
-                                    html.Div("Recommended action", className="aq-standard-action-card__subtitle"),
-                                ]
-                            ),
-                        ],
-                        className="aq-standard-action-card__header",
+                    html.Td(html.Strong(category.get("name", "")), className=row_class),
+                    html.Td(
+                        html.Ul([html.Li(item) for item in category.get("sensitiveGroups", [])]),
+                        className="activity-guide__cell",
                     ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div("Sensitive groups", className="aq-standard-action-card__group-title"),
-                                    html.Div("Heart/lung conditions, asthma, older adults, children, infants and pregnant women.", className="aq-standard-action-card__group-note"),
-                                    html.Ul([html.Li(item) for item in sensitive_actions]),
-                                ],
-                                className="aq-standard-action-card__group aq-standard-action-card__group--sensitive",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div("Everyone else", className="aq-standard-action-card__group-title"),
-                                    html.Div("General community guidance for outdoor activity and symptoms.", className="aq-standard-action-card__group-note"),
-                                    html.Ul([html.Li(item) for item in everyone_actions]),
-                                ],
-                                className="aq-standard-action-card__group",
-                            ),
-                        ],
-                        className="aq-standard-action-card__body",
+                    html.Td(
+                        html.Ul([html.Li(item) for item in category.get("everyoneElse", [])]),
+                        className="activity-guide__cell",
                     ),
-                ],
-                className="aq-standard-action-card",
-            )
-        )
-
-    threshold_cards = []
-    for pollutant_label in ("PM2.5", "PM10", "O3"):
-        pollutant = POLLUTANTS.get(pollutant_label) or {}
-        categories = [
-            item
-            for item in pollutant.get("categories") or []
-            if str(item.get("label") or "").strip().lower() != "no data"
-        ]
-        threshold_cards.append(
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(pollutant_display(pollutant_label), className="aq-standard-threshold-card__pollutant"),
-                            html.Div(pollutant.get("Units") or "", className="aq-standard-threshold-card__unit"),
-                        ],
-                        className="aq-standard-threshold-card__header",
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Span(item.get("label") or "", className="aq-standard-threshold-card__label"),
-                                    html.Strong(item.get("range") or "--", className="aq-standard-threshold-card__range"),
-                                ],
-                                className="aq-standard-threshold-card__row",
-                                style={"--aq-standard-color": item.get("color") or "#64748b"},
-                            )
-                            for item in categories
-                        ],
-                        className="aq-standard-threshold-card__scale",
-                    ),
-                ],
-                className="aq-standard-threshold-card",
+                ]
             )
         )
 
@@ -6505,77 +4973,28 @@ def _activity_guide_panel():
         [
             html.Div(
                 [
-                    html.Div(
-                        [
-                            html.Div("NSW air quality guidance", className="aq-standard-hero__eyebrow"),
-                            html.H2("AQ Standard"),
-                            html.P("A practical reference for reading category colours, pollutant thresholds and recommended health actions."),
-                        ],
-                        className="aq-standard-hero__copy",
-                    ),
-                    html.Div(
-                        [
-                            html.Div([html.Span("5"), html.Strong("Categories")], className="aq-standard-hero__stat"),
-                            html.Div([html.Span("3"), html.Strong("Key pollutants")], className="aq-standard-hero__stat"),
-                            html.Div([html.Span("000"), html.Strong("Emergency")], className="aq-standard-hero__stat aq-standard-hero__stat--urgent"),
-                        ],
-                        className="aq-standard-hero__stats",
-                    ),
+                    html.H2("AQ Standard"),
+                    html.P("The table below mirrors the NSW guidance used in the original dashboard."),
                 ],
-                className="aq-standard-hero",
+                className="activity-guide__heading",
             ),
             html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3("Category ladder"),
-                            html.P("Colours move from normal conditions to severe pollution episodes."),
-                        ],
-                        className="aq-standard-section-heading",
-                    ),
-                    html.Div(category_cards, className="aq-standard-category-grid"),
-                ],
-                className="aq-standard-card aq-standard-card--ladder",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3("Pollutant breakpoints"),
-                            html.P("Thresholds used by the dashboard for PM2.5, PM10 and ozone categories."),
-                        ],
-                        className="aq-standard-section-heading",
-                    ),
-                    html.Div(threshold_cards, className="aq-standard-threshold-grid"),
-                ],
-                className="aq-standard-card",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3("Recommended actions"),
-                            html.P("Guidance is separated for sensitive groups and the broader community."),
-                        ],
-                        className="aq-standard-section-heading",
-                    ),
-                    html.Div(action_cards, className="aq-standard-action-grid"),
-                    html.Div(
-                        "If symptoms are concerning, contact HealthDirect on 1800 022 222 or seek medical advice. In an emergency call triple zero (000).",
-                        className="aq-standard-emergency-note",
-                    ),
-                ],
-                className="aq-standard-card",
-            ),
-            html.Div(
-                [
-                    html.Strong("Source: "),
-                    html.Span("NSW air quality health activity guidance mirrored from the dashboard reference data."),
-                ],
-                className="aq-standard-source-note",
+                html.Table(
+                    [
+                        html.Thead(
+                            [
+                                html.Tr(header_cells),
+                                html.Tr(subheader_cells),
+                            ]
+                        ),
+                        html.Tbody(rows),
+                    ],
+                    className="activity-guide-table",
+                ),
+                className="activity-guide__table-wrap",
             ),
         ],
-        className="activity-guide-panel aq-standard-panel",
+        className="activity-guide-panel",
     )
 
 
@@ -6595,7 +5014,6 @@ def _load_forecast(selection):
         return None, parsed["error"]
     parsed["_sourceFile"] = file_path
     parsed["_exactMatch"] = exact_match
-    parsed["_region"] = selection.get("regions")
     try:
         parsed["_generatedAtEpoch"] = os.path.getmtime(file_path)
     except OSError:
@@ -6605,264 +5023,27 @@ def _load_forecast(selection):
     return parsed, f"Closest match: {Path(file_path).name}"
 
 
-def _monitor_store_payload(
-    monitor_settings=None,
-    current_store=None,
-    raw_obs=None,
-    purpleair_payload=None,
-    source_filter=None,
-    pollutant_label=None,
-    include_history=False,
-    status_prefix=None,
-):
-    monitor_settings = monitor_settings or {}
-    pollutant_label = (pollutant_label or monitor_settings.get("pollutant") or "PM2.5").strip()
-    source_filter = (source_filter or monitor_settings.get("source") or "both").strip().lower()
-    pollutant_meta = POLLUTANTS.get(pollutant_label) or {}
-    parameter_code = pollutant_meta.get("ParameterCode") or pollutant_label
-
-    status_bits = [status_prefix] if status_prefix else []
-    error = None
-    aqms_ok = True
-    if raw_obs is None:
-        try:
-            raw_obs = fetch_observations(query=None, timeout=25)
-            status_bits.append("AQMS feed: Live")
-        except Exception as exc:
-            raw_obs = []
-            aqms_ok = False
-            error = f"AQMS feed unavailable: {exc}"
-            status_bits.append("AQMS feed: Offline")
-    else:
-        status_bits.append("AQMS feed: Memory" if raw_obs else "AQMS feed: No cached data")
-    if not isinstance(raw_obs, list):
-        raw_obs = []
-
-    if purpleair_payload is None:
-        purpleair_payload = fetch_purpleair_snapshot(bounds=NSW_MAP_BOUNDS, timeout=12)
-        if purpleair_payload.get("error"):
-            status_bits.append("PurpleAir feed: Offline")
-            if error is None:
-                error = f"PurpleAir feed unavailable: {purpleair_payload.get('error')}"
-        elif purpleair_payload.get("source") in {"bundle", "cache"}:
-            status_bits.append("PurpleAir feed: Cached")
-        else:
-            status_bits.append("PurpleAir feed: Live")
-    else:
-        status_bits.append("PurpleAir feed: Memory" if purpleair_payload.get("sensors") else "PurpleAir feed: No cached data")
-
-    aqms_rows = _aqms_rows_for_pollutant(raw_obs, parameter_code, pollutant_label)
-    aqms_pm25_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["PM2.5"]["ParameterCode"], "PM2.5")
-    aqms_pm10_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["PM10"]["ParameterCode"], "PM10")
-    aqms_o3_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["O3"]["ParameterCode"], "O3")
-    aqms_no2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["NO2"]["ParameterCode"], "NO2")
-    aqms_so2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["SO2"]["ParameterCode"], "SO2")
-    aqms_co_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["CO"]["ParameterCode"], "CO")
-    aqms_no_rows = _aqms_rows_for_pollutant(raw_obs, "NO", "NO")
-    aqms_nox_rows = _aqms_rows_for_pollutant(raw_obs, "NOX", "NOX")
-    aqc_rows = _aqms_rows_for_pollutant(raw_obs, "AQC", "AQC")
-
-    aqms_history_rows = []
-    if include_history and raw_obs:
-        try:
-            history_site_ids = sorted({int(item.get("Site_Id")) for item in raw_obs if isinstance(item, dict) and item.get("Site_Id") is not None})
-        except Exception:
-            history_site_ids = []
-        history_parameter_codes = []
-        for pollutant_name in ["PM2.5", "PM10", "O3", "CO", "NO", "NO2", "NOX"]:
-            code = (POLLUTANTS.get(pollutant_name) or {}).get("ParameterCode") or pollutant_name
-            if code and code not in history_parameter_codes:
-                history_parameter_codes.append(code)
-        if history_site_ids and history_parameter_codes:
-            now = datetime.now(SYDNEY_TZ)
-            try:
-                aqms_history_rows = fetch_observation_history(
-                    history_site_ids,
-                    history_parameter_codes,
-                    (now.date() - timedelta(days=1)).isoformat(),
-                    now.date().isoformat(),
-                    timeout=12,
-                )
-            except Exception:
-                aqms_history_rows = []
-    aqms_previous_by_site = _aqms_previous_hour_values_by_site(raw_obs, aqms_history_rows)
-
-    met_site_ids_by_region = {}
-    try:
-        wanted_met = {"TEMP", "HUMID", "WSP", "RAIN"}
-        for item in raw_obs or []:
-            if not isinstance(item, dict):
-                continue
-            param = _aqms_parameter(item)
-            code = str(param.get("ParameterCode") or "").strip()
-            if code not in wanted_met or item.get("Value") is None or item.get("Site_Id") is None:
-                continue
-            site_id = int(item.get("Site_Id"))
-            site = _sites_by_id().get(site_id, {})
-            region = str(site.get("Region") or "").strip() or "Unknown"
-            met_site_ids_by_region.setdefault(region, set()).add(site_id)
-            met_site_ids_by_region.setdefault("All NSW", set()).add(site_id)
-    except Exception:
-        met_site_ids_by_region = {}
-
-    purpleair_sensors = _purpleair_rows_for_pollutant(purpleair_payload.get("sensors") or [], pollutant_label)
-    clusters = purpleair_clusters(purpleair_payload.get("sensors") or [], pollutant_label=pollutant_label) if purpleair_sensors else []
-
-    aqms_snapshot_by_site = {}
-    for key, rows in {
-        "PM2.5": aqms_pm25_rows,
-        "PM10": aqms_pm10_rows,
-        "O3": aqms_o3_rows,
-        "NO": aqms_no_rows,
-        "NO2": aqms_no2_rows,
-        "NOX": aqms_nox_rows,
-        "SO2": aqms_so2_rows,
-        "CO": aqms_co_rows,
-        "AQC": aqc_rows,
-    }.items():
-        for row in rows or []:
-            site_id = row.get("site_id")
-            if site_id is None:
-                continue
-            aqms_snapshot_by_site.setdefault(int(site_id), {})[key] = row
-
-    aqms_map_rows = _aqms_station_map_rows(
-        {
-            "PM2.5": aqms_pm25_rows,
-            "PM10": aqms_pm10_rows,
-            "O3": aqms_o3_rows,
-            "NO2": aqms_no2_rows,
-            "NO": aqms_no_rows,
-            "NOX": aqms_nox_rows,
-            "SO2": aqms_so2_rows,
-            "CO": aqms_co_rows,
-            "AQC": aqc_rows,
-        },
-        selected_pollutant=pollutant_label,
-    )
-    map_rows = []
-    if source_filter in {"both", "aqms"}:
-        map_rows.extend(aqms_map_rows)
-    if source_filter in {"both", "purpleair"}:
-        map_rows.extend(purpleair_sensors)
-
-    latest_label = _format_monitor_label(_monitoring_time_row(aqms_rows)) if aqms_rows else "--"
-    completeness = _data_completeness(aqms_rows, purpleair_sensors if source_filter in {"both", "purpleair"} else [])
-    kpis = _monitor_kpi_payload(aqms_rows, purpleair_sensors, clusters, latest_label, completeness)
-    table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site, max_rows=40)
-    table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site)
-    fetched_epoch = datetime.now(SYDNEY_TZ).timestamp()
-    status_text = ". ".join([bit for bit in status_bits if bit])
-    if latest_label and latest_label != "--":
-        status_text = f"{status_text}. Latest snapshot: {latest_label}"
-
-    return {
-        "pollutant": pollutant_label,
-        "parameterCode": parameter_code,
-        "aqmsRows": aqms_rows,
-        "aqmsPm25Rows": aqms_pm25_rows,
-        "aqmsPm10Rows": aqms_pm10_rows,
-        "aqmsO3Rows": aqms_o3_rows,
-        "aqmsNo2Rows": aqms_no2_rows,
-        "aqmsNoRows": aqms_no_rows,
-        "aqmsNoxRows": aqms_nox_rows,
-        "aqmsSo2Rows": aqms_so2_rows,
-        "aqmsCoRows": aqms_co_rows,
-        "aqcRows": aqc_rows,
-        "metSiteIdsByRegion": {k: sorted(list(v)) for k, v in (met_site_ids_by_region or {}).items()},
-        "aqmsSnapshotBySite": aqms_snapshot_by_site,
-        "aqmsPreviousBySite": aqms_previous_by_site,
-        "purpleairSnapshot": purpleair_payload,
-        "purpleairSensors": purpleair_sensors,
-        "purpleairClusters": clusters,
-        "mapRows": map_rows,
-        "kpis": kpis,
-        "tableRows": table_rows,
-        "tableRowsAll": table_rows_all,
-        "feeds": {
-            "aqms": {"status": "Live" if aqms_ok else "Offline"},
-            "purpleair": {"status": "Live" if not purpleair_payload.get("error") else "Offline"},
-            "completeness": completeness,
-        },
-        "latestLabel": latest_label,
-        "fetchedAtEpoch": fetched_epoch,
-        "status": status_text or INITIAL_MONITOR_STATUS,
-        "error": error,
-    }
-
-
 """
 Startup performance note
 ------------------------
-This module used to eagerly live-fetch monitoring data at import time.
+This module used to eagerly load and parse the latest forecast CSV + monitoring sensor list at import time.
 On remote hosts that delayed binding the Dash server port and made it feel like the app "hangs" before you can open it.
 
-We now start with disk/memory cache data and let callbacks refresh live feeds once a browser session connects.
+We now start with placeholders and let the existing callbacks (monitor refresh + forecast tab selection)
+fetch data once a browser session connects.
 """
 
 INITIAL_MONITOR_ROWS = []
 INITIAL_MONITOR_STATUS = "Monitoring feed is loading."
-try:
-    INITIAL_MONITOR_STORE = _monitor_store_payload(
-        raw_obs=_load_observations_cache(),
-        purpleair_payload=_load_purpleair_snapshot_cache(),
-        pollutant_label="PM2.5",
-        source_filter="both",
-        include_history=False,
-        status_prefix="Monitoring feed: Memory cache",
-    )
-    try:
-        live_startup_store = _monitor_store_payload(
-            raw_obs=fetch_observations(query=None, timeout=10),
-            purpleair_payload=_load_purpleair_snapshot_cache(),
-            pollutant_label="PM2.5",
-            source_filter="both",
-            include_history=False,
-            status_prefix="Monitoring feed: Live startup",
-        )
-        if live_startup_store.get("aqmsRows") and not _monitor_data_is_stale(live_startup_store):
-            live_startup_store["status"] = str(live_startup_store.get("status") or "").replace("AQMS feed: Memory", "AQMS feed: Live")
-            INITIAL_MONITOR_STORE = live_startup_store
-    except Exception:
-        pass
-    INITIAL_MONITOR_ROWS = INITIAL_MONITOR_STORE.get("mapRows") or []
-    _LAST_GOOD_MONITOR_MAP_ROWS = list(INITIAL_MONITOR_ROWS)
-    INITIAL_MONITOR_STATUS = INITIAL_MONITOR_STORE.get("status") or INITIAL_MONITOR_STATUS
-except Exception as exc:
-    INITIAL_MONITOR_STORE = {
-        "pollutant": "PM2.5",
-        "parameterCode": POLLUTANTS.get("PM2.5", {}).get("ParameterCode", "PM2.5"),
-        "aqmsRows": [],
-        "aqmsPm25Rows": [],
-        "aqmsPm10Rows": [],
-        "aqmsO3Rows": [],
-        "aqmsNo2Rows": [],
-        "aqmsSo2Rows": [],
-        "aqmsCoRows": [],
-        "aqcRows": [],
-        "aqmsSnapshotBySite": {},
-        "purpleairSensors": [],
-        "purpleairClusters": [],
-        "mapRows": [],
-        "kpis": {},
-        "tableRows": [],
-        "tableRowsAll": [],
-        "feeds": {},
-        "latestLabel": "--",
-        "fetchedAtEpoch": None,
-        "status": f"{INITIAL_MONITOR_STATUS} Cache load failed: {exc}",
-        "error": str(exc),
-    }
 
 INITIAL_MONITOR_STATION_LIST = _monitor_station_list(INITIAL_MONITOR_ROWS)
 INITIAL_MONITOR_SUMMARY_CARDS = _monitoring_summary_cards(INITIAL_MONITOR_ROWS)
 INITIAL_MONITOR_TIME_LABEL = _format_monitor_label(_monitoring_time_row(INITIAL_MONITOR_ROWS)) if INITIAL_MONITOR_ROWS else "--"
-INITIAL_MONITOR_UPDATED_LABEL = _monitor_header_timestamp_label(INITIAL_MONITOR_STORE)
-INITIAL_MONITOR_OVERVIEW_UPDATED_LABEL = _monitor_updated_label(INITIAL_MONITOR_STORE)
+INITIAL_MONITOR_UPDATED_LABEL = _format_header_timestamp(datetime.now(tz.gettz("Australia/Sydney")).timestamp())
 
 if INITIAL_FORECAST_PARSED:
-    INITIAL_FORECAST_TIME_INDEX = 0
     INITIAL_FORECAST_TIMES = INITIAL_FORECAST_PARSED.get("data", {}).get("time", {}).get("forecastTime", [])
+    INITIAL_FORECAST_TIME_INDEX = _forecast_live_base_index(INITIAL_FORECAST_TIMES)
     INITIAL_FORECAST_SUMMARY_CARDS = _make_summary_cards(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION, INITIAL_FORECAST_TIME_INDEX)
     INITIAL_FORECAST_TIME_LABEL = _format_forecast_label(_selected_time_label(INITIAL_FORECAST_PARSED, INITIAL_FORECAST_TIME_INDEX))
     INITIAL_FORECAST_FILE_INFO = [
@@ -6875,33 +5056,15 @@ if INITIAL_FORECAST_PARSED:
     INITIAL_FORECAST_MAP = _map_figure(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"], INITIAL_FORECAST_TIME_INDEX)
     INITIAL_FORECAST_MAP_HTML = _leaflet_forecast_map_html(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"], INITIAL_FORECAST_TIME_INDEX)
     INITIAL_FORECAST_RANKING = _ranking_rows(INITIAL_FORECAST_PARSED)
-    INITIAL_FORECAST_RANKING_FIGURE = _ranking_bar_figure(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"])
-    INITIAL_FORECAST_RANKING_HOUR_OPTIONS = _forecast_hour_options(INITIAL_FORECAST_PARSED)
-    INITIAL_RANKING_STATION_OPTIONS = []
-    INITIAL_RANKING_SELECTED_STATION = _default_ranking_station(DEFAULT_SELECTION, INITIAL_FORECAST_TIME_INDEX)
-    INITIAL_FORECAST_RANKING_CARDS = _station_prediction_cards(DEFAULT_SELECTION, INITIAL_FORECAST_TIME_INDEX)
-    if INITIAL_RANKING_SELECTED_STATION:
-        INITIAL_STATION_TREND = _station_trend_figure(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"], INITIAL_RANKING_SELECTED_STATION)
-    else:
-        INITIAL_STATION_TREND = _all_stations_trend_figure(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"])
-    INITIAL_TIME_SERIES_REGION_OPTIONS = _forecast_region_options(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["regions"])
-    INITIAL_TIME_SERIES_REGION = DEFAULT_SELECTION["regions"]
-    INITIAL_TIME_SERIES_STATION_OPTIONS = _forecast_station_options(INITIAL_FORECAST_PARSED, INITIAL_TIME_SERIES_REGION)
-    INITIAL_TIME_SERIES_STATION = _default_forecast_station(INITIAL_FORECAST_PARSED, INITIAL_TIME_SERIES_REGION)
-    INITIAL_TIME_SERIES = _forecast_time_series_figure(
+    INITIAL_FORECAST_RANKING_FIGURE = _station_rank_bars_for_pollutants(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION, INITIAL_FORECAST_TIME_INDEX)
+    INITIAL_STATION_TREND = _all_stations_trend_figure(
         INITIAL_FORECAST_PARSED,
         DEFAULT_SELECTION["pollutants"],
-        INITIAL_TIME_SERIES_STATION,
-        0,
-        INITIAL_TIME_SERIES_REGION,
+        DEFAULT_SELECTION.get("timeScopes"),
     )
-    INITIAL_STATION_DETAILS = _selected_station_details(
-        INITIAL_FORECAST_PARSED,
-        DEFAULT_SELECTION["pollutants"],
-        INITIAL_RANKING_SELECTED_STATION,
-        INITIAL_FORECAST_TIME_INDEX,
-    )
-    INITIAL_SELECTED_STATION = INITIAL_RANKING_SELECTED_STATION
+    INITIAL_TIME_SERIES = _forecast_time_series_figure(INITIAL_FORECAST_PARSED, DEFAULT_SELECTION["pollutants"], None, 0)
+    INITIAL_STATION_DETAILS = _all_stations_details(INITIAL_FORECAST_PARSED)
+    INITIAL_SELECTED_STATION = None
 else:
     INITIAL_FORECAST_TIME_INDEX = 0
     INITIAL_FORECAST_TIMES = []
@@ -6911,36 +5074,17 @@ else:
     INITIAL_FORECAST_MAP = go.Figure()
     INITIAL_FORECAST_MAP_HTML = _leaflet_forecast_map_html({}, DEFAULT_SELECTION.get("pollutants"), 0)
     INITIAL_FORECAST_RANKING = []
-    INITIAL_FORECAST_RANKING_FIGURE = _ranking_bar_figure({}, DEFAULT_SELECTION.get("pollutants"))
-    INITIAL_FORECAST_RANKING_HOUR_OPTIONS = _forecast_hour_options({})
-    INITIAL_RANKING_STATION_OPTIONS = []
-    INITIAL_RANKING_SELECTED_STATION = None
-    INITIAL_FORECAST_RANKING_CARDS = _station_prediction_cards(DEFAULT_SELECTION, 0)
+    INITIAL_FORECAST_RANKING_FIGURE = _station_rank_bars_for_pollutants({}, DEFAULT_SELECTION, 0)
     INITIAL_STATION_TREND = go.Figure()
-    INITIAL_TIME_SERIES_REGION_OPTIONS = []
-    INITIAL_TIME_SERIES_REGION = DEFAULT_SELECTION.get("regions")
-    INITIAL_TIME_SERIES_STATION_OPTIONS = []
-    INITIAL_TIME_SERIES_STATION = None
     INITIAL_TIME_SERIES = go.Figure()
-    INITIAL_STATION_DETAILS = "Choose a station from the list to inspect its forecast profile."
+    INITIAL_STATION_DETAILS = "Click a station on the map to inspect its full forecast."
     INITIAL_SELECTED_STATION = None
-
-try:
-    _initial_rank_parsed, _initial_rank_message = _load_forecast(DEFAULT_SELECTION)
-    INITIAL_FORECAST_RANK_TIME_LABEL = (
-        _format_forecast_label(_selected_time_label(_initial_rank_parsed, INITIAL_FORECAST_TIME_INDEX))
-        if _initial_rank_parsed
-        else INITIAL_FORECAST_TIME_LABEL
-    )
-except Exception:
-    INITIAL_FORECAST_RANK_TIME_LABEL = INITIAL_FORECAST_TIME_LABEL
 
 
 app = dash.Dash(
     __name__,
     assets_folder=str(CURRENT_DIR / "assets"),
-    title="NSW Air Quality Forecast Dashboard",
-    suppress_callback_exceptions=True,
+    title="NSW Air Quality Nowcasting Dashboard",
 )
 server = app.server
 app.index_string = """
@@ -6967,11 +5111,6 @@ app.index_string = """
 @server.route("/favicon.ico")
 def favicon():
     return send_from_directory(CURRENT_DIR / "assets", "nsw-logo.svg", mimetype="image/svg+xml")
-
-
-@server.route("/_dash-component-suites/plotly_cloud/<path:_asset_path>")
-def optional_plotly_cloud_asset(_asset_path):
-    return Response("", mimetype="text/css")
 
 
 @app.callback(Output("monitor-highest-aqms", "children"), [Input("monitor-store", "data")])
@@ -7044,18 +5183,13 @@ def render_monitor_highest_purpleair(monitor_store):
     [Input("monitor-store", "data"), Input("monitor-pollutant", "value"), Input("monitor-source", "value")],
 )
 def render_monitor_top_boxes(monitor_store, pollutant_label, source):
-    """Render top boxes for AQMS (PM2.5/PM10/O3) and PurpleAir (selected pollutant)."""
+    """Render up to 5 top boxes for AQMS and PurpleAir based on the selected pollutant."""
     monitor_store = monitor_store or {}
-    current_label = datetime.now(SYDNEY_TZ).strftime("%Y-%m-%d %H:%M")
-    selected_pollutant = pollutant_label or "PM2.5"
+    pollutant = pollutant_label or "PM2.5"
     # Map pollutant to store keys for AQMS
     key_map = {"PM2.5": "aqmsPm25Rows", "PM10": "aqmsPm10Rows", "O3": "aqmsO3Rows"}
-    purple_snapshot = monitor_store.get("purpleairSnapshot") or {}
-    purple_rows_pm25 = _purpleair_rows_for_pollutant((purple_snapshot or {}).get("sensors") or [], "PM2.5")
-    purple_rows_pm10 = _purpleair_rows_for_pollutant((purple_snapshot or {}).get("sensors") or [], "PM10")
-    card_backgrounds = ["#f8fafc", "#eff6ff", "#f0fdf4", "#fff7ed", "#fdf2f8"]
-    purple_backgrounds_pm25 = ["#f7f3ff", "#f3edff", "#efe7ff", "#e9e0ff", "#e4d8ff"]
-    purple_backgrounds_pm10 = ["#efe1ff", "#e7d5ff", "#ddc7ff", "#d2baff", "#c9aefc"]
+    aqms_rows = monitor_store.get(key_map.get(pollutant, "aqmsPm25Rows")) or []
+    purple_rows = monitor_store.get("purpleairSensors") or []
 
     def top_n(rows, n=5):
         selected = []
@@ -7070,7 +5204,10 @@ def render_monitor_top_boxes(monitor_store, pollutant_label, source):
         selected.sort(key=lambda x: x[0], reverse=True)
         return [r for _, r in selected[:n]]
 
-    def box_for_row(r, pollutant, src_label, card_index=0, background_colour=None):
+    aqms_top = top_n(aqms_rows, 5) if source in ("both", "aqms") else []
+    pa_top = top_n(purple_rows, 5) if source in ("both", "purpleair") else []
+
+    def box_for_row(r):
         station = r.get("station") or r.get("name") or "--"
         value = r.get("value") if r.get("value") is not None else r.get("pm25") or r.get("pm10")
         try:
@@ -7081,106 +5218,31 @@ def render_monitor_top_boxes(monitor_store, pollutant_label, source):
         value_label = "--" if v is None else f"{v:.1f} {units}"
         category_label = r.get("category") or "No data"
         colour = r.get("category_color") or "#9ca3af"
+        # Use station text as the index for the clickable id
         station_key = str(station)
-        # IDs must be unique across all rendered boxes; include pollutant + source.
-        box_unique = r.get("site_id") or r.get("monitorKey") or card_index
-        box_index = f"{src_label}|{pollutant}|{station_key}|{box_unique}"
-        if background_colour is None:
-            background_colour = card_backgrounds[card_index % len(card_backgrounds)]
         return html.Button(
             [
                 html.Div(station, className="monitor-top-box__station"),
                 html.Div(category_label, className="monitor-top-box__category", style={"backgroundColor": colour, "color": "#fff"}),
                 html.Div(value_label, className="monitor-top-box__value"),
             ],
-            id={"type": "monitor-top-box", "index": box_index},
+            id={"type": "monitor-top-box", "index": station_key},
             n_clicks=0,
             className="monitor-top-box",
-            style={
-                "padding": "10px",
-                "borderRadius": "8px",
-                "backgroundColor": background_colour,
-                "boxShadow": "0 1px 4px rgba(2,6,23,0.08)",
-                "textAlign": "center",
-                "border": "1px solid rgba(148, 163, 184, 0.18)",
-                "cursor": "pointer",
-            },
+            style={"width": "150px", "padding": "10px", "borderRadius": "8px", "background": "#fff", "boxShadow": "0 1px 4px rgba(2,6,23,0.08)", "marginRight": "10px", "textAlign": "center", "border": "none", "cursor": "pointer"},
         )
 
-    def panel_title(label):
-        return html.Div(
-            [
-                html.Span(label),
-                html.Span(f" @ {current_label}", style={"color": "#94a3b8", "fontWeight": "500", "fontSize": "0.92rem"}),
-            ],
-            className="monitor-top-panel__title",
-        )
+    rows = []
+    if aqms_top:
+        rows.append(html.Div([html.H4(f"Top {len(aqms_top)} AQMS ({pollutant})", style={"marginTop": "6px", "marginBottom": "8px"})]))
+        rows.append(html.Div([box_for_row(r) for r in aqms_top], style={"display": "flex", "gap": "10px", "flexWrap": "nowrap", "overflowX": "auto"}))
+    if pa_top:
+        rows.append(html.Div([html.H4(f"Top {len(pa_top)} PurpleAir ({pollutant})", style={"marginTop": "12px", "marginBottom": "8px"})]))
+        rows.append(html.Div([box_for_row(r) for r in pa_top], style={"display": "flex", "gap": "10px", "flexWrap": "nowrap", "overflowX": "auto"}))
 
-    panels = []
-
-    # AQMS: always show PM2.5 + PM10 + O3 rows so the boxes are visible without switching filters.
-    if source in ("both", "aqms"):
-        sections = []
-        for pollutant in ["PM2.5", "PM10", "O3"]:
-            aqms_rows = monitor_store.get(key_map.get(pollutant, "aqmsPm25Rows")) or []
-            aqms_top = top_n(aqms_rows, 5)
-            if not aqms_top:
-                continue
-            sections.append(
-                html.Div(
-                    [
-                        html.Div(pollutant, className="monitor-top-section__title"),
-                        html.Div([box_for_row(r, pollutant, "AQMS", card_index=i) for i, r in enumerate(aqms_top)], className="monitor-top-box-grid"),
-                    ],
-                    className="monitor-top-section",
-                )
-            )
-        if sections:
-            panels.append(
-                html.Div(
-                    [
-                        panel_title("Top AQMS Stations by Pollutant"),
-                        html.Div(sections, className="monitor-top-panel__body"),
-                    ],
-                    className="monitor-top-panel",
-                )
-            )
-
-    if source in ("both", "purpleair"):
-        purple_sections = []
-        for pollutant, rows, palette in [
-            ("PM2.5", purple_rows_pm25, purple_backgrounds_pm25),
-            ("PM10", purple_rows_pm10, purple_backgrounds_pm10),
-        ]:
-            pa_top = top_n(rows, 5)
-            if not pa_top:
-                continue
-            purple_sections.append(
-                html.Div(
-                    [
-                        html.Div(pollutant, className="monitor-top-section__title"),
-                        html.Div(
-                            [box_for_row(r, pollutant, "PurpleAir", card_index=i, background_colour=palette[i % len(palette)]) for i, r in enumerate(pa_top)],
-                            className="monitor-top-box-grid",
-                        ),
-                    ],
-                    className="monitor-top-section",
-                )
-            )
-        if purple_sections:
-            panels.append(
-                html.Div(
-                    [
-                        panel_title("Top PurpleAir Stations by Pollutant"),
-                        html.Div(purple_sections, className="monitor-top-panel__body"),
-                    ],
-                    className="monitor-top-panel",
-                )
-            )
-
-    if not panels:
+    if not rows:
         return html.Div("No top observations available", className="card-hint")
-    return html.Div(panels, className="monitor-top-panels")
+    return html.Div(rows)
 
 
 @app.callback(Output("monitor-station", "value"), [Input({"type": "monitor-top-box", "index": MATCH}, "n_clicks")], [State({"type": "monitor-top-box", "index": MATCH}, "id")], prevent_initial_call=True)
@@ -7188,172 +5250,8 @@ def monitor_top_box_clicked(n_clicks, box_id):
     if not n_clicks:
         return no_update
     # box_id is a dict {'type':'monitor-top-box','index': station_key}
-    index = (box_id or {}).get("index") or ""
-    # index format: "<source>|<pollutant>|<station>"
-    index_parts = str(index).split("|")
-    station_key = index_parts[2] if len(index_parts) >= 3 else (str(index) if index else None)
+    station_key = (box_id or {}).get("index")
     return station_key
-
-
-def _initial_monitor_table_seed(rows, region_value=None, compact=False):
-    region_value = str(region_value or MONITOR_DEFAULT_REGION).strip()
-    seeded_rows = _attach_arrows_to_table_rows(
-        rows or [],
-        INITIAL_MONITOR_STORE.get("aqmsSnapshotBySite"),
-        INITIAL_MONITOR_STORE.get("aqmsPreviousBySite"),
-    )
-    seeded_rows = _inject_badges_into_monitor_rows(seeded_rows)
-    if region_value != "ALL":
-        seeded_rows = [
-            row
-            for row in seeded_rows
-            if str((row or {}).get("region") or "").strip() == region_value
-            or (row or {}).get("source") == "PurpleAir"
-        ]
-    return _ordered_monitor_outlook_rows(seeded_rows, source_value="both", compact=compact, max_rows=12 if compact else None)
-
-
-INITIAL_MONITOR_LATEST_LABEL = INITIAL_MONITOR_STORE.get("latestLabel") or "--"
-INITIAL_MONITOR_KPI_NODES = _monitor_kpi_cards(INITIAL_MONITOR_STORE.get("kpis") or {})
-INITIAL_MONITOR_TABLE_ROWS = _initial_monitor_table_seed(INITIAL_MONITOR_STORE.get("tableRowsAll") or [], compact=True)
-INITIAL_MONITOR_TABLE_ALL_ROWS = _initial_monitor_table_seed(INITIAL_MONITOR_STORE.get("tableRowsAll") or [])
-INITIAL_MONITOR_TABLE_STYLES = _monitor_table_styles()
-INITIAL_MONITOR_NETWORK_NODES = _monitor_network_nodes(INITIAL_MONITOR_STORE.get("feeds") or {})
-INITIAL_MONITOR_STATUS_TEXT = INITIAL_MONITOR_STORE.get("error") or INITIAL_MONITOR_STORE.get("status") or INITIAL_MONITOR_STATUS
-INITIAL_MONITOR_TOP_BOXES = render_monitor_top_boxes(INITIAL_MONITOR_STORE, "PM2.5", "both")
-
-
-def _overview_nsw_region_options(monitor_store):
-    monitor_store = monitor_store or {}
-    pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
-    pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
-    o3_rows_all = monitor_store.get("aqmsO3Rows") or []
-    combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
-    latest = _monitoring_time_row(combined_rows)
-    if not latest:
-        return [{"name": "NSW", "stations": []}]
-
-    date_val = latest.get("date")
-    hour_val = latest.get("hour")
-    latest_combined = [row for row in combined_rows if row.get("date") == date_val and row.get("hour") == hour_val]
-    latest_pm25 = [row for row in pm25_rows_all if row.get("date") == date_val and row.get("hour") == hour_val]
-    regions = sorted({str(row.get("region") or "").strip() for row in latest_pm25 if str(row.get("region") or "").strip()})
-
-    def station_names(region_name=None):
-        rows = latest_combined
-        if region_name:
-            rows = [row for row in rows if str(row.get("region") or "").strip() == region_name]
-        names = []
-        seen = set()
-        region_cmp = str(region_name or "").strip().lower()
-        for row in rows:
-            name = str(row.get("station") or "").strip()
-            if not name:
-                continue
-            key = name.lower()
-            if region_cmp and key == region_cmp:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            names.append(name)
-        return sorted(names)
-
-    options = [{"name": "NSW", "stations": station_names(None)}]
-    options.extend({"name": region, "stations": station_names(region)} for region in regions)
-    return options
-
-
-def _overview_nsw_summary_data(monitor_store):
-    monitor_store = monitor_store or {}
-    pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
-    pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
-    o3_rows_all = monitor_store.get("aqmsO3Rows") or []
-    combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
-    options = _overview_nsw_region_options(monitor_store)
-    latest = _monitoring_time_row(combined_rows)
-    if not latest:
-        return {"options": options, "regions": []}
-
-    date_val = latest.get("date")
-    hour_val = latest.get("hour")
-
-    def _latest_rows(rows):
-        return [row for row in rows or [] if row.get("date") == date_val and row.get("hour") == hour_val]
-
-    latest_by_pollutant = {
-        "PM2.5": _latest_rows(pm25_rows_all),
-        "PM10": _latest_rows(pm10_rows_all),
-        "O3": _latest_rows(o3_rows_all),
-    }
-
-    def _region_rows(rows, region_name):
-        if not region_name or region_name == "NSW":
-            return rows
-        return [row for row in rows if str(row.get("region") or "").strip() == region_name]
-
-    def _avg(rows):
-        values = []
-        for row in rows or []:
-            try:
-                if row.get("value") is not None:
-                    values.append(float(row.get("value")))
-            except (TypeError, ValueError):
-                continue
-        return (sum(values) / float(len(values))) if values else None
-
-    def _station_value(rows, station_name, region_name):
-        for row in _region_rows(rows, region_name):
-            if str(row.get("station") or "").strip() != station_name:
-                continue
-            try:
-                return float(row.get("value")) if row.get("value") is not None else None
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    regions = []
-    for option in options:
-        display_name = str((option or {}).get("name") or "NSW").strip() or "NSW"
-        region_filter = None if display_name == "NSW" else display_name
-        pm25_avg = _avg(_region_rows(latest_by_pollutant["PM2.5"], region_filter))
-        pm10_avg = _avg(_region_rows(latest_by_pollutant["PM10"], region_filter))
-        o3_avg = _avg(_region_rows(latest_by_pollutant["O3"], region_filter))
-        category_key, colour = category_for_value("PM2.5", pm25_avg)
-        pm10_category, pm10_colour = category_for_value("PM10", pm10_avg)
-        o3_category, o3_colour = category_for_value("O3", o3_avg)
-        station_payloads = []
-        for station_name in (option or {}).get("stations") or []:
-            station_payload = {"name": station_name}
-            for pollutant in ("PM2.5", "PM10", "O3"):
-                value = _station_value(latest_by_pollutant[pollutant], station_name, region_filter)
-                station_category, station_colour = category_for_value(pollutant, value)
-                station_payload[pollutant] = value
-                station_payload[f"{pollutant}_category"] = station_category
-                station_payload[f"{pollutant}_colour"] = station_colour
-            station_payloads.append(
-                station_payload
-            )
-        regions.append(
-            {
-                "name": display_name,
-                "pm25": pm25_avg,
-                "pm10": pm10_avg,
-                "o3": o3_avg,
-                "category": category_key,
-                "colour": colour,
-                "pm10_category": pm10_category,
-                "pm10_colour": pm10_colour,
-                "o3_category": o3_category,
-                "o3_colour": o3_colour,
-                "stations": station_payloads,
-            }
-        )
-    return {"options": options, "regions": regions}
-
-
-INITIAL_OVERVIEW_NSW_REGION_OPTIONS = _overview_nsw_region_options(INITIAL_MONITOR_STORE)
-INITIAL_OVERVIEW_NSW_SUMMARY = _overview_nsw_summary_data(INITIAL_MONITOR_STORE)
 
 
 @server.route("/debug-page")
@@ -7388,15 +5286,6 @@ app.layout = html.Div(
                                         className="nsw-header__logo",
                                         alt="NSW Government",
                                     ),
-                                    # Department name intentionally hidden to keep the dashboard title focused.
-                                    # html.Div(
-                                    #     [
-                                    #         "Department of Climate Change,",
-                                    #         html.Br(),
-                                    #         "Energy, the Environment and Water",
-                                    #     ],
-                                    #     className="nsw-header__logo-text",
-                                    # ),
                                 ],
                                 href="https://www.dpie.nsw.gov.au",
                                 className="nsw-header__logo-link",
@@ -7409,13 +5298,13 @@ app.layout = html.Div(
                         # Center: title
                         html.Div(
                             html.Div(
-                                html.H1(["NSW Air Quality Monitoring and", html.Br(), "Forecast Operations Dashboard"]),
+                                html.H1("NSW Air Quality Nowcasting Dashboard"),
                                 className="banner",
                             ),
                             className="nsw-header__center",
                         ),
 
-                        # Right: timestamps and actions
+                        # Right: timestamps
                         html.Div(
                             [
                                 html.Div(
@@ -7427,7 +5316,7 @@ app.layout = html.Div(
                                             className="header-small-value",
                                         ),
                                     ],
-                                    style={"textAlign": "right", "marginBottom": "8px"},
+                                    className="header-status__item",
                                 ),
                                 html.Div(
                                     [
@@ -7438,10 +5327,10 @@ app.layout = html.Div(
                                             className="header-small-value",
                                         ),
                                     ],
-                                    style={"textAlign": "right", "marginBottom": "8px"},
+                                    className="header-status__item",
                                 ),
                             ],
-                            className="nsw-header__right",
+                            className="nsw-header__right header-status",
                         ),
                     ],
                     className="nsw-header__wrapper",
@@ -7450,14 +5339,13 @@ app.layout = html.Div(
             className="nsw-header",
         ),
         dcc.Store(id="forecast-store", data=INITIAL_FORECAST_PARSED),
-        dcc.Store(id="validation-store", data=INITIAL_FORECAST_PARSED),
         dcc.Store(id="selected-station-store", data=INITIAL_SELECTED_STATION),
         dcc.Store(
             id="monitor-settings-store",
             data={
                 "pollutant": "PM2.5",
                 "source": "both",
-                "region": MONITOR_DEFAULT_REGION,
+                "region": "ALL",
                 "stationKey": None,
                 "window": "24h",
                 "categories": [],
@@ -7466,22 +5354,46 @@ app.layout = html.Div(
         ),
         dcc.Store(
             id="monitor-store",
-            data=INITIAL_MONITOR_STORE,
+            data={
+                "pollutant": "PM2.5",
+                "parameterCode": POLLUTANTS.get("PM2.5", {}).get("ParameterCode", "PM2.5"),
+                "aqmsRows": [],
+                "aqmsPm25Rows": [],
+                "aqmsPm10Rows": [],
+                "aqmsO3Rows": [],
+                "aqmsNo2Rows": [],
+                "aqmsSo2Rows": [],
+                "aqmsCoRows": [],
+                "dustwatchPm25Rows": [],
+                "dustwatchPm10Rows": [],
+                "aqcRows": [],
+                "aqmsSnapshotBySite": {},
+                "purpleairSensors": [],
+                "purpleairClusters": [],
+                "mapRows": [],
+                "kpis": {},
+                "tableRows": [],
+                "tableRowsAll": [],
+                "feeds": {},
+                "latestLabel": "--",
+                "fetchedAtEpoch": None,
+                "status": INITIAL_MONITOR_STATUS,
+                "error": None,
+            },
         ),
-        dcc.Store(id="monitor-map-html-store", data=_leaflet_monitoring_map_html(INITIAL_MONITOR_ROWS)),
         dcc.Store(id="selected-monitor-site-store", data=None),
         dcc.Store(id="overview-nsw-region-index", data=0),
         dcc.Store(id="overview-nsw-station-index", data=0),
-        dcc.Store(id="overview-nsw-region-options", data=INITIAL_OVERVIEW_NSW_REGION_OPTIONS),
-        dcc.Store(id="overview-nsw-summary-store", data=INITIAL_OVERVIEW_NSW_SUMMARY),
         dcc.Store(id="overview-met-region-index", data=0),
         # Preload only one region so Overview paints quickly; scrolling loads more.
         dcc.Store(id="overview-trends-visible", data=["Sydney_East"]),
         dcc.Store(id="overview-trends-index", data=0),
-        dcc.Store(id="overview-trends-region-options", data=[]),
         dcc.Interval(id="forecast-playback", interval=1800, n_intervals=0, disabled=True),
-        # Start with memory/cache data, then refresh live feeds in the background for every session.
-        dcc.Interval(id="monitor-refresh", interval=MONITOR_REFRESH_MS, n_intervals=0, disabled=False),
+        # Monitoring feed calls external APIs and can be slow on some hosts/networks.
+        # Start disabled and enable shortly after first paint so the app opens fast.
+        # Keep monitoring refresh disabled on startup to avoid blocking the server on slow external APIs.
+        # It is enabled when the Monitoring tab is opened.
+        dcc.Interval(id="monitor-refresh", interval=MONITOR_REFRESH_MS, n_intervals=0, disabled=True),
         dcc.Interval(id="overview-clock", interval=60 * 1000, n_intervals=0),
         # Load forecast data shortly after the first page paint so Overview can render forecast panels
         # without delaying server start/bind.
@@ -7495,21 +5407,6 @@ app.layout = html.Div(
         # Autoplay the overview region panels so met/aq status advance automatically
         dcc.Interval(id="overview-region-autoplay", interval=8000, n_intervals=0),
         html.Div(id="forecast-map-updater", style={"display": "none"}),
-        html.Iframe(
-            id="monitor-map-preload",
-            srcDoc=_leaflet_monitoring_map_html(INITIAL_MONITOR_ROWS),
-            title="Monitoring map preload",
-            style={
-                "position": "absolute",
-                "left": "-10000px",
-                "top": "0",
-                "width": "640px",
-                "height": "420px",
-                "border": "0",
-                "opacity": "0",
-                "pointerEvents": "none",
-            },
-        ),
         html.Div(
             [
                 dcc.Tabs(
@@ -7546,27 +5443,20 @@ app.layout = html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
-                                                                            html.H4("NSW AIR QUALITY STATUS"),
-                                                                            html.Div(
-                                                                                INITIAL_MONITOR_OVERVIEW_UPDATED_LABEL,
-                                                                                id="overview-nsw-air-quality-updated",
-                                                                                className="card-hint overview-updated-at",
-                                                                            ),
+                                                                            html.H4("Air Quality Status", className="overview-aq-status-title"),
+                                                                            html.Div(id="overview-nsw-air-quality-updated", className="card-hint"),
                                                                         ],
-                                                                        className="card-heading-row",
+                                                                        className="overview-card-title-row overview-card-title-row--status",
                                                                     ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Button("‹", id="overview-nsw-region-prev", n_clicks=0, className="nsw-aq-status__nav-btn"),
-                                                                    html.Div("NSW", id="overview-nsw-region-name", className="nsw-aq-status__nav-label"),
-                                                                    html.Button("›", id="overview-nsw-region-next", n_clicks=0, className="nsw-aq-status__nav-btn"),
-                                                                ],
-                                                                className="nsw-aq-status__nav",
-                                                            ),
-                                                            html.Div(id="overview-nsw-air-quality-status"),
-                                                            # Station-level pollutant box with navigation
-                                                            html.Div(
-                                                                [
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Button("‹", id="overview-nsw-region-prev", n_clicks=0, className="nsw-aq-status__nav-btn"),
+                                                                            html.Div("NSW", id="overview-nsw-region-name", className="nsw-aq-status__nav-label"),
+                                                                            html.Button("›", id="overview-nsw-region-next", n_clicks=0, className="nsw-aq-status__nav-btn"),
+                                                                        ],
+                                                                        className="nsw-aq-status__nav",
+                                                                    ),
+                                                                    html.Div(id="overview-nsw-air-quality-status"),
                                                                     html.Div(
                                                                         [
                                                                             html.Button("‹", id="overview-nsw-station-prev", n_clicks=0, className="nsw-aq-status__nav-btn"),
@@ -7574,87 +5464,43 @@ app.layout = html.Div(
                                                                             html.Button("›", id="overview-nsw-station-next", n_clicks=0, className="nsw-aq-status__nav-btn"),
                                                                         ],
                                                                         className="nsw-aq-status__nav",
-                                                                        style={"marginTop": "8px"},
+                                                                        style={"display": "none"},
                                                                     ),
-                                                                    html.Div(id="overview-nsw-station-box", style={"marginTop": "8px"}),
+                                                                    html.Div(id="overview-nsw-station-box", style={"display": "none"}),
                                                                 ],
-                                                                className="overview-nsw-station-container",
-                                                            ),
-                                                        ],
-                                                        className="control-card overview-area--status",
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.H4("Upcoming Forecast"),
-                                                                    html.Div(
-                                                                        id="overview-next3-time-labels",
-                                                                        className="card-hint",
-                                                                    ),
-                                                                ],
-                                                                className="card-heading-row",
-                                                            ),
-                                                            html.Div(id="overview-next3-grid", className="overview-next3-table overview-next3-table--tight"),
-                                                            html.Button(
-                                                                "All stations forecast",
-                                                                id="overview-open-allstations",
-                                                                n_clicks=0,
-                                                                className="overview-next2-allstations__summary",
-                                                            ),
-                                                        ],
-                                                        className="overview-next3-card overview-next3-card--inline overview-area--next3",
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.H4("Regional Forecast Overview"),
-                                                                ],
-                                                                className="card-heading-row",
+                                                                className="control-card overview-status-summary",
                                                             ),
                                                             html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
-                                                                            html.Button(
-                                                                                "⟨",
-                                                                                id="overview-trends-prev",
-                                                                                n_clicks=0,
-                                                                                className="overview-trend-nav",
-                                                                            ),
-                                                                            html.Div(
-                                                                                html.H4(id="overview-trends-current-region-label", children="", style={"margin": "0", "fontSize": "1.05rem"}),
-                                                                                style={"flex": "1", "textAlign": "center"},
-                                                                            ),
-                                                                            html.Button(
-                                                                                "⟩",
-                                                                                id="overview-trends-next",
-                                                                                n_clicks=0,
-                                                                                className="overview-trend-nav",
-                                                                            ),
+                                                                            html.H4("Nowcasting Outlook", className="overview-aq-status-title"),
+                                                                            html.Div(id="overview-next3-time-labels", className="card-hint"),
                                                                         ],
-                                                                        style={"display": "flex", "alignItems": "center", "gap": "12px", "width": "100%"},
+                                                                        className="overview-station-outlook-heading",
+                                                                    ),
+                                                                    html.Div(id="overview-next3-grid", className="overview-next3-table overview-next3-table--tight"),
+                                                                    html.Button(
+                                                                        "All stations forecast",
+                                                                        id="overview-open-allstations",
+                                                                        n_clicks=0,
+                                                                        className="overview-next2-allstations__summary",
                                                                     ),
                                                                 ],
-                                                                className="card-heading-row",
+                                                                className="overview-next3-card overview-next3-card--inline overview-station-card",
                                                             ),
-                                                            html.Div(id="overview-forecast-trends", className="overview-trends-grid"),
                                                         ],
-                                                        className="ranking-card overview-trends-card overview-area--trends",
+                                                        className="overview-status-content",
                                                     ),
-                                                                ],
-                                                                className="overview-left-column",
-                                                            ),
                                                     html.Div(
                                                         [
                                                             html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
+                                                                            html.H4("Nowcasting map", className="overview-map-title"),
                                                                             html.Div(
                                                                                 [
-                                                                                    html.H4("Forecast map"),
                                                                                     dcc.Dropdown(
                                                                                         id="overview-forecast-map-pollutant",
                                                                                         options=[
@@ -7666,64 +5512,102 @@ app.layout = html.Div(
                                                                                         clearable=False,
                                                                                         searchable=False,
                                                                                     ),
-                                                                                    html.Div(
-                                                                                        [
-                                                                                            html.Button("‹", id="overview-forecast-prev-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Previous hour"),
-                                                                                            html.Button("›", id="overview-forecast-next-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Next hour"),
-                                                                                            dcc.Store(id="overview-forecast-hour-index", data=0),
-                                                                                        ],
-                                                                                        style={"display": "inline-flex", "gap": "8px", "marginLeft": "12px", "alignItems": "center"},
-                                                                                    ),
+                                                                                    html.Button("‹", id="overview-forecast-prev-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Previous hour"),
+                                                                                    html.Button("›", id="overview-forecast-next-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Next hour"),
+                                                                                    dcc.Store(id="overview-forecast-hour-index", data=0),
                                                                                 ],
-                                                                                className="overview-map-heading",
+                                                                                className="overview-nowcasting-controls",
                                                                             ),
-                                                                            html.Div(
-                                                                                id="overview-next-hour-forecast-time",
-                                                                                className="card-hint",
-                                                                            ),
+                                                                            html.Div(id="overview-next-hour-forecast-time", className="overview-map-time"),
                                                                         ],
-                                                                        className="card-heading-row",
+                                                                        className="card-heading-row overview-map-card-heading",
                                                                     ),
                                                                     html.Iframe(
                                                                         id="overview-next-hour-forecast-map",
-                                                                        srcDoc=INITIAL_FORECAST_MAP_HTML,
+                                                                        srcDoc=_leaflet_forecast_map_html({}, DEFAULT_SELECTION.get("pollutants"), 0),
                                                                         className="map-frame map-frame--overview-next map-frame--forecast",
                                                                     ),
                                                                     html.Div(id="overview-next-hour-station-panel", className="overview-next-hour-station-panel"),
                                                                 ],
-                                                                className="control-card overview-current-card",
+                                                                className="map-card overview-current-card overview-area--forecast-map",
                                                             ),
                                                             html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
-                                                                            html.Div(
-                                                                                [
-                                                                                    html.H4("Meteorological conditions (last 24 hours)"),
-                                                                                    html.Span("AQMS (region average)", className="card-hint"),
+                                                                            html.H4("Observation map"),
+                                                                            dcc.Dropdown(
+                                                                                id="overview-observation-map-pollutant",
+                                                                                options=[
+                                                                                    {"label": "PM2.5", "value": "PM2.5"},
+                                                                                    {"label": "PM10", "value": "PM10"},
+                                                                                    {"label": "O3", "value": "O3"},
                                                                                 ],
-                                                                                className="card-heading-row",
-                                                                            ),
-                                                                            html.Div(
-                                                                                [
-                                                                                    html.Button("‹", id="overview-met-region-prev", n_clicks=0, className="nsw-aq-status__nav-btn"),
-                                                                                    html.Div("NSW", id="overview-met-region-name", className="nsw-aq-status__nav-label"),
-                                                                                    html.Button("›", id="overview-met-region-next", n_clicks=0, className="nsw-aq-status__nav-btn"),
-                                                                                ],
-                                                                                className="nsw-aq-status__nav",
-                                                                                style={"marginTop": "6px"},
+                                                                                value="PM2.5",
+                                                                                clearable=False,
+                                                                                searchable=False,
                                                                             ),
                                                                         ],
+                                                                        className="card-heading-row overview-observation-heading",
                                                                     ),
-                                                                    html.Div(id="overview-met-6h", className="overview-met6h"),
+                                                                    html.Iframe(
+                                                                        id="overview-observation-map",
+                                                                        srcDoc=_leaflet_monitoring_map_html(INITIAL_MONITOR_ROWS),
+                                                                        className="map-frame map-frame--monitor map-frame--monitor-large",
+                                                                    ),
                                                                 ],
-                                                                className="control-card",
+                                                                className="map-card overview-area--observation-map",
                                                             ),
                                                         ],
-                                                        className="overview-area--map",
+                                                        className="overview-left-column",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Regional Forecast"),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Button("‹", id="overview-trends-prev", n_clicks=0, className="overview-trend-nav"),
+                                                                            html.Button("›", id="overview-trends-next", n_clicks=0, className="overview-trend-nav"),
+                                                                            html.Div(id="overview-trends-current-region-label", className="overview-regional-forecast-time"),
+                                                                        ],
+                                                                        className="overview-regional-forecast-controls",
+                                                                    ),
+                                                                ],
+                                                                className="card-heading-row overview-regional-forecast-heading",
+                                                            ),
+                                                            html.Div(id="overview-forecast-trends", className="overview-trends-grid overview-forecast-pollutants"),
+                                                        ],
+                                                        className="ranking-card overview-trends-card overview-area--trends",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Regional Observed", id="overview-regional-air-quality-title"),
+                                                                    html.Span("AQMS region average", className="card-hint"),
+                                                                ],
+                                                                className="card-heading-row",
+                                                            ),
+                                                            html.Div(id="overview-observed-grid", className="overview-observed-grid overview-observed-pollutants"),
+                                                            html.Div(id="overview-pm25-top3", style={"display": "none"}),
+                                                            dcc.Dropdown(id="overview-pm25-region-dropdown", options=[], value=None, style={"display": "none"}),
+                                                            html.Div(id="overview-pm25-other", style={"display": "none"}),
+                                                        ],
+                                                        className="ranking-card overview-area--observed",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("‹", id="overview-met-region-prev", n_clicks=0),
+                                                            html.Div("NSW", id="overview-met-region-name"),
+                                                            html.Button("›", id="overview-met-region-next", n_clicks=0),
+                                                            html.Div(id="overview-met-6h"),
+                                                        ],
+                                                        style={"display": "none"},
                                                     ),
                                                 ],
-                                                className="overview-grid",
+                                                className="overview-dashboard",
                                             ),
                                         ],
                                         className="monitor-panel",
@@ -7744,107 +5628,163 @@ app.layout = html.Div(
                                         [
                                             html.Div(
                                                 [
-                                                    dcc.Dropdown(
-                                                        id="monitor-region",
-                                                        options=MONITOR_REGION_OPTIONS,
-                                                        value=MONITOR_DEFAULT_REGION,
-                                                        clearable=False,
-                                                    ),
-                                                    dcc.Dropdown(
-                                                        id="monitor-station",
-                                                        options=[],
-                                                        value=None,
-                                                        clearable=True,
-                                                        placeholder="Select a station…",
-                                                    ),
-                                                    dcc.Dropdown(
-                                                        id="monitor-pollutant",
-                                                        options=MONITOR_POLLUTANT_OPTIONS,
-                                                        value="PM2.5",
-                                                        clearable=False,
-                                                    ),
-                                                    dcc.Dropdown(
-                                                        id="monitor-source",
-                                                        options=[
-                                                            {"label": "AQMS", "value": "aqms"},
-                                                            {"label": "PurpleAir", "value": "purpleair"},
-                                                            {"label": "Both", "value": "both"},
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.H2("Monitoring"),
+                                                                    html.P("Investigate current and historical observations from AQMS monitoring stations and PurpleAir sensors."),
+                                                                ],
+                                                                className="monitor__heading",
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Region"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-region",
+                                                                                options=MONITOR_REGION_OPTIONS,
+                                                                                value="ALL",
+                                                                                clearable=False,
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Station"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-station",
+                                                                                options=[],
+                                                                                value=None,
+                                                                                clearable=True,
+                                                                                placeholder="Select a station…",
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Pollutant"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-pollutant",
+                                                                                options=MONITOR_POLLUTANT_OPTIONS,
+                                                                                value="PM2.5",
+                                                                                clearable=False,
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Source"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-source",
+                                                                                options=[
+                                                                                    {"label": "AQMS", "value": "aqms"},
+                                                                                    {"label": "PurpleAir", "value": "purpleair"},
+                                                                                    {"label": "Both", "value": "both"},
+                                                                                ],
+                                                                                value="both",
+                                                                                clearable=False,
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Time window"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-window",
+                                                                                options=[
+                                                                                    {"label": "Last 6 hours", "value": "6h"},
+                                                                                    {"label": "Last 24 hours", "value": "24h"},
+                                                                                    {"label": "Last 48 hours", "value": "48h"},
+                                                                                    {"label": "Last 7 days", "value": "7d"},
+                                                                                ],
+                                                                                value="24h",
+                                                                                clearable=False,
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("AQ category"),
+                                                                            dcc.Dropdown(
+                                                                                id="monitor-category-filter",
+                                                                                options=MONITOR_CATEGORY_OPTIONS,
+                                                                                value=[],
+                                                                                multi=True,
+                                                                                placeholder="All categories",
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Label("Search station"),
+                                                                            dcc.Input(
+                                                                                id="monitor-station-search",
+                                                                                type="text",
+                                                                                value="",
+                                                                                placeholder="Type to filter stations…",
+                                                                                className="monitor-search",
+                                                                            ),
+                                                                        ],
+                                                                        className="filter-field",
+                                                                    ),
+                                                                ],
+                                                                className="forecast-toolbar__filters monitor-toolbar__filters",
+                                                            ),
                                                         ],
-                                                        value="both",
-                                                        clearable=False,
-                                                    ),
-                                                    dcc.Dropdown(
-                                                        id="monitor-window",
-                                                        options=[
-                                                            {"label": "Last 6 hours", "value": "6h"},
-                                                            {"label": "Last 24 hours", "value": "24h"},
-                                                            {"label": "Last 48 hours", "value": "48h"},
-                                                            {"label": "Last 7 days", "value": "7d"},
-                                                        ],
-                                                        value="24h",
-                                                        clearable=False,
-                                                    ),
-                                                    dcc.Dropdown(
-                                                        id="monitor-category-filter",
-                                                        options=MONITOR_CATEGORY_OPTIONS,
-                                                        value=[],
-                                                        multi=True,
-                                                        placeholder="All categories",
-                                                    ),
-                                                    dcc.Input(
-                                                        id="monitor-station-search",
-                                                        type="text",
-                                                        value="",
-                                                        placeholder="Type to filter stations…",
-                                                        className="monitor-search",
-                                                    ),
+                                                        className="forecast-toolbar__row",
+                                                    )
                                                 ],
-                                                style={"display": "none"},
+                                                className="control-card monitor-toolbar",
                                             ),
                                             html.Div(
                                                 [
-                                                    html.Div(INITIAL_MONITOR_KPI_NODES, id="monitor-kpi-row", className="metric-row"),
-                                                    html.Div(INITIAL_MONITOR_LATEST_LABEL, id="monitor-time-label", className="time-label"),
+                                                    html.Div(id="monitor-kpi-row", className="metric-row"),
+                                                    html.Div(id="monitor-time-label", className="time-label"),
                                                 ],
                                                 className="monitor-diagnostics",
                                             ),
                                             html.Div(
                                                 [
                                                     html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
+                                                            [
+                                                                    # Highest AQMS observed box (e.g. PM2.5 highest station)
                                                                     html.Div(
                                                                         [
-                                                                            html.H4("Observation map"),
-                                                                            html.Span("Hover for details. Click to select a station.", className="card-hint"),
+                                                                            html.Div(
+                                                                                [
+                                                                                    html.H4("Observation map"),
+                                                                                    html.Span("Hover for details. Click to select a station.", className="card-hint"),
+                                                                                ],
+                                                                                className="card-heading-row",
+                                                                            ),
+                                                                                html.Iframe(
+                                                                                    id="monitor-map",
+                                                                                    srcDoc=_leaflet_monitoring_map_html(INITIAL_MONITOR_ROWS),
+                                                                                    className="map-frame map-frame--monitor map-frame--monitor-large",
+                                                                                ),
                                                                         ],
-                                                                        className="card-heading-row",
+                                                                        className="map-card",
                                                                     ),
-                                                                    html.Iframe(
-                                                                        id="monitor-map",
-                                                                        srcDoc=_leaflet_monitoring_map_html(INITIAL_MONITOR_ROWS),
-                                                                        className="map-frame map-frame--monitor map-frame--monitor-large",
-                                                                    ),
+                                                                    # Container for top-N boxes (AQMS and PurpleAir) rendered below the map
+                                                                    html.Div(id="monitor-top-boxes", className="monitor-top-boxes", style={"marginTop": "12px"}),
                                                                 ],
-                                                                className="map-card",
+                                                                className="monitor-main__map",
                                                             ),
-                                                            html.Div(INITIAL_MONITOR_TOP_BOXES, id="monitor-top-boxes", className="monitor-top-boxes", style={"marginTop": "12px"}),
-                                                        ],
-                                                        className="monitor-main__map",
-                                                    ),
                                                     html.Div(
                                                         [
                                                             html.Div(
                                                                 [
                                                                     html.Div(
                                                                         [
-                                                                            html.H4(
-                                                                                [
-                                                                                    "Air quality outlook @ ",
-                                                                                    html.Span(INITIAL_MONITOR_LATEST_LABEL, id="monitor-outlook-time", className="monitor-outlook-time"),
-                                                                                ]
-                                                                            ),
+                                                                            html.H4("Station ranking (current snapshot)"),
                                                                             html.Button(
                                                                                 "View all stations →",
                                                                                 id="monitor-view-all",
@@ -7859,18 +5799,20 @@ app.layout = html.Div(
                                                                         columns=[
                                                                             {"name": "Station", "id": "station"},
                                                                             {"name": "Region", "id": "region"},
-                                                                            {"name": "PM2.5", "id": "pm25_badge", "presentation": "markdown"},
-                                                                            {"name": "PM10", "id": "pm10_badge", "presentation": "markdown"},
-                                                                            {"name": "O3", "id": "o3_badge", "presentation": "markdown"},
+                                                                            {"name": "Hour", "id": "hour"},
+                                                                            {"name": "Source", "id": "source"},
+                                                                            {"name": "PM2.5", "id": "pm25"},
+                                                                            {"name": "PM10", "id": "pm10"},
+                                                                            {"name": "O3", "id": "o3"},
+                                                                            {"name": "Category", "id": "category"},
                                                                         ],
-                                                                        data=INITIAL_MONITOR_TABLE_ROWS,
-                                                                        page_size=12,
-                                                                        markdown_options={"html": True},
+                                                                        data=[],
+                                                                        page_size=8,
                                                                         style_table={"overflowX": "auto"},
                                                                         style_cell={
                                                                             "fontFamily": BASE_FONT_FAMILY,
                                                                             "fontSize": "0.92rem",
-                                                                            "padding": "4px 8px",
+                                                                            "padding": "8px 10px",
                                                                             "whiteSpace": "nowrap",
                                                                             "border": "none",
                                                                         },
@@ -7881,12 +5823,13 @@ app.layout = html.Div(
                                                                             "color": "#0f172a",
                                                                         },
                                                                         style_cell_conditional=[
-                                                                            {"if": {"column_id": "pm25_badge"}, "textAlign": "center"},
-                                                                            {"if": {"column_id": "pm10_badge"}, "textAlign": "center"},
-                                                                            {"if": {"column_id": "o3_badge"}, "textAlign": "center"},
+                                                                            {"if": {"column_id": "category"}, "textAlign": "center", "fontWeight": "900"},
+                                                                            {"if": {"column_id": "pm25"}, "textAlign": "right"},
+                                                                            {"if": {"column_id": "pm10"}, "textAlign": "right"},
+                                                                            {"if": {"column_id": "o3"}, "textAlign": "right"},
                                                                         ],
                                                                         style_data={"borderBottom": "1px solid #eef2f7"},
-                                                                        style_data_conditional=INITIAL_MONITOR_TABLE_STYLES,
+                                                                        style_data_conditional=[],
                                                                     ),
                                                                 ],
                                                                 className="ranking-card monitor-table-card",
@@ -7907,29 +5850,27 @@ app.layout = html.Div(
                                                                                 ],
                                                                                 className="modal-header",
                                                                             ),
-                                                                            dash_table.DataTable(
-                                                                                id="monitor-table-all",
-                                                                                columns=[
-                                                                                    {"name": "Station", "id": "station"},
-                                                                                    {"name": "Region", "id": "region"},
-                                                                                    {"name": "PM2.5", "id": "pm25_badge", "presentation": "markdown"},
-                                                                                    {"name": "PM10", "id": "pm10_badge", "presentation": "markdown"},
-                                                                                    {"name": "O3", "id": "o3_badge", "presentation": "markdown"},
-                                                                                    {"name": "CO", "id": "co_badge", "presentation": "markdown"},
-                                                                                    {"name": "NO", "id": "no_badge", "presentation": "markdown"},
-                                                                                    {"name": "NO2", "id": "no2_badge", "presentation": "markdown"},
-                                                                                    {"name": "NOX", "id": "nox_badge", "presentation": "markdown"},
-                                                                                ],
-                                                                                data=INITIAL_MONITOR_TABLE_ALL_ROWS,
+                                                                    dash_table.DataTable(
+                                                                        id="monitor-table-all",
+                                                                        columns=[
+                                                                            {"name": "Station", "id": "station"},
+                                                                            {"name": "Region", "id": "region"},
+                                                                            {"name": "Hour", "id": "hour"},
+                                                                            {"name": "Source", "id": "source"},
+                                                                            {"name": "PM2.5", "id": "pm25"},
+                                                                            {"name": "PM10", "id": "pm10"},
+                                                                            {"name": "O3", "id": "o3"},
+                                                                            {"name": "Category", "id": "category"},
+                                                                        ],
+                                                                                data=[],
                                                                                 page_size=20,
                                                                                 sort_action="native",
                                                                                 filter_action="native",
-                                                                                markdown_options={"html": True},
                                                                                 style_table={"overflowX": "auto"},
                                                                                 style_cell={
                                                                                     "fontFamily": BASE_FONT_FAMILY,
                                                                                     "fontSize": "0.92rem",
-                                                                                    "padding": "4px 8px",
+                                                                                    "padding": "9px 10px",
                                                                                     "whiteSpace": "nowrap",
                                                                                     "border": "none",
                                                                                 },
@@ -7940,16 +5881,13 @@ app.layout = html.Div(
                                                                                     "color": "#0f172a",
                                                                                 },
                                                                                 style_cell_conditional=[
-                                                                                    {"if": {"column_id": "pm25_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "pm10_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "o3_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "co_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "no_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "no2_badge"}, "textAlign": "center"},
-                                                                                    {"if": {"column_id": "nox_badge"}, "textAlign": "center"},
+                                                                                    {"if": {"column_id": "category"}, "textAlign": "center", "fontWeight": "900"},
+                                                                                    {"if": {"column_id": "pm25"}, "textAlign": "right"},
+                                                                                    {"if": {"column_id": "pm10"}, "textAlign": "right"},
+                                                                                    {"if": {"column_id": "o3"}, "textAlign": "right"},
                                                                                 ],
                                                                                 style_data={"borderBottom": "1px solid #eef2f7"},
-                                                                                style_data_conditional=INITIAL_MONITOR_TABLE_STYLES,
+                                                                                style_data_conditional=[],
                                                                             ),
                                                                         ],
                                                                         className="modal-card",
@@ -7961,50 +5899,22 @@ app.layout = html.Div(
                                                             ),
                                                             html.Div(
                                                                 [
-                                                                    html.Div(
-                                                                        [
-                                                                            html.H4("Regional pollutant time series"),
-                                                                            html.P("Last 24 hours for one AQMS station in the selected region.", className="monitor-region-series-subtitle"),
-                                                                        ],
-                                                                        className="monitor-region-series-heading",
-                                                                    ),
-                                                                    html.Div(
-                                                                        [
-                                                                            html.Div(
-                                                                                [
-                                                                                    html.Label("Region"),
-                                                                                    dcc.Dropdown(
-                                                                                        id="monitor-region-series",
-                                                                                        options=MONITOR_REGION_SERIES_OPTIONS,
-                                                                                        value=MONITOR_REGION_SERIES_DEFAULT_VALUE,
-                                                                                        clearable=False,
-                                                                                    ),
-                                                                                ],
-                                                                                className="filter-field monitor-region-series-filter",
-                                                                            ),
-                                                                            html.Div(
-                                                                                [
-                                                                                    html.Label("Station"),
-                                                                                    dcc.Dropdown(
-                                                                                        id="monitor-region-series-station",
-                                                                                        options=MONITOR_REGION_SERIES_DEFAULT_STATION_OPTIONS,
-                                                                                        value=MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE,
-                                                                                        clearable=False,
-                                                                                    ),
-                                                                                ],
-                                                                                className="filter-field monitor-region-series-filter monitor-region-series-station-filter",
-                                                                            ),
-                                                                        ],
-                                                                        className="monitor-region-series-filters",
-                                                                    ),
-                                                                    html.Div(id="monitor-region-series-note", className="monitor-region-series-note"),
-                                                                    dcc.Loading(
-                                                                        html.Div(id="monitor-region-series-plots", className="monitor-region-series-plots"),
-                                                                        type="circle",
-                                                                        color="#005eb8",
-                                                                    ),
+                                                                    html.H4("Selected site"),
+                                                                    html.Div(id="monitor-selected-site", className="selected-site"),
                                                                 ],
-                                                                className="control-card monitor-region-series-card",
+                                                                className="control-card selected-site-card",
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Observation vs PurpleAir (nearby)"),
+                                                                    dcc.Graph(
+                                                                        id="monitor-compare-chart",
+                                                                        figure=go.Figure(),
+                                                                        config={"displayModeBar": False},
+                                                                    ),
+                                                                    html.Div(id="monitor-compare-summary", className="monitor-compare-summary"),
+                                                                ],
+                                                                className="control-card monitor-compare-card",
                                                             ),
                                                         ],
                                                         className="monitor-main__side",
@@ -8012,40 +5922,34 @@ app.layout = html.Div(
                                                 ],
                                                 className="monitor-main",
                                             ),
+                                            html.Div(
+                                                [
                                                     html.Div(
                                                         [
-                                                            html.Div(
-                                                                [
-                                                                    html.H4("Network status"),
-                                                                    html.Div(INITIAL_MONITOR_NETWORK_NODES, id="monitor-network-status", className="network-status"),
-                                                                ],
-                                                                className="control-card monitor-network-card",
-                                                            ),
-                                                        ],
-                                                        className="monitor-bottom",
-                                                    ),
-                                                    html.Div(INITIAL_MONITOR_STATUS_TEXT, id="monitor-status", className="monitor-status"),
-                                                    html.Div(
-                                                        id="monitor-selected-site",
-                                                        className="selected-site",
-                                                        style={"display": "none"},
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            dcc.Graph(
-                                                                id="monitor-compare-chart",
-                                                                figure=go.Figure(),
-                                                                config={"displayModeBar": False},
-                                                            ),
-                                                            html.Div(id="monitor-compare-summary", className="monitor-compare-summary"),
+                                                            html.H4("Observation trend – selected site"),
                                                             dcc.Graph(
                                                                 id="monitor-trend-chart",
                                                                 figure=go.Figure(),
                                                                 config={"displayModeBar": False},
                                                             ),
+                                                            html.Div(
+                                                                "AQI based on PM2.5 where available. Data shown is preliminary and subject to change. All times shown in AEST.",
+                                                                className="monitor-note",
+                                                            ),
                                                         ],
-                                                        style={"display": "none"},
+                                                        className="map-card monitor-trend-card",
                                                     ),
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Network status"),
+                                                            html.Div(id="monitor-network-status", className="network-status"),
+                                                        ],
+                                                        className="control-card monitor-network-card",
+                                                    ),
+                                                ],
+                                                className="monitor-bottom",
+                                            ),
+                                            html.Div(INITIAL_MONITOR_STATUS, id="monitor-status", className="monitor-status"),
                                         ],
                                         className="monitor-panel",
                                     )
@@ -8054,7 +5958,7 @@ app.layout = html.Div(
                             ),
                         ),
                         dcc.Tab(
-                            label="Forecast",
+                            label="Nowcasting",
                             value="forecast",
                             className="dashboard-tab dashboard-tab--forecast",
                             selected_className="dashboard-tab--selected",
@@ -8066,7 +5970,7 @@ app.layout = html.Div(
                                                 [
                                                     html.Div(
                                                         [
-                                                            html.H4("Forecasting"),
+                                                            html.H4("Nowcasting"),
                                                             html.Div(id="selection-message", className="selection-message"),
                                                         ],
                                                         className="forecast-toolbar__heading",
@@ -8078,7 +5982,7 @@ app.layout = html.Div(
                                                                     html.Label("Run date"),
                                                                     dcc.Dropdown(
                                                                         id="date-dropdown",
-                                                                        options=INITIAL_FORECAST_DATE_OPTIONS,
+                                                                        options=[{"label": value, "value": value} for value in OPTIONS.get("date", [])],
                                                                         value=DEFAULT_SELECTION["date"],
                                                                         clearable=False,
                                                                     ),
@@ -8090,43 +5994,43 @@ app.layout = html.Div(
                                                                     html.Label("Model"),
                                                                     dcc.Dropdown(
                                                                         id="model-dropdown",
-                                                                        options=INITIAL_FORECAST_MODEL_OPTIONS,
+                                                                        options=[{"label": value, "value": value} for value in OPTIONS.get("models", [])],
                                                                         value=DEFAULT_SELECTION["models"],
                                                                         clearable=False,
                                                                     ),
                                                                 ],
-                                                                className="filter-field",
+                                                                className="filter-field filter-field--wide",
                                                             ),
                                                             html.Div(
                                                                 [
                                                                     html.Label("Pollutant"),
                                                                     dcc.Dropdown(
                                                                         id="pollutant-dropdown",
-                                                                        options=INITIAL_FORECAST_POLLUTANT_OPTIONS,
+                                                                        options=[{"label": value, "value": value} for value in OPTIONS.get("pollutants", [])],
                                                                         value=DEFAULT_SELECTION["pollutants"],
                                                                         clearable=False,
                                                                     ),
                                                                 ],
-                                                                className="filter-field",
+                                                                className="filter-field filter-field--pollutant",
                                                             ),
                                                             html.Div(
                                                                 [
-                                                                    html.Label("Horizon"),
+                                                                    html.Label("Forecast Hour"),
                                                                     dcc.Dropdown(
                                                                         id="time-dropdown",
-                                                                        options=INITIAL_FORECAST_HORIZON_OPTIONS,
+                                                                        options=[{"label": f"{value} hours", "value": value} for value in OPTIONS.get("timeScopes", [])],
                                                                         value=DEFAULT_SELECTION["timeScopes"],
                                                                         clearable=False,
                                                                     ),
                                                                 ],
-                                                                className="filter-field",
+                                                                className="filter-field filter-field--horizon",
                                                             ),
                                                             html.Div(
                                                                 [
                                                                     html.Label("Region"),
                                                                     dcc.Dropdown(
                                                                         id="region-dropdown",
-                                                                        options=INITIAL_FORECAST_REGION_OPTIONS,
+                                                                        options=[{"label": _display_region_label(value), "value": value} for value in OPTIONS.get("regions", [])],
                                                                         value=DEFAULT_SELECTION["regions"],
                                                                         clearable=False,
                                                                     ),
@@ -8138,11 +6042,46 @@ app.layout = html.Div(
                                                     ),
                                                 ],
                                                 className="control-card forecast-toolbar",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(INITIAL_FORECAST_SUMMARY_CARDS, id="summary-cards", className="metric-row"),
-                                                    html.Div(f"Showing {INITIAL_FORECAST_TIME_LABEL}" if INITIAL_FORECAST_PARSED else "Latest forecast run not loaded.", id="forecast-time-label", className="time-label time-label--forecast"),
+	                                            ),
+	                                            html.Div(
+	                                                [
+	                                                    html.Div(INITIAL_FORECAST_SUMMARY_CARDS, id="summary-cards", className="metric-row forecast-summary-row"),
+	                                                ],
+	                                                className="forecast-summary-wrap",
+	                                            ),
+	                                            html.Div(
+	                                                [
+		                                                    html.Div(
+		                                                        [
+		                                                            html.H4("Nowcasting Map"),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Div(
+                                                                                [
+                                                                                    html.Label("Pollutant"),
+                                                                                    dcc.Dropdown(
+                                                                                        id="forecast-map-pollutant-dropdown",
+                                                                                        options=[{"label": value, "value": value} for value in OPTIONS.get("pollutants", [])],
+                                                                                        value=DEFAULT_SELECTION["pollutants"],
+                                                                                        clearable=False,
+                                                                                    ),
+                                                                                ],
+                                                                                className="forecast-map-pollutant-control",
+                                                                            ),
+                                                                            html.Div(
+                                                                                [
+                                                                                    html.Button("‹", id="forecast-prev-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Previous forecast hour"),
+                                                                                    html.Div(INITIAL_FORECAST_TIME_LABEL if INITIAL_FORECAST_PARSED else "No forecast", id="forecast-time-label", className="forecast-map-heading__time"),
+                                                                                    html.Button("›", id="forecast-next-hour", n_clicks=0, className="nsw-aq-status__nav-btn", title="Next forecast hour"),
+                                                                                ],
+                                                                                className="forecast-hour-stepper",
+                                                                            ),
+                                                                        ],
+                                                                        className="forecast-map-heading__right",
+                                                                    ),
+	                                                        ],
+	                                                        className="forecast-map-heading",
+	                                                    ),
                                                     html.Iframe(
                                                         id="forecast-map",
                                                         srcDoc=INITIAL_FORECAST_MAP_HTML,
@@ -8150,194 +6089,85 @@ app.layout = html.Div(
                                                     ),
                                                     html.Div(
                                                         [
-                                                            dcc.Slider(id="time-slider", min=0, max=max(len(INITIAL_FORECAST_TIMES) - 1, 0), value=0, step=1, marks=_slider_marks(INITIAL_FORECAST_TIMES)),
-                                                            html.Div(INITIAL_FORECAST_FILE_INFO, id="file-info", className="file-info"),
+                                                            html.Div("Forecast step"),
+                                                            dcc.Slider(id="time-slider", min=0, max=max(len(INITIAL_FORECAST_TIMES) - 1, 0), value=INITIAL_FORECAST_TIME_INDEX, step=1, marks=_slider_marks(INITIAL_FORECAST_TIMES)),
                                                         ],
-                                                        className="forecast-hidden-controls",
-                                                    ),
+	                                                        className="time-control forecast-hidden-controls",
+	                                                    ),
+	                                                    html.Div(INITIAL_FORECAST_FILE_INFO, id="file-info", className="file-info forecast-hidden-controls"),
                                                 ],
                                                 className="map-card",
                                             ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.H4("Station ranking"),
-                                                                    html.P("Predicted station values for the selected forecast hour."),
-                                                                ],
-                                                                className="forecast-rank-heading",
-                                                            ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Label("Forecast hour"),
-                                                                    dcc.Dropdown(
-                                                                        id="ranking-hour-dropdown",
-                                                                        options=INITIAL_FORECAST_RANKING_HOUR_OPTIONS,
-                                                                        value=INITIAL_FORECAST_TIME_INDEX,
-                                                                        clearable=False,
-                                                                    ),
-                                                                ],
-                                                                className="forecast-rank-hour-control",
-                                                            ),
-                                                        ],
-                                                        className="forecast-rank-header",
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.A(
-                                                                "All station forecast",
-                                                                id="forecast-view-all",
-                                                                href="#forecast-all-stations-modal",
-                                                                n_clicks=0,
-                                                                className="forecast-rank-eyebrow forecast-all-stations-link table-link",
-                                                            ),
-                                                            html.Div(
-                                                                INITIAL_FORECAST_RANK_TIME_LABEL or "--",
-                                                                id="forecast-rank-selected-time",
-                                                                className="forecast-rank-time",
-                                                            ),
-                                                        ],
-                                                        className="forecast-rank-summary",
-                                                    ),
-                                                    html.Div(INITIAL_FORECAST_RANKING_CARDS, id="ranking-cards"),
-                                                    html.Hr(),
-                                                    html.H4("Region Forecast"),
-                                                    html.Div(INITIAL_STATION_DETAILS, id="station-details", className="station-forecast-note"),
-                                                    dcc.Graph(id="station-trend", figure=INITIAL_STATION_TREND, config={"displayModeBar": False}),
-                                                ],
-                                                className="ranking-card",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.Div(
-                                                                        [
-                                                                            html.H3("All station forecast", id="forecast-all-stations-title", className="modal-title"),
-                                                                            html.Div(
-                                                                                "Upcoming forecast horizons for every station.",
-                                                                                id="forecast-all-stations-subtitle",
-                                                                                className="forecast-all-stations-subtitle",
-                                                                            ),
-                                                                        ],
-                                                                        className="forecast-all-stations-heading",
-                                                                    ),
-                                                                    html.Button(
-                                                                        "Close",
-                                                                        id="forecast-modal-close",
-                                                                        n_clicks=0,
-                                                                        className="header-action header-action--ghost modal-close",
-                                                                    ),
-                                                                ],
-                                                                className="modal-header",
-                                                            ),
-                                                            dash_table.DataTable(
-                                                                id="forecast-all-stations-table",
-                                                                columns=[
-                                                                    {"name": "Station", "id": "station"},
-                                                                    {"name": "Region", "id": "region"},
-                                                                    {"name": ["+1h", "PM₂.₅"], "id": "h1_pm25"},
-                                                                    {"name": ["+1h", "PM10"], "id": "h1_pm10"},
-                                                                    {"name": ["+1h", "O3"], "id": "h1_o3"},
-                                                                    {"name": ["+3h", "PM₂.₅"], "id": "h3_pm25"},
-                                                                    {"name": ["+3h", "PM10"], "id": "h3_pm10"},
-                                                                    {"name": ["+3h", "O3"], "id": "h3_o3"},
-                                                                    {"name": ["+6h", "PM₂.₅"], "id": "h6_pm25"},
-                                                                    {"name": ["+6h", "PM10"], "id": "h6_pm10"},
-                                                                    {"name": ["+6h", "O3"], "id": "h6_o3"},
-                                                                    {"name": ["+12h", "PM₂.₅"], "id": "h12_pm25"},
-                                                                    {"name": ["+12h", "PM10"], "id": "h12_pm10"},
-                                                                    {"name": ["+12h", "O3"], "id": "h12_o3"},
-                                                                ],
-                                                                data=[],
-                                                                page_action="none",
-                                                                sort_action="native",
-                                                                merge_duplicate_headers=True,
-                                                                style_table={"overflowX": "auto", "maxHeight": "70vh", "overflowY": "auto"},
-                                                                style_cell={
-                                                                    "fontFamily": BASE_FONT_FAMILY,
-                                                                    "fontSize": "0.86rem",
-                                                                    "padding": "6px 8px",
-                                                                    "whiteSpace": "nowrap",
-                                                                    "border": "none",
-                                                                    "textAlign": "center",
-                                                                },
-                                                                style_header={
-                                                                    "fontWeight": "900",
-                                                                    "backgroundColor": "#f1f5f9",
-                                                                    "borderBottom": "1px solid #e2e8f0",
-                                                                    "color": "#0f172a",
-                                                                    "height": "34px",
-                                                                    "padding": "5px 8px",
-                                                                },
-                                                                style_cell_conditional=[
-                                                                    {"if": {"column_id": "station"}, "textAlign": "left", "minWidth": "150px", "width": "170px"},
-                                                                    {"if": {"column_id": "region"}, "textAlign": "left", "minWidth": "130px", "width": "150px"},
-                                                                    {"if": {"column_type": "text"}, "textAlign": "left"},
-                                                                ],
-                                                                style_data={"borderBottom": "1px solid #eef2f7", "height": "34px"},
-                                                                style_data_conditional=_overview_allstations_value_styles(),
-                                                            ),
-                                                        ],
-                                                        className="modal-card forecast-all-stations-modal-card",
-                                                    )
-                                                ],
-                                                id="forecast-all-stations-modal",
-                                                className="modal-overlay",
-                                                style={"display": "none"},
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.H4("Observed + Forecast Time Series"),
-                                                                    html.P("Choose a region and station explicitly; the plot will not change station automatically."),
-                                                                ],
-                                                                className="forecast-series-heading",
-                                                            ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Div(
-                                                                        [
-                                                                            html.Label("Region"),
-                                                                            dcc.Dropdown(
-                                                                                id="time-series-region-dropdown",
-                                                                                options=INITIAL_TIME_SERIES_REGION_OPTIONS,
-                                                                                value=INITIAL_TIME_SERIES_REGION,
-                                                                                clearable=False,
-                                                                            ),
-                                                                        ],
-                                                                        className="forecast-series-filter",
-                                                                    ),
-                                                                    html.Div(
-                                                                        [
-                                                                            html.Label("Station"),
-                                                                            dcc.Dropdown(
-                                                                                id="time-series-station-dropdown",
-                                                                                options=INITIAL_TIME_SERIES_STATION_OPTIONS,
-                                                                                value=INITIAL_TIME_SERIES_STATION,
-                                                                                clearable=False,
-                                                                            ),
-                                                                        ],
-                                                                        className="forecast-series-filter forecast-series-filter--station",
-                                                                    ),
-                                                                ],
-                                                                className="forecast-series-filters",
-                                                            ),
-                                                        ],
-                                                        className="forecast-series-header",
-                                                    ),
-                                                    dcc.Graph(
-                                                        id="forecast-time-series",
-                                                        figure=INITIAL_TIME_SERIES,
+	                                            html.Div(
+	                                                [
+	                                                    html.Div(
+	                                                        [
+	                                                            html.H4(
+	                                                                f"Station's Nowcasting @ {INITIAL_FORECAST_TIME_LABEL}" if INITIAL_FORECAST_PARSED else "Station's Nowcasting",
+	                                                                id="station-ranking-title",
+	                                                            ),
+						                                            html.Div(
+						                                                INITIAL_FORECAST_RANKING_FIGURE,
+						                                                id="ranking-chart",
+					                                                    className="station-rank-bars-shell",
+					                                                ),
+				                                                html.Button(
+				                                                    "All Stations Nowcasting",
+				                                                    id="forecast-all-stations-open",
+				                                                    n_clicks=0,
+				                                                    className="forecast-all-stations-link",
+				                                                ),
+				                                                html.Hr(),
+				                                                html.H4("Selected station"),
+				                                                html.Div(INITIAL_STATION_DETAILS, id="station-details", style={"marginBottom": "10px"}),
+				                                                dcc.Graph(id="station-trend", figure=INITIAL_STATION_TREND, config={"displayModeBar": False}),
+	                                                        ],
+	                                                        className="ranking-card",
+	                                                    ),
+	                                                    html.A(
+	                                                        "NSW Air Quality Categories (AQC)",
+	                                                        href="https://www.airquality.nsw.gov.au/health-advice/air-quality-categories",
+	                                                        target="_blank",
+	                                                        rel="noopener noreferrer",
+	                                                        className="aqc-link-box",
+	                                                    ),
+	                                                ],
+	                                                className="forecast-side-stack",
+	                                            ),
+	                                            html.Div(
+	                                                [
+	                                                    html.Div(
+	                                                        [
+	                                                            html.Div(
+	                                                                [
+	                                                                    html.H4(
+	                                                                        f"Nowcasting Time Series @ {_display_region_label(DEFAULT_SELECTION.get('regions'))}",
+	                                                                        id="forecast-time-series-title",
+	                                                                    ),
+	                                                                    html.P("Observed monitoring and forecast mean for the selected station."),
+	                                                                ],
+	                                                                className="forecast-series-heading",
+	                                                            ),
+	                                                            html.Div(
+	                                                                [
+	                                                                    html.Label("Station"),
+	                                                                    dcc.Dropdown(
+	                                                                        id="forecast-time-series-station",
+	                                                                        options=_forecast_station_dropdown_options(INITIAL_FORECAST_PARSED),
+	                                                                        value=None,
+	                                                                        clearable=False,
+	                                                                    ),
+	                                                                ],
+	                                                                className="forecast-series-filter",
+	                                                            ),
+	                                                        ],
+	                                                        className="forecast-series-header forecast-series-header--station",
+	                                                    ),
+	                                                    dcc.Graph(
+	                                                        id="forecast-time-series",
+	                                                        figure=INITIAL_TIME_SERIES,
                                                         config={"displayModeBar": False},
-                                                    ),
+                                                    )
                                                 ],
                                                 className="time-series-card",
                                             ),
@@ -8350,7 +6180,7 @@ app.layout = html.Div(
                         ),
                         dcc.Tab(
                             label="Validation",
-                            value="validation",
+                            value="model-performance",
                             className="dashboard-tab dashboard-tab--performance",
                             selected_className="dashboard-tab--selected",
                             children=html.Div(
@@ -8359,83 +6189,22 @@ app.layout = html.Div(
                                         [
                                             html.Div(
                                                 [
-                                                    html.Div(
-                                                        [
-                                                            html.H2("Validation"),
-                                                            html.P("Compare observed monitoring values with the selected forecast run and region."),
-                                                        ],
-                                                        className="validation-heading",
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.Label("Date / time"),
-                                                                    dcc.Dropdown(
-                                                                        id="validation-date-dropdown",
-                                                                        options=INITIAL_VALIDATION_DATE_OPTIONS,
-                                                                        value=INITIAL_VALIDATION_DATE,
-                                                                        clearable=False,
-                                                                    ),
-                                                                ],
-                                                                className="validation-filter",
-                                                            ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Label("Pollutant"),
-                                                                    dcc.Dropdown(
-                                                                        id="validation-pollutant-dropdown",
-                                                                        options=INITIAL_VALIDATION_POLLUTANT_OPTIONS,
-                                                                        value=INITIAL_VALIDATION_POLLUTANT,
-                                                                        clearable=False,
-                                                                    ),
-                                                                ],
-                                                                className="validation-filter",
-                                                            ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Label("Horizon"),
-                                                                    dcc.Dropdown(
-                                                                        id="validation-horizon-dropdown",
-                                                                        options=INITIAL_VALIDATION_HORIZON_OPTIONS,
-                                                                        value=INITIAL_VALIDATION_HORIZON,
-                                                                        clearable=False,
-                                                                    ),
-                                                                ],
-                                                                className="validation-filter",
-                                                            ),
-                                                            html.Div(
-                                                                [
-                                                                    html.Label("Region"),
-                                                                    dcc.Dropdown(
-                                                                        id="validation-region-dropdown",
-                                                                        options=INITIAL_VALIDATION_REGION_OPTIONS,
-                                                                        value=INITIAL_VALIDATION_REGION,
-                                                                        clearable=False,
-                                                                    ),
-                                                                ],
-                                                                className="validation-filter",
-                                                            ),
-                                                        ],
-                                                        className="validation-toolbar",
-                                                    ),
-                                                    html.Div(id="validation-message", className="validation-message"),
-                                                    html.Div(
-                                                        html.Div(
-                                                            _validation_station_plot_grid(INITIAL_FORECAST_PARSED, INITIAL_VALIDATION_POLLUTANT, INITIAL_VALIDATION_REGION),
-                                                            id="validation-time-series-grid",
-                                                        ),
-                                                        className="validation-plot-card",
-                                                    ),
-                                                    html.Div(
-                                                        _validation_metric_cards(INITIAL_FORECAST_PARSED, INITIAL_VALIDATION_POLLUTANT, INITIAL_FORECAST_TIME_INDEX, INITIAL_VALIDATION_REGION),
-                                                        id="validation-metrics",
-                                                    ),
+                                                    html.H2("Validation"),
+                                                    html.P("Validation metrics and skill summaries for each model version."),
                                                 ],
-                                                className="validation-panel",
+                                                className="placeholder__heading",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Div(
+                                                        "This tab is a placeholder in the Python dashboard. Hook it up to your evaluation outputs when ready.",
+                                                        className="placeholder__body",
+                                                    )
+                                                ],
+                                                className="placeholder-panel",
                                             ),
                                         ],
-                                        className="validation-wrap",
+                                        className="placeholder-wrap",
                                     )
                                 ],
                                 className="dashboard-tab-panel",
@@ -8458,8 +6227,8 @@ app.layout = html.Div(
             ],
             id="dashboard-page",
         ),
-        html.Div(
-            id="overview-allstations-overlay",
+	        html.Div(
+	            id="overview-allstations-overlay",
             children=[
                 html.Div(
                     [
@@ -8470,7 +6239,7 @@ app.layout = html.Div(
                             className="card-heading-row",
                         ),
                         html.Div([
-                            html.H4("All stations forecast"),
+                            html.H4("All stations forecast (next 3 hours)"),
                         ], className="card-heading-row"),
                         html.Div(
                             [
@@ -8544,10 +6313,39 @@ app.layout = html.Div(
                 "zIndex": "1100",
                 "overflow": "auto",
                 "padding": "20px",
-            },
-        ),
-        html.Div(
-            f"Source data is loaded from forecast CSVs under {CSV_DATA_FILE_PATH}. If you point CSV_DATA_FILE_PATH at another folder, restart the app.",
+	            },
+	        ),
+	        html.Div(
+	            id="forecast-all-stations-modal",
+	            className="modal-overlay",
+	            style={"display": "none"},
+	            children=[
+	                html.Div(
+	                    [
+	                        html.Div(
+	                            [
+	                                html.Div(
+	                                    [
+	                                        html.H3("All Stations Nowcasting", id="forecast-all-stations-title", className="modal-title"),
+	                                        html.Div(id="forecast-all-stations-subtitle", className="forecast-all-stations-subtitle"),
+	                                    ],
+	                                    className="forecast-all-stations-heading",
+	                                ),
+	                                html.Button("Close", id="forecast-all-stations-close", n_clicks=0, className="header-action header-action--ghost modal-close"),
+	                            ],
+	                            className="modal-header",
+	                        ),
+	                        html.Div(
+	                            id="forecast-all-stations-table",
+	                            className="all-fc-outer",
+	                        ),
+	                    ],
+	                    className="modal-card forecast-all-stations-modal-card",
+	                )
+	            ],
+	        ),
+	        html.Div(
+	            f"Source data is loaded from forecast CSVs under {CSV_DATA_FILE_PATH}. If you point CSV_DATA_FILE_PATH at another folder, restart the app.",
             className="dash-footer",
         ),
     ],
@@ -8582,6 +6380,54 @@ def toggle_allstations_overlay(open_clicks, close_clicks, current_style):
 
 
 @app.callback(
+    Output("forecast-all-stations-modal", "style"),
+    [Input("forecast-all-stations-open", "n_clicks"), Input("forecast-all-stations-close", "n_clicks")],
+    [State("forecast-all-stations-modal", "style")],
+    prevent_initial_call=True,
+)
+def toggle_forecast_allstations_modal(open_clicks, close_clicks, current_style):
+    current_style = current_style or {}
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    if trigger == "forecast-all-stations-close":
+        return {**current_style, "display": "none"}
+    if trigger == "forecast-all-stations-open" and open_clicks:
+        return {**current_style, "display": "flex"}
+    return current_style
+
+
+@app.callback(
+    [
+        Output("forecast-all-stations-table", "children"),
+        Output("forecast-all-stations-title", "children"),
+        Output("forecast-all-stations-subtitle", "children"),
+    ],
+    [
+        Input("forecast-store", "data"),
+        Input("pollutant-dropdown", "value"),
+        Input("forecast-all-stations-open", "n_clicks"),
+    ],
+    [
+        State("region-dropdown", "value"),
+        State("time-dropdown", "value"),
+        State("model-dropdown", "value"),
+        State("date-dropdown", "value"),
+    ],
+)
+def render_forecast_allstations_table(parsed, pollutant, _open_clicks,
+                                      region, time_scope, model, date):
+    selection = {
+        "regions":     region      or DEFAULT_SELECTION.get("regions"),
+        "pollutants":  pollutant   or DEFAULT_SELECTION.get("pollutants"),
+        "timeScopes":  time_scope  or DEFAULT_SELECTION.get("timeScopes"),
+        "models":      model       or DEFAULT_SELECTION.get("models"),
+        "date":        date        or DEFAULT_SELECTION.get("date"),
+    }
+    # _forecast_all_hour_table loads via _merged_forecast_map_payload — works without forecast-store.
+    return _forecast_all_hour_table(parsed, pollutant, selection)
+    return _forecast_all_hour_table(parsed, pollutant, selection)
+
+
+@app.callback(
     Output("forecast-playback", "disabled"),
     [Input("dashboard-tabs", "value")],
 )
@@ -8594,17 +6440,12 @@ def toggle_forecast_playback(active_tab):
     [Input("dashboard-tabs", "value")],
 )
 def load_monitor_region_options(active_tab):
+    # Avoid parsing the large site metadata file during initial startup.
+    # Populate region options the first time the Monitoring tab is opened.
+    if active_tab != "monitor":
+        return no_update
     regions = sorted({(site or {}).get("Region") for site in _sites_by_id().values() if (site or {}).get("Region")})
     return [{"label": "All regions", "value": "ALL"}] + [{"label": region, "value": region} for region in regions]
-
-
-@app.callback(
-    [Output("monitor-region", "value"), Output("monitor-region-series", "value")],
-    [Input("dashboard-tabs", "value")],
-    [State("monitor-region", "value"), State("monitor-region-series", "value")],
-)
-def initialize_monitor_defaults(active_tab, current_region, current_region_series):
-    return MONITOR_DEFAULT_REGION, MONITOR_REGION_SERIES_DEFAULT_VALUE
 
 
 app.clientside_callback(
@@ -8624,58 +6465,6 @@ app.clientside_callback(
 
 @app.callback(
     [
-        Output("date-dropdown", "options"),
-        Output("date-dropdown", "value"),
-        Output("model-dropdown", "options"),
-        Output("model-dropdown", "value"),
-        Output("pollutant-dropdown", "options"),
-        Output("pollutant-dropdown", "value"),
-        Output("time-dropdown", "options"),
-        Output("time-dropdown", "value"),
-        Output("region-dropdown", "options"),
-        Output("region-dropdown", "value"),
-    ],
-    [
-        Input("date-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("pollutant-dropdown", "value"),
-        Input("time-dropdown", "value"),
-        Input("region-dropdown", "value"),
-    ],
-)
-def sync_forecast_dropdowns(date, model, pollutant, horizon, region):
-    selection = {
-        "date": date,
-        "models": model,
-        "pollutants": pollutant,
-        "timeScopes": horizon,
-        "regions": region,
-    }
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    trigger_field = {
-        "date-dropdown": "date",
-        "model-dropdown": "models",
-        "pollutant-dropdown": "pollutants",
-        "time-dropdown": "timeScopes",
-        "region-dropdown": "regions",
-    }.get(trigger, "date")
-    normalised = _normalise_forecast_selection(selection, priority_field=trigger_field)
-    return (
-        _forecast_options_for_field("date", normalised),
-        normalised.get("date"),
-        _forecast_options_for_field("models", normalised),
-        normalised.get("models"),
-        _forecast_options_for_field("pollutants", normalised),
-        normalised.get("pollutants"),
-        _forecast_options_for_field("timeScopes", normalised),
-        normalised.get("timeScopes"),
-        _forecast_options_for_field("regions", normalised),
-        normalised.get("regions"),
-    )
-
-
-@app.callback(
-    [
         Output("forecast-store", "data"),
         Output("selection-message", "children"),
         Output("time-slider", "max"),
@@ -8691,11 +6480,13 @@ def sync_forecast_dropdowns(date, model, pollutant, horizon, region):
         Input("date-dropdown", "value"),
         Input("forecast-playback", "n_intervals"),
         Input("overview-forecast-load", "n_intervals"),
+        Input("forecast-prev-hour", "n_clicks"),
+        Input("forecast-next-hour", "n_clicks"),
     ],
     [State("time-slider", "value"), State("forecast-store", "data")],
     prevent_initial_call=True,
 )
-def load_forecast(active_tab, region, pollutant, time_scope, model, date, _n_intervals, _overview_load, current_time_value, current_store):
+def load_forecast(active_tab, region, pollutant, time_scope, model, date, _n_intervals, _overview_load, _prev_hour, _next_hour, current_time_value, current_store):
     selection = {
         "regions": region,
         "pollutants": pollutant,
@@ -8708,16 +6499,28 @@ def load_forecast(active_tab, region, pollutant, time_scope, model, date, _n_int
 
 
 def _load_forecast_payload(active_tab, selection, trigger, current_time_value, current_store):
+    # Keep the large forecast payload out of the browser unless the Forecast tab is open.
+    # The Overview tab renders its forecast panels by reading CSVs server-side to avoid
+    # Dash "Uploading..." delays caused by shipping big dcc.Store payloads back to the server.
+    if active_tab != "forecast":
+        return no_update, no_update, no_update, no_update, no_update
+
     if current_store and current_store.get("_selection") == selection:
         times = current_store.get("data", {}).get("time", {}).get("forecastTime", [])
         slider_max = max(len(times) - 1, 0)
+        base_index = _forecast_live_base_index(times)
         if trigger == "forecast-playback":
-            slider_value = current_time_value if current_time_value is not None else 0
+            slider_value = current_time_value if current_time_value is not None else base_index
             slider_value += 1
             if slider_value > slider_max:
-                slider_value = 0
-            return no_update, no_update, no_update, slider_value, no_update
-        return no_update, no_update, no_update, no_update, no_update
+                slider_value = base_index
+        elif trigger == "forecast-next-hour":
+            slider_value = min(slider_max, (current_time_value if current_time_value is not None else base_index) + 1)
+        elif trigger == "forecast-prev-hour":
+            slider_value = max(0, (current_time_value if current_time_value is not None else base_index) - 1)
+        else:
+            slider_value = base_index
+        return current_store, "", slider_max, slider_value, _slider_marks(times)
 
     parsed, message = _load_forecast(selection)
     if not parsed:
@@ -8728,13 +6531,18 @@ def _load_forecast_payload(active_tab, selection, trigger, current_time_value, c
 
     times = parsed.get("data", {}).get("time", {}).get("forecastTime", [])
     slider_max = max(len(times) - 1, 0)
+    base_index = _forecast_live_base_index(times)
     if trigger == "forecast-playback":
-        current_value = current_time_value if current_time_value is not None else 0
+        current_value = current_time_value if current_time_value is not None else base_index
         slider_value = current_value + 1
         if slider_value > slider_max:
-            slider_value = 0
+            slider_value = base_index
+    elif trigger == "forecast-next-hour":
+        slider_value = min(slider_max, (current_time_value if current_time_value is not None else base_index) + 1)
+    elif trigger == "forecast-prev-hour":
+        slider_value = max(0, (current_time_value if current_time_value is not None else base_index) - 1)
     else:
-        slider_value = 0
+        slider_value = base_index
 
     return parsed, "", slider_max, slider_value, _slider_marks(times)
 
@@ -8744,65 +6552,8 @@ def _load_forecast_payload(active_tab, selection, trigger, current_time_value, c
     [Input("dashboard-tabs", "value")],
 )
 def toggle_monitor_refresh(active_tab):
-    return False
-
-
-@app.callback(
-    Output("monitor-map-html-store", "data"),
-    [Input("monitor-store", "data")],
-    [State("monitor-map-html-store", "data")],
-)
-def update_monitor_map_html_store(monitor_store, current_html):
-    global _LAST_GOOD_MONITOR_MAP_ROWS, _LAST_GOOD_MONITOR_MAP_HTML
-    monitor_store = monitor_store or {}
-    map_rows = monitor_store.get("mapRows") or []
-    if map_rows:
-        _LAST_GOOD_MONITOR_MAP_ROWS = list(map_rows)
-        next_html = _leaflet_monitoring_map_html(map_rows)
-        if current_html and current_html == next_html:
-            _LAST_GOOD_MONITOR_MAP_HTML = current_html
-            return no_update
-        _LAST_GOOD_MONITOR_MAP_HTML = next_html
-        return next_html
-
-    if current_html:
-        _LAST_GOOD_MONITOR_MAP_HTML = current_html
-        return no_update
-
-    if _LAST_GOOD_MONITOR_MAP_HTML:
-        return _LAST_GOOD_MONITOR_MAP_HTML
-
-    if _LAST_GOOD_MONITOR_MAP_ROWS:
-        _LAST_GOOD_MONITOR_MAP_HTML = _leaflet_monitoring_map_html(_LAST_GOOD_MONITOR_MAP_ROWS)
-        return _LAST_GOOD_MONITOR_MAP_HTML
-
-    return _leaflet_monitoring_map_html([])
-
-
-@app.callback(Output("monitor-map", "srcDoc"), [Input("monitor-map-html-store", "data")])
-def render_monitor_map_srcdoc(map_html):
-    global _LAST_GOOD_MONITOR_MAP_HTML
-    if map_html:
-        _LAST_GOOD_MONITOR_MAP_HTML = map_html
-        return map_html
-    if _LAST_GOOD_MONITOR_MAP_HTML:
-        return _LAST_GOOD_MONITOR_MAP_HTML
-    if _LAST_GOOD_MONITOR_MAP_ROWS:
-        return _leaflet_monitoring_map_html(_LAST_GOOD_MONITOR_MAP_ROWS)
-    return _leaflet_monitoring_map_html([])
-
-
-@app.callback(Output("monitor-map-preload", "srcDoc"), [Input("monitor-map-html-store", "data")])
-def preload_monitor_map(map_html):
-    global _LAST_GOOD_MONITOR_MAP_HTML
-    if map_html:
-        _LAST_GOOD_MONITOR_MAP_HTML = map_html
-        return map_html
-    if _LAST_GOOD_MONITOR_MAP_HTML:
-        return _LAST_GOOD_MONITOR_MAP_HTML
-    elif _LAST_GOOD_MONITOR_MAP_ROWS:
-        return _leaflet_monitoring_map_html(_LAST_GOOD_MONITOR_MAP_ROWS)
-    return _leaflet_monitoring_map_html([])
+    # Only refresh monitoring feeds when the Monitoring tab is open.
+    return active_tab != "monitor"
 
 
 @app.callback(
@@ -8814,24 +6565,28 @@ def preload_monitor_map(map_html):
         Input("overview-monitor-load", "n_intervals"),
     ],
     [State("monitor-store", "data")],
+    prevent_initial_call=True,
 )
 def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_load, current_store):
-    global _LAST_GOOD_MONITOR_MAP_ROWS
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    on_monitor = True
-    on_overview_snapshot = True
-    include_history = trigger == "monitor-refresh"
-    monitor_settings = _as_dict(monitor_settings)
-    current_store = _as_dict(current_store)
+    # Refresh rules:
+    # - Monitoring tab: refresh on its normal interval / setting changes.
+    # - Overview tab: run a single AQMS-only snapshot shortly after first paint
+    #   (driven by `overview-monitor-load`).
+    on_monitor = active_tab == "monitor"
+    on_overview_snapshot = active_tab == "overview" and (_overview_load is not None)
+    if not on_monitor and not on_overview_snapshot:
+        return no_update
+    monitor_settings = monitor_settings or {}
     pollutant_label = (monitor_settings.get("pollutant") or "PM2.5").strip()
     source_filter = (monitor_settings.get("source") or "both").strip().lower()
 
     # module-level snapshot accessed via globals() to avoid local/global parsing issues
 
-    # Overview snapshot: AQMS only (no PurpleAir) so the top-left status card always has data.
+    # Overview snapshot: keep AQMS rows for status cards, but load both sensor
+    # layers so the observation map can show AQMS, DustWatch, and PurpleAir.
     if on_overview_snapshot and not on_monitor:
         pollutant_label = "PM2.5"
-        source_filter = "aqms"
+        source_filter = "both"
 
     pollutant_meta = POLLUTANTS.get(pollutant_label) or {}
     parameter_code = pollutant_meta.get("ParameterCode") or pollutant_label
@@ -8839,7 +6594,7 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     status_bits = []
     error = None
     try:
-        raw_obs = fetch_observations(query=None, timeout=25)
+        raw_obs = fetch_observations(query=None, timeout=12)
         status_bits.append("AQMS feed: Live")
         aqms_ok = True
     except Exception as exc:
@@ -8850,14 +6605,12 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
 
     purpleair_bounds = NSW_MAP_BOUNDS
     purpleair_payload = {"sensors": [], "fetched_at": None, "error": None}
-    if on_monitor or on_overview_snapshot:
+    if source_filter in {"both", "purpleair"} and pollutant_label in {"PM2.5", "PM10"}:
         purpleair_payload = fetch_purpleair_snapshot(bounds=purpleair_bounds, timeout=12)
         if purpleair_payload.get("error"):
             status_bits.append("PurpleAir feed: Offline")
             if error is None:
                 error = f"PurpleAir feed unavailable: {purpleair_payload.get('error')}"
-        elif purpleair_payload.get("source") in {"bundle", "cache"}:
-            status_bits.append("PurpleAir feed: Cached")
         else:
             status_bits.append("PurpleAir feed: Live")
     else:
@@ -8871,38 +6624,17 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     aqms_no2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["NO2"]["ParameterCode"], "NO2")
     aqms_so2_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["SO2"]["ParameterCode"], "SO2")
     aqms_co_rows = _aqms_rows_for_pollutant(raw_obs, POLLUTANTS["CO"]["ParameterCode"], "CO")
-    # Optional nitrogen parameters (not always present in the AQMS feed).
-    aqms_no_rows = _aqms_rows_for_pollutant(raw_obs, "NO", "NO")
-    aqms_nox_rows = _aqms_rows_for_pollutant(raw_obs, "NOX", "NOX")
+    dustwatch_pm25_rows = _aqms_rows_for_pollutant(raw_obs, "PM2.5d", "PM2.5", source_label="DustWatch")
+    dustwatch_pm10_rows = _aqms_rows_for_pollutant(raw_obs, "PM10d", "PM10", source_label="DustWatch")
     # Always compute site-level AQC (Air Quality Category) rows for the Overview tab.
     aqc_rows = _aqms_rows_for_pollutant(raw_obs, "AQC", "AQC")
-    aqms_history_rows = []
-    if include_history and raw_obs:
-        try:
-            history_site_ids = sorted({int(item.get("Site_Id")) for item in raw_obs if item.get("Site_Id") is not None})
-        except Exception:
-            history_site_ids = []
-        history_parameter_codes = []
-        for pollutant_name in ["PM2.5", "PM10", "O3", "CO", "NO", "NO2", "NOX"]:
-            code = (POLLUTANTS.get(pollutant_name) or {}).get("ParameterCode") or pollutant_name
-            if code and code not in history_parameter_codes:
-                history_parameter_codes.append(code)
-        if history_site_ids and history_parameter_codes:
-            now = datetime.now(SYDNEY_TZ)
-            start_date = (now.date() - timedelta(days=1)).isoformat()
-            end_date = now.date().isoformat()
-            try:
-                aqms_history_rows = fetch_observation_history(history_site_ids, history_parameter_codes, start_date, end_date, timeout=12)
-            except Exception:
-                aqms_history_rows = []
-    aqms_previous_by_site = _aqms_previous_hour_values_by_site(raw_obs, aqms_history_rows)
 
     # Meteorology-capable AQMS sites (from latest snapshot, used to keep history calls small).
     met_site_ids_by_region = {}
     try:
         wanted_met = {"TEMP", "HUMID", "WSP", "RAIN"}
         for item in raw_obs or []:
-            param = _aqms_parameter(item)
+            param = item.get("Parameter") or {}
             code = str(param.get("ParameterCode") or "").strip()
             if code not in wanted_met:
                 continue
@@ -8922,32 +6654,15 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     purpleair_sensors = _purpleair_rows_for_pollutant(purpleair_payload.get("sensors") or [], pollutant_label)
     clusters = purpleair_clusters(purpleair_payload.get("sensors") or [], pollutant_label=pollutant_label) if purpleair_sensors else []
 
-    aqms_map_rows = _aqms_station_map_rows(
-        {
-            "PM2.5": aqms_pm25_rows,
-            "PM10": aqms_pm10_rows,
-            "O3": aqms_o3_rows,
-            "NO2": aqms_no2_rows,
-            "NO": aqms_no_rows,
-            "NOX": aqms_nox_rows,
-            "SO2": aqms_so2_rows,
-            "CO": aqms_co_rows,
-            "AQC": aqc_rows,
-        },
-        selected_pollutant=pollutant_label,
-    )
-
     map_rows = []
     if source_filter in {"both", "aqms"}:
-        map_rows.extend(aqms_map_rows)
+        map_rows.extend(aqms_rows)
+        if pollutant_label == "PM2.5":
+            map_rows.extend(dustwatch_pm25_rows)
+        elif pollutant_label == "PM10":
+            map_rows.extend(dustwatch_pm10_rows)
     if source_filter in {"both", "purpleair"}:
-        map_rows.extend(purpleair_sensors)
-    if map_rows:
-        _LAST_GOOD_MONITOR_MAP_ROWS = list(map_rows)
-    elif current_store and current_store.get("mapRows"):
-        map_rows = current_store.get("mapRows") or []
-    elif _LAST_GOOD_MONITOR_MAP_ROWS:
-        map_rows = list(_LAST_GOOD_MONITOR_MAP_ROWS)
+        map_rows.extend(purpleair_sensors or load_purpleair_sensors())
 
     # Convenience: snapshot per-site for station detail panels.
     aqms_snapshot_by_site = {}
@@ -8955,9 +6670,7 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         "PM2.5": aqms_pm25_rows,
         "PM10": aqms_pm10_rows,
         "O3": aqms_o3_rows,
-        "NO": aqms_no_rows,
         "NO2": aqms_no2_rows,
-        "NOX": aqms_nox_rows,
         "SO2": aqms_so2_rows,
         "CO": aqms_co_rows,
         "AQC": aqc_rows,
@@ -9006,8 +6719,8 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     latest_label = _format_monitor_label(_monitoring_time_row(aqms_rows)) if aqms_rows else "--"
     completeness = _data_completeness(aqms_rows, purpleair_sensors if source_filter in {"both", "purpleair"} else [])
     kpis = _monitor_kpi_payload(aqms_rows, purpleair_sensors, clusters, latest_label, completeness)
-    table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site, max_rows=40)
-    table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, aqms_previous_by_site)
+    table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, max_rows=40)
+    table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site)
     feeds = {
         "aqms": {"status": "Live" if aqms_ok else "Offline"},
         "purpleair": {"status": "Live" if not purpleair_payload.get("error") else "Offline"},
@@ -9066,15 +6779,13 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         "aqmsPm10Rows": aqms_pm10_rows,
         "aqmsO3Rows": aqms_o3_rows,
         "aqmsNo2Rows": aqms_no2_rows,
-        "aqmsNoRows": aqms_no_rows,
-        "aqmsNoxRows": aqms_nox_rows,
         "aqmsSo2Rows": aqms_so2_rows,
         "aqmsCoRows": aqms_co_rows,
+        "dustwatchPm25Rows": dustwatch_pm25_rows,
+        "dustwatchPm10Rows": dustwatch_pm10_rows,
         "aqcRows": aqc_rows,
         "metSiteIdsByRegion": {k: sorted(list(v)) for k, v in (met_site_ids_by_region or {}).items()},
         "aqmsSnapshotBySite": aqms_snapshot_by_site,
-        "aqmsPreviousBySite": aqms_previous_by_site,
-        "purpleairSnapshot": purpleair_payload,
         "purpleairSensors": purpleair_sensors,
         "purpleairClusters": clusters,
         "mapRows": map_rows,
@@ -9103,7 +6814,7 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     [State("monitor-settings-store", "data")],
 )
 def sync_monitor_settings(region_value, station_key, pollutant_label, source_filter, window_value, categories_value, search_value, current_settings):
-    settings = dict(_as_dict(current_settings))
+    settings = dict(current_settings or {})
     if region_value is not None:
         settings["region"] = str(region_value).strip() or "ALL"
     if station_key is not None or "stationKey" in settings:
@@ -9121,7 +6832,7 @@ def sync_monitor_settings(region_value, station_key, pollutant_label, source_fil
     if "source" not in settings or not settings["source"]:
         settings["source"] = "both"
     if "region" not in settings or not settings["region"]:
-        settings["region"] = MONITOR_DEFAULT_REGION
+        settings["region"] = "ALL"
     if "window" not in settings or not settings["window"]:
         settings["window"] = "24h"
     return settings
@@ -9185,9 +6896,9 @@ def update_monitor_station_options(monitor_store, region_value, source_value, se
 
 @app.callback(
     [
+        Output("monitor-map", "srcDoc"),
         Output("monitor-kpi-row", "children"),
         Output("monitor-time-label", "children"),
-        Output("monitor-outlook-time", "children"),
         Output("monitor-table", "data"),
         Output("monitor-table", "style_data_conditional"),
         Output("monitor-network-status", "children"),
@@ -9198,21 +6909,18 @@ def update_monitor_station_options(monitor_store, region_value, source_value, se
     [Input("monitor-store", "data"), Input("monitor-settings-store", "data")],
 )
 def render_monitoring(monitor_store, monitor_settings):
-    monitor_store = _as_dict(monitor_store)
-    monitor_settings = _as_dict(monitor_settings)
+    monitor_store = monitor_store or {}
+    monitor_settings = monitor_settings or {}
+    map_rows = monitor_store.get("mapRows") or []
     kpis = monitor_store.get("kpis") or {}
     table_rows = monitor_store.get("tableRows") or []
     table_rows_all = monitor_store.get("tableRowsAll") or []
     feeds = monitor_store.get("feeds") or {}
     latest_label = monitor_store.get("latestLabel") or "--"
-    latest_display_label = latest_label
-    if _monitor_data_is_stale(monitor_store) and latest_label != "--":
-        latest_display_label = f"Last cached: {latest_label}"
     status = monitor_store.get("status") or "Monitoring feed is loading."
     error = monitor_store.get("error")
 
-    region_value = str(monitor_settings.get("region") or MONITOR_DEFAULT_REGION).strip()
-    source_value = str(monitor_settings.get("source") or "both").strip().lower()
+    region_value = str(monitor_settings.get("region") or "ALL").strip()
     categories_value = set([str(v).strip() for v in (monitor_settings.get("categories") or []) if v is not None])
     search_value = normalize_station_name(monitor_settings.get("search") or "")
 
@@ -9230,26 +6938,21 @@ def render_monitoring(monitor_store, monitor_settings):
         return True
 
     # Re-attach arrows to table rows using latest snapshot info, then apply filters.
-    # Build the compact outlook table from the full row set, not the pre-trimmed
-    # store sample, so AQMS stations in the selected region are not dropped before
-    # region/category/search filters run.
-    table_rows_all = _attach_arrows_to_table_rows(table_rows_all, monitor_store.get("aqmsSnapshotBySite"), monitor_store.get("aqmsPreviousBySite"))
-    table_rows_all = _inject_badges_into_monitor_rows(table_rows_all)
+    table_rows = _attach_arrows_to_table_rows(table_rows, monitor_store.get("aqmsSnapshotBySite"))
+    table_rows_all = _attach_arrows_to_table_rows(table_rows_all, monitor_store.get("aqmsSnapshotBySite"))
+    map_rows = [row for row in map_rows if _match_station(row)]
+    table_rows = [row for row in table_rows if _match_station(row)]
     table_rows_all = [row for row in table_rows_all if _match_station(row)]
-    compact_seed_rows = [row for row in table_rows_all if not row.get("is_placeholder")]
-    if not compact_seed_rows:
-        compact_seed_rows = table_rows_all
-    table_rows = _ordered_monitor_outlook_rows(compact_seed_rows, source_value=source_value, compact=True, max_rows=12)
-    table_rows_all = _ordered_monitor_outlook_rows(table_rows_all, source_value=source_value)
 
+    map_html = _leaflet_monitoring_map_html(map_rows)
     kpi_nodes = _monitor_kpi_cards(kpis)
     style_conditional = _monitor_table_styles()
     style_conditional_all = _monitor_table_styles()
     network_nodes = _monitor_network_nodes(feeds)
     return (
+        map_html,
         kpi_nodes,
-        latest_display_label,
-        latest_display_label,
+        latest_label,
         table_rows,
         style_conditional,
         network_nodes,
@@ -9257,6 +6960,29 @@ def render_monitoring(monitor_store, monitor_settings):
         table_rows_all,
         style_conditional_all,
     )
+
+
+@app.callback(
+    Output("overview-observation-map", "srcDoc"),
+    [Input("monitor-store", "data"), Input("overview-observation-map-pollutant", "value")],
+)
+def render_overview_observation_map(monitor_store, pollutant_label):
+    monitor_store = monitor_store or {}
+    pollutant_label = (pollutant_label or "PM2.5").strip()
+    rows = []
+    if pollutant_label == "PM2.5":
+        rows.extend(monitor_store.get("aqmsPm25Rows") or [])
+        rows.extend(monitor_store.get("dustwatchPm25Rows") or [])
+        rows.extend(monitor_store.get("purpleairSensors") or [])
+    elif pollutant_label == "PM10":
+        rows.extend(monitor_store.get("aqmsPm10Rows") or [])
+        rows.extend(monitor_store.get("dustwatchPm10Rows") or [])
+        rows.extend(monitor_store.get("purpleairSensors") or [])
+    elif pollutant_label == "O3":
+        rows.extend(monitor_store.get("aqmsO3Rows") or [])
+    if not rows:
+        rows = monitor_store.get("mapRows") or []
+    return _leaflet_monitoring_map_html(rows)
 
 
 def _overview_pick_multi_region_forecast_selection(selection):
@@ -9326,8 +7052,9 @@ def render_overview_next_hour_forecast_map(
     next_clicks,
     current_index,
 ):
-    global _LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML
+    print(f"DEBUG: render_overview_next_hour_forecast_map called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
+        print("DEBUG: render_overview_next_hour_forecast_map early exit (not overview)", flush=True)
         return no_update, no_update, no_update
 
     selection = {
@@ -9453,9 +7180,11 @@ def render_overview_next_hour_forecast_map(
     # Determine trigger to see which control fired
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
 
-    # Reset index to 0 when core selection inputs change
+    live_base_index, has_upcoming_forecast = _forecast_live_base_state(times)
+
+    # Reset to the live/upcoming forecast hour when core selection inputs change.
     if trigger in ("dashboard-tabs", "region-dropdown", "time-dropdown", "model-dropdown", "date-dropdown", "overview-forecast-load", "overview-forecast-map-pollutant"):
-        new_index = 0
+        new_index = live_base_index
     else:
         new_index = current_index
 
@@ -9470,13 +7199,9 @@ def render_overview_next_hour_forecast_map(
     if times and new_index >= len(times):
         new_index = max(0, len(times) - 1)
 
+    # Create map HTML for selected index
     time_index = new_index if times else 0
-    if merged_stations:
-        map_html = _leaflet_forecast_map_html(merged_parsed, pollutant, time_index, include_series=False)
-        _LAST_GOOD_OVERVIEW_FORECAST_MAP_HTML = map_html
-        map_output = map_html
-    else:
-        map_output = no_update
+    map_html = _leaflet_forecast_map_html(merged_parsed if merged_stations else {}, pollutant, time_index, include_series=False)
 
     # Build user-facing label (show only the timestamp in uppercase, larger font)
     label_el = ""
@@ -9486,11 +7211,13 @@ def render_overview_next_hour_forecast_map(
         if parsed_dt:
             hour = parsed_dt.strftime("%I").lstrip("0") or "0"
             label_text = f"{parsed_dt.strftime('%b').upper()} {parsed_dt.day} {hour}{parsed_dt.strftime('%p')}"
+            if not has_upcoming_forecast:
+                label_text = f"LATEST AVAILABLE {label_text}"
             label_el = html.Div(label_text, style={"fontSize": "1.25rem", "fontWeight": "700", "letterSpacing": "0.5px"})
     else:
         label_el = html.Div("", className="card-hint")
 
-    return map_output, label_el, new_index
+    return map_html, label_el, new_index
 
 
 @app.callback(
@@ -9507,7 +7234,9 @@ def render_overview_next_hour_forecast_map(
     ],
 )
 def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_scope, model, date, _overview_load, overview_pollutant):
+    print(f"DEBUG: render_overview_next_hour_station_panel called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
+        print("DEBUG: render_overview_next_hour_station_panel early exit (not overview)", flush=True)
         return no_update
 
     params = _parse_hash_params(url_hash)
@@ -9532,6 +7261,8 @@ def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_s
 
     next_time_value = None
     found_val = None
+    forecast_hour_index = 0
+    has_upcoming_forecast = True
     for region_name_candidate in regions or []:
         file_path = forecast_file_path(
             [
@@ -9554,8 +7285,9 @@ def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_s
         if next_time_value is None:
             times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
             if times:
-                next_time_value = times[0]
-        _name, found_val = _find_station_forecast_value(parsed, station_key, hour_index=0)
+                forecast_hour_index, has_upcoming_forecast = _forecast_live_base_state(times)
+                next_time_value = times[max(0, min(forecast_hour_index, len(times) - 1))]
+        _name, found_val = _find_station_forecast_value(parsed, station_key, hour_index=forecast_hour_index)
         if _name is not None:
             break
 
@@ -9563,6 +7295,8 @@ def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_s
     if dt:
         hour = dt.strftime("%I").lstrip("0") or "0"
         time_label = f"{dt.strftime('%b')} {dt.day} {hour}{dt.strftime('%p')}"
+        if not has_upcoming_forecast:
+            time_label = f"Latest available {time_label}"
     else:
         time_label = ""
 
@@ -9634,7 +7368,9 @@ def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_s
     ],
 )
 def render_overview_next3_diamonds(active_tab, region, time_scope, model, date, _overview_load):
+    print(f"DEBUG: render_overview_next3_diamonds called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
+        print("DEBUG: render_overview_next3_diamonds early exit (not overview)", flush=True)
         return no_update, no_update
 
     selection = {
@@ -9645,64 +7381,7 @@ def render_overview_next3_diamonds(active_tab, region, time_scope, model, date, 
         "date": date or DEFAULT_SELECTION.get("date"),
     }
 
-    time_labels, rows = _overview_next3_values(selection)
-
-    max_cols = 2
-
-    # Header hour labels.
-    hours_pretty = []
-    for ts in time_labels or []:
-        hours_pretty.append(_forecast_hour_label(ts))
-
-    units_by_pollutant = {k: (POLLUTANTS.get(k) or {}).get("Units") or "" for k in ["PM2.5", "PM10", "O3"]}
-
-    grid_children = []
-    grid_children.append(html.Div("", className="overview-next2__corner"))
-    for label in (hours_pretty or ["--"] * max_cols)[:max_cols]:
-        grid_children.append(html.Div(label, className="overview-next2__hour"))
-
-    for row in rows or []:
-        pollutant = row.get("pollutant") or "--"
-        units = units_by_pollutant.get(pollutant) or ""
-        grid_children.append(
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(pollutant, className="overview-next2__pollutant-name"),
-                            html.Div(units, className="overview-next2__pollutant-unit"),
-                        ]
-                    ),
-                ],
-                className="overview-next2__pollutant",
-            )
-        )
-
-        values = (row.get("values") or [])[:max_cols]
-        stations = (row.get("stations") or [])[:max_cols]
-        while len(values) < max_cols:
-            values.append(None)
-        while len(stations) < max_cols:
-            stations.append(None)
-
-        for idx in range(max_cols):
-            val = values[idx]
-            station_label = title_case_station_name(stations[idx]) if stations[idx] else "--"
-            category_key, colour = category_for_value(pollutant, val)
-            category_label = str(category_key or "no-data").replace("-", " ").title()
-            value_text = "--" if val is None else f"{float(val):.1f}"
-            grid_children.append(
-                html.Div(
-                    [
-                        html.Div(station_label, className="overview-next2__station"),
-                        html.Div(category_label, className="overview-next2__category", style={"backgroundColor": colour}),
-                        html.Div(f"{value_text} {units}".strip(), className="overview-next2__value"),
-                    ],
-                    className="overview-next2__card",
-                )
-            )
-
-    return html.Div(grid_children, className="overview-next2-grid"), ""
+    return _overview_station_outlook(selection)
 
 
 def _overview_allstations_multi_hour_rows(selection, hours=3):
@@ -9733,7 +7412,6 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
     rows = []
     station_index = {}
     time_labels = []
-    base_index = 0
 
     def _ensure_row(station_name, region_name):
         station_norm = normalize_station_name(station_name)
@@ -9808,8 +7486,7 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
             if not time_labels:
                 times = ((parsed.get("data") or {}).get("time") or {}).get("forecastTime") or []
                 if times:
-                    time_labels = list(times)
-                    base_index = _forecast_live_base_index(time_labels)
+                    time_labels = list(times[:hours])
 
             stations = ((parsed.get("data") or {}).get("stations") or {})
             for station_name, payload in stations.items():
@@ -9819,9 +7496,8 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
                 series = (payload or {}).get("forecastValue") or []
                 for hour_idx in range(hours):
                     value_num = None
-                    source_idx = base_index + hour_idx
-                    if source_idx < len(series):
-                        value_num = _coerce_float(series[source_idx])
+                    if hour_idx < len(series):
+                        value_num = _coerce_float(series[hour_idx])
                     col = f"h{hour_idx + 1}_{p_key}"
                     cat_col = f"h{hour_idx + 1}_{p_key}_cat"
                     if value_num is None:
@@ -9834,10 +7510,12 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
 
     pretty_labels = []
     for idx in range(hours):
-        time_idx = base_index + idx
-        if time_idx < len(time_labels):
-            pretty_labels.append(_forecast_hour_label(time_labels[time_idx]))
-            continue
+        if idx < len(time_labels):
+            dt = _parse_forecast_timestamp(time_labels[idx])
+            if dt:
+                hour = dt.strftime("%I").lstrip("0") or "0"
+                pretty_labels.append(f"{hour}{dt.strftime('%p')}")
+                continue
         pretty_labels.append(f"+{idx + 1}h")
 
     columns = [
@@ -9876,17 +7554,12 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
         Input("overview-forecast-load", "n_intervals"),
         Input("overview-open-allstations", "n_clicks"),
     ],
-    [State("overview-allstations-overlay", "style")],
 )
-def render_overview_next2_allstations(active_tab, region, time_scope, model, date, _overview_load, open_allstations_clicks, overlay_style):
+def render_overview_next2_allstations(active_tab, region, time_scope, model, date, _overview_load, open_allstations_clicks):
     # Populate when either the (now-removed) All-stations tab is active or the
     # overlay open button was clicked.
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    overlay_style = overlay_style or {}
-    overlay_is_open = overlay_style.get("display") not in (None, "", "none")
-    if active_tab not in {"overview", "allstations"}:
-        return no_update, no_update
-    if trigger != "overview-open-allstations" and not overlay_is_open:
+    if active_tab != "allstations" and trigger != "overview-open-allstations":
         return no_update, no_update
     selection = {
         "regions": region or DEFAULT_SELECTION.get("regions"),
@@ -9895,7 +7568,8 @@ def render_overview_next2_allstations(active_tab, region, time_scope, model, dat
         "models": model or DEFAULT_SELECTION.get("models"),
         "date": date or DEFAULT_SELECTION.get("date"),
     }
-    return _overview_allstations_multi_hour_rows(selection, hours=2)
+    # return columns and rows for offsets +1h, +3h, +6h, +12h
+    return _overview_allstations_offsets_rows(selection, offsets=(1, 3, 6, 12))
 
 
 @app.callback(
@@ -9911,7 +7585,7 @@ def render_overview_pm25_regions(monitor_store):
     monitor_store = monitor_store or {}
     error = monitor_store.get("error")
     latest_label = monitor_store.get("latestLabel") or "--"
-    title = f"Regional Air Quality at {latest_label}" if latest_label and latest_label != "--" else "Regional Air Quality"
+    title = f"Regional Observed @ {latest_label}" if latest_label and latest_label != "--" else "Regional Observed"
 
     region_rows = _overview_multi_pollutant_region_rows(monitor_store)
 
@@ -9968,6 +7642,24 @@ def render_overview_pm25_regions(monitor_store):
 
 
 @app.callback(
+    Output("overview-observed-grid", "children"),
+    [Input("monitor-store", "data")],
+)
+def render_overview_observed_grid(monitor_store):
+    monitor_store = monitor_store or {}
+    rows_by_pollutant = {
+        "PM2.5": _overview_region_pollutant_summary_rows(monitor_store.get("aqmsPm25Rows") or [], "PM2.5"),
+        "PM10": _overview_region_pollutant_summary_rows(monitor_store.get("aqmsPm10Rows") or [], "PM10"),
+        "O3": _overview_region_pollutant_summary_rows(monitor_store.get("aqmsO3Rows") or [], "O3"),
+    }
+    sections = []
+    for pollutant, rows in rows_by_pollutant.items():
+        rows = sorted(rows or [], key=lambda item: title_case_station_name(str(item.get("region") or "")))
+        sections.append(_overview_region_bar_section(pollutant, rows, "No observed data available."))
+    return sections
+
+
+@app.callback(
     Output("overview-pm25-other", "children"),
     [Input("overview-pm25-region-dropdown", "value")],
     [State("monitor-store", "data")],
@@ -10020,238 +7712,212 @@ def render_overview_pm25_other(selected_region, monitor_store):
 
 @app.callback(Output("overview-nsw-air-quality-updated", "children"), [Input("monitor-store", "data")])
 def render_overview_nsw_air_quality_updated(monitor_store):
-    return _monitor_updated_label(monitor_store)
+    monitor_store = monitor_store or {}
+    rows = monitor_store.get("aqmsPm25Rows") or []
+    latest = _monitoring_time_row(rows)
+    if not latest:
+        error = monitor_store.get("error")
+        if error:
+            return "@ -- (AQMS feed offline)"
+        return "@ -- (loading)"
+    hour_desc = latest.get("hour_description") or "--"
+    date_value = str(latest.get("date") or "").strip()
+    date_label = date_value or "--"
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            date_label = datetime.strptime(date_value, fmt).strftime("%d %b %Y").lstrip("0")
+            break
+        except (TypeError, ValueError):
+            continue
+    return f"@ {hour_desc} / {date_label}"
 
 
-@app.callback(Output("overview-nsw-region-options", "data"), [Input("monitor-store", "data")], prevent_initial_call=True)
-def sync_overview_nsw_region_options(monitor_store):
-    return _overview_nsw_region_options(monitor_store)
-
-
-@app.callback(Output("overview-nsw-summary-store", "data"), [Input("monitor-store", "data")], prevent_initial_call=True)
-def sync_overview_nsw_summary_store(monitor_store):
-    return _overview_nsw_summary_data(monitor_store)
-
-
-app.clientside_callback(
-    """
-    function(prevClicks, nextClicks, options, currentIndex) {
-        const ctx = dash_clientside.callback_context;
-        const count = Array.isArray(options) && options.length ? options.length : 1;
-        let idx = Number.isFinite(Number(currentIndex)) ? Number(currentIndex) : 0;
-        if (!ctx.triggered.length) {
-            return Math.max(0, Math.min(idx, count - 1));
-        }
-        const prop = ctx.triggered[0].prop_id || "";
-        if (prop.indexOf("overview-nsw-region-prev") === 0) {
-            idx = (idx - 1 + count) % count;
-        } else if (prop.indexOf("overview-nsw-region-next") === 0) {
-            idx = (idx + 1) % count;
-        }
-        return Math.max(0, Math.min(idx, count - 1));
-    }
-    """,
+@app.callback(
     Output("overview-nsw-region-index", "data"),
-    [Input("overview-nsw-region-prev", "n_clicks"), Input("overview-nsw-region-next", "n_clicks"), Input("overview-nsw-region-options", "data")],
-    [State("overview-nsw-region-index", "data")],
+    [
+        Input("overview-nsw-region-prev", "n_clicks"),
+        Input("overview-nsw-region-next", "n_clicks"),
+        Input("overview-region-autoplay", "n_intervals"),
+    ],
+    [State("monitor-store", "data"), State("overview-nsw-region-index", "data")],
+    prevent_initial_call=True,
 )
+def cycle_overview_nsw_region(_prev_clicks, _next_clicks, _autoplay_intervals, monitor_store, current_index):
+    """Cycle the Overview status card between All NSW and individual regions."""
+    monitor_store = monitor_store or {}
+    # Aggregate available AQMS pollutant rows so station lists include sites present in any pollutant feed
+    pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
+    pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
+    o3_rows_all = monitor_store.get("aqmsO3Rows") or []
+    combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
+    latest = _monitoring_time_row(combined_rows)
+    date_val = latest.get("date")
+    hour_val = latest.get("hour")
+    latest_rows = [row for row in pm25_rows_all if row.get("date") == date_val and row.get("hour") == hour_val]
+    regions = sorted({str(row.get("region") or "").strip() for row in latest_rows if str(row.get("region") or "").strip()})
+    count = 1 + len(regions)  # +1 for All NSW
+    if count <= 0:
+        return 0
+
+    try:
+        idx = int(current_index or 0)
+    except (TypeError, ValueError):
+        idx = 0
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    # Determine new NSW index depending on which control triggered (master controls only)
+    if trigger == "overview-nsw-region-prev":
+        idx = (idx - 1) % count
+    elif trigger == "overview-nsw-region-next":
+        idx = (idx + 1) % count
+    elif trigger == "overview-region-autoplay":
+        idx = (idx + 1) % count
+    else:
+        idx = max(0, min(idx, count - 1))
+
+    # Map internal All NSW (index 0) to display name 'NSW'
+    return idx
 
 
-app.clientside_callback(
-    """
-    function(regionIndex, options) {
-        const opts = Array.isArray(options) && options.length ? options : [{name: "NSW", stations: []}];
-        const idx = Math.max(0, Math.min(Number(regionIndex) || 0, opts.length - 1));
-        return opts[idx].name || "NSW";
-    }
-    """,
-    Output("overview-nsw-region-name", "children"),
-    [Input("overview-nsw-region-index", "data"), Input("overview-nsw-region-options", "data")],
-)
-
-
-app.clientside_callback(
-    """
-    function(prevClicks, nextClicks, nswRegionIndex, options, currentIndex) {
-        const ctx = dash_clientside.callback_context;
-        const opts = Array.isArray(options) && options.length ? options : [{name: "NSW"}];
-        const count = opts.length || 1;
-        let idx = Number.isFinite(Number(currentIndex)) ? Number(currentIndex) : 0;
-        if (!ctx.triggered.length) {
-            return Math.max(0, Math.min(idx, count - 1));
-        }
-        const prop = ctx.triggered[0].prop_id || "";
-        if (prop.indexOf("overview-nsw-region-index") === 0) {
-            return Math.max(0, Math.min(Number(nswRegionIndex) || 0, count - 1));
-        }
-        if (prop.indexOf("overview-met-region-prev") === 0) {
-            idx = (idx - 1 + count) % count;
-        } else if (prop.indexOf("overview-met-region-next") === 0) {
-            idx = (idx + 1) % count;
-        }
-        return Math.max(0, Math.min(idx, count - 1));
-    }
-    """,
-    Output("overview-met-region-index", "data"),
+@app.callback(
+    [Output("overview-met-region-index", "data"), Output("overview-met-region-name", "children")],
     [
         Input("overview-met-region-prev", "n_clicks"),
         Input("overview-met-region-next", "n_clicks"),
-        Input("overview-nsw-region-index", "data"),
-        Input("overview-nsw-region-options", "data"),
+        Input("overview-nsw-region-prev", "n_clicks"),
+        Input("overview-nsw-region-next", "n_clicks"),
+        Input("overview-region-autoplay", "n_intervals"),
+        Input("dashboard-tabs", "value"),
     ],
-    [State("overview-met-region-index", "data")],
+    [State("monitor-store", "data"), State("overview-met-region-index", "data")],
+    prevent_initial_call=True,
 )
+def cycle_overview_met_region(_prev_clicks, _next_clicks, _nsw_prev, _nsw_next, _autoplay_intervals, active_tab, monitor_store, current_index):
+    """Manage the meteorology panel region selection independently, but respond to master nav."""
+    if active_tab != "overview":
+        return current_index or 0, dash.no_update
+
+    monitor_store = monitor_store or {}
+    pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
+    pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
+    o3_rows_all = monitor_store.get("aqmsO3Rows") or []
+    combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
+    latest = _monitoring_time_row(combined_rows)
+    if not latest:
+        return current_index or 0, "NSW"
+    date_val = latest.get("date")
+    hour_val = latest.get("hour")
+    latest_rows = [row for row in pm25_rows_all if row.get("date") == date_val and row.get("hour") == hour_val]
+    regions = sorted({str(row.get("region") or "").strip() for row in latest_rows if str(row.get("region") or "").strip()})
+    count = 1 + len(regions)
+
+    try:
+        idx = int(current_index or 0)
+    except Exception:
+        idx = 0
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    if trigger == "overview-met-region-prev":
+        idx = (idx - 1) % count
+    elif trigger == "overview-met-region-next":
+        idx = (idx + 1) % count
+    elif trigger == "overview-nsw-region-prev":
+        idx = (idx - 1) % count
+    elif trigger == "overview-nsw-region-next":
+        idx = (idx + 1) % count
+    elif trigger == "overview-region-autoplay":
+        idx = (idx + 1) % count
+    else:
+        idx = max(0, min(idx, count - 1))
+
+    try:
+        display = "NSW" if idx <= 0 else (regions[idx - 1] if (idx - 1) < len(regions) else "NSW")
+    except Exception:
+        display = "NSW"
+
+    return idx, display
 
 
-app.clientside_callback(
-    """
-    function(regionIndex, options) {
-        const opts = Array.isArray(options) && options.length ? options : [{name: "NSW"}];
-        const idx = Math.max(0, Math.min(Number(regionIndex) || 0, opts.length - 1));
-        return opts[idx].name || "NSW";
-    }
-    """,
-    Output("overview-met-region-name", "children"),
-    [Input("overview-met-region-index", "data"), Input("overview-nsw-region-options", "data")],
-)
-
-
-app.clientside_callback(
-    """
-    function(prevClicks, nextClicks, regionIndex, options, currentIndex) {
-        const ctx = dash_clientside.callback_context;
-        const opts = Array.isArray(options) && options.length ? options : [{name: "NSW", stations: []}];
-        const regionIdx = Math.max(0, Math.min(Number(regionIndex) || 0, opts.length - 1));
-        const stations = Array.isArray(opts[regionIdx].stations) ? opts[regionIdx].stations : [];
-        const count = stations.length || 1;
-        let idx = Number.isFinite(Number(currentIndex)) ? Number(currentIndex) : 0;
-        if (!ctx.triggered.length) {
-            return Math.max(0, Math.min(idx, count - 1));
-        }
-        const prop = ctx.triggered[0].prop_id || "";
-        if (prop.indexOf("overview-nsw-region-index") === 0 || prop.indexOf("overview-nsw-region-options") === 0) {
-            return 0;
-        }
-        if (prop.indexOf("overview-nsw-station-prev") === 0) {
-            idx = (idx - 1 + count) % count;
-        } else if (prop.indexOf("overview-nsw-station-next") === 0) {
-            idx = (idx + 1) % count;
-        }
-        return Math.max(0, Math.min(idx, count - 1));
-    }
-    """,
+@app.callback(
     Output("overview-nsw-station-index", "data"),
     [
         Input("overview-nsw-station-prev", "n_clicks"),
         Input("overview-nsw-station-next", "n_clicks"),
         Input("overview-nsw-region-index", "data"),
-        Input("overview-nsw-region-options", "data"),
     ],
-    [State("overview-nsw-station-index", "data")],
+    [State("monitor-store", "data"), State("overview-nsw-station-index", "data")],
+    prevent_initial_call=True,
 )
+def cycle_overview_nsw_station(_prev, _next, region_index, monitor_store, current_index):
+    """Cycle stations within the selected region."""
+    monitor_store = monitor_store or {}
+    pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
+    pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
+    o3_rows_all = monitor_store.get("aqmsO3Rows") or []
+    combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
+    latest = _monitoring_time_row(combined_rows)
+    if not latest:
+        return 0
+    date_val = latest.get("date")
+    hour_val = latest.get("hour")
+    latest_rows = [r for r in combined_rows if r.get("date") == date_val and r.get("hour") == hour_val]
+    regions = sorted({str(r.get("region") or "").strip() for r in latest_rows if str(r.get("region") or "").strip()})
 
+    try:
+        idx_reg = int(region_index or 0)
+    except Exception:
+        idx_reg = 0
 
-app.clientside_callback(
-    """
-    function(regionIndex, stationIndex, options) {
-        const opts = Array.isArray(options) && options.length ? options : [{name: "NSW", stations: []}];
-        const regionIdx = Math.max(0, Math.min(Number(regionIndex) || 0, opts.length - 1));
-        const stations = Array.isArray(opts[regionIdx].stations) ? opts[regionIdx].stations : [];
-        if (!stations.length) {
-            return "";
-        }
-        const stationIdx = Math.max(0, Math.min(Number(stationIndex) || 0, stations.length - 1));
-        return stations[stationIdx] || "";
-    }
-    """,
-    Output("overview-nsw-station-name", "children"),
-    [Input("overview-nsw-region-index", "data"), Input("overview-nsw-station-index", "data"), Input("overview-nsw-region-options", "data")],
-)
+    if idx_reg <= 0 or not regions:
+        region_name = None
+    else:
+        region_name = regions[idx_reg - 1]
+
+    stations = []
+    if region_name:
+        stations = sorted({str(r.get("station") or "").strip() for r in latest_rows if str(r.get("region") or "").strip() == region_name})
+    else:
+        stations = sorted({str(r.get("station") or "").strip() for r in latest_rows})
+
+    count = len(stations)
+    if count <= 0:
+        return 0
+
+    try:
+        idx = int(current_index or 0)
+    except Exception:
+        idx = 0
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    if trigger == "overview-nsw-station-prev":
+        idx = (idx - 1) % count
+    elif trigger == "overview-nsw-station-next":
+        idx = (idx + 1) % count
+    else:
+        # Reset to first station when region or monitor-store changes
+        idx = 0
+
+    return idx
 
 
 @app.callback(
-    Output("overview-nsw-air-quality-status", "children"),
-    [Input("overview-nsw-summary-store", "data"), Input("overview-nsw-region-index", "data")],
+    [Output("overview-nsw-air-quality-status", "children"), Output("overview-nsw-region-name", "children")],
+    [Input("monitor-store", "data"), Input("overview-nsw-region-index", "data")],
 )
-def render_overview_nsw_air_quality_status(summary_store, region_index):
+def render_overview_nsw_air_quality_status(monitor_store, region_index):
     """Render NSW/region PM2.5 network average from AQMS (no PurpleAir)."""
-    summary_store = summary_store or {}
-    regions = summary_store.get("regions") or []
-    if not regions:
-        return html.Div("Loading AQMS monitoring data…", className="card-hint")
-
-    try:
-        idx = int(region_index or 0)
-    except (TypeError, ValueError):
-        idx = 0
-    idx = max(0, min(idx, len(regions) - 1))
-    payload = regions[idx] or {}
-    avg = payload.get("pm25")
-    pm10_avg = payload.get("pm10")
-    o3_avg = payload.get("o3")
-    colour = payload.get("colour") or category_for_value("PM2.5", avg)[1]
-    category = _pollutant_category_label("PM2.5", colour)
-
-    units = (POLLUTANTS.get("PM2.5") or {}).get("Units") or "µg/m³"
-    avg_label = "--" if avg is None else f"{float(avg):.1f} {units}".strip()
-    pm10_units = (POLLUTANTS.get("PM10") or {}).get("Units") or "µg/m³"
-    o3_units = (POLLUTANTS.get("O3") or {}).get("Units") or ""
-    pm10_label = "--" if pm10_avg is None else f"{float(pm10_avg):.1f} {pm10_units}".strip()
-    o3_label = "--" if o3_avg is None else f"{float(o3_avg):.1f} {o3_units}".strip()
-
-    pm10_category_key, pm10_colour = category_for_value("PM10", pm10_avg)
-    o3_category_key, o3_colour = category_for_value("O3", o3_avg)
-    delta = None
-    pm10_delta = None
-    o3_delta = None
-
-    def _arrow_span(d):
-        if d is None or abs(float(d)) <= 1e-9:
-            return ""
-        dv = float(d)
-        if dv > 0:
-            return html.Span(" ↑", style={"color": "#dc2626", "fontWeight": 900, "marginLeft": "6px"})
-        return html.Span(" ↓", style={"color": "#16a34a", "fontWeight": 900, "marginLeft": "6px"})
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div("Avg (PM2.5)", className="nsw-aq-status__metric-label"),
-                            html.Div([html.Span(avg_label), _arrow_span(delta)], className="nsw-aq-status__metric-value", style={"color": colour}),
-                            html.Div(category, className="nsw-aq-status__metric-category", style={"color": colour}),
-                        ],
-                        className="nsw-aq-status__metric nsw-aq-status__metric--pm25",
-                    ),
-                    html.Div(
-                        [
-                            html.Div("AQMS averages", className="nsw-aq-status__kpi-label"),
-                            html.Div([html.Span(f"PM10 · {pm10_label}"), _arrow_span(pm10_delta)], className="nsw-aq-status__kpi-value"),
-                            html.Div([html.Span(f"O3 · {o3_label}"), _arrow_span(o3_delta)], className="nsw-aq-status__kpi-value"),
-                        ],
-                        className="nsw-aq-status__kpis",
-                    ),
-                ],
-                className="nsw-aq-status__row",
-            ),
-        ],
-        className="nsw-aq-status",
-        style={"borderTop": f"6px solid {colour}"},
-    )
-
     global _LAST_NSW_PM25_AVG
+    print(f"DEBUG: render_overview_nsw_air_quality_status called region_index={region_index} monitor_store_present={bool(monitor_store)}", flush=True)
     monitor_store = monitor_store or {}
     pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
     if not pm25_rows_all:
         error = monitor_store.get("error")
         if error:
-            return html.Div(str(error), className="card-hint")
+            return html.Div(str(error), className="card-hint"), "NSW"
         status = monitor_store.get("status") or ""
         if status and "Offline" in status:
-            return html.Div("AQMS monitoring feed is offline.", className="card-hint")
-        return html.Div("Loading AQMS monitoring data…", className="card-hint")
+            return html.Div("AQMS monitoring feed is offline.", className="card-hint"), "NSW"
+        return html.Div("Loading AQMS monitoring data…", className="card-hint"), "NSW"
 
 
     # Station box callback moved to module scope (registered below)
@@ -10430,10 +8096,14 @@ def render_overview_nsw_air_quality_status(summary_store, region_index):
             className="nsw-aq-status__delta",
         )
 
-    return html.Div(
-        [
-            html.Div(
-                [
+    # Use display name 'NSW' for the UI while keeping internal region_name as 'All NSW'
+    display_region_name = "NSW" if region_name == "All NSW" else region_name
+
+    return (
+        html.Div(
+            [
+                html.Div(
+                    [
                     html.Div(
                         [
                             html.Div("Avg (PM2.5)", className="nsw-aq-status__metric-label"),
@@ -10466,6 +8136,8 @@ def render_overview_nsw_air_quality_status(summary_store, region_index):
         ],
         className="nsw-aq-status",
         style={"borderTop": f"6px solid {colour}"},
+        ),
+        display_region_name,
     )
 
 
@@ -10520,71 +8192,22 @@ def _met_sparkline(values, color, height=46):
 
 
 @app.callback(
-    Output("overview-nsw-station-box", "children"),
-    [Input("overview-nsw-summary-store", "data"), Input("overview-nsw-region-index", "data"), Input("overview-nsw-station-index", "data")],
+    [Output("overview-nsw-station-box", "children"), Output("overview-nsw-station-name", "children")],
+    [Input("monitor-store", "data"), Input("overview-nsw-region-index", "data"), Input("overview-nsw-station-index", "data")],
 )
-def render_overview_nsw_station_box(summary_store, region_index, station_index):
+def render_overview_nsw_station_box(monitor_store, region_index, station_index):
     """Render a small station pollutant box for the selected region and station index."""
-    summary_store = summary_store or {}
-    regions = summary_store.get("regions") or []
-    if not regions:
-        return html.Div("No data", className="card-hint")
-
-    try:
-        idx_reg = int(region_index or 0)
-    except (TypeError, ValueError):
-        idx_reg = 0
-    idx_reg = max(0, min(idx_reg, len(regions) - 1))
-    stations = (regions[idx_reg] or {}).get("stations") or []
-    if not stations:
-        return html.Div("No stations", className="card-hint")
-
-    try:
-        sidx = int(station_index or 0)
-    except (TypeError, ValueError):
-        sidx = 0
-    sidx = max(0, min(sidx, len(stations) - 1))
-    station_payload = stations[sidx] or {}
-
-    def _box(pollutant):
-        val = station_payload.get(pollutant)
-        try:
-            v = float(val) if val is not None else None
-        except (TypeError, ValueError):
-            v = None
-        label = "--" if v is None else f"{v:.1f}"
-        key, colour = category_for_value(pollutant, v)
-        cat = _pollutant_category_label(pollutant, colour)
-        return html.Div(
-            [
-                html.Div(pollutant, className="overview-pollutant-box__label"),
-                html.Div(label, className="overview-pollutant-box__value"),
-                html.Div(cat, className="overview-pollutant-box__category"),
-            ],
-            className="overview-pollutant-box",
-            style={"backgroundColor": colour},
-        )
-
-    return html.Div(
-        [
-            _box("PM2.5"),
-            _box("PM10"),
-            _box("O3"),
-        ],
-        className="overview-pollutant-box-grid",
-    )
-
     monitor_store = monitor_store or {}
     pm25_rows_all = monitor_store.get("aqmsPm25Rows") or []
     pm10_rows_all = monitor_store.get("aqmsPm10Rows") or []
     o3_rows_all = monitor_store.get("aqmsO3Rows") or []
     combined_rows = list(pm25_rows_all) + list(pm10_rows_all) + list(o3_rows_all)
     if not combined_rows:
-        return html.Div("No data", className="card-hint")
+        return html.Div("No data", className="card-hint"), ""
 
     latest = _monitoring_time_row(combined_rows)
     if not latest:
-        return html.Div("No data", className="card-hint")
+        return html.Div("No data", className="card-hint"), ""
 
     date_val = latest.get("date")
     hour_val = latest.get("hour")
@@ -10624,7 +8247,7 @@ def render_overview_nsw_station_box(summary_store, region_index, station_index):
         seen.add(ncmp)
         stations.append(name)
     if not stations:
-        return html.Div("No stations")
+        return html.Div("No stations"), ""
 
     try:
         sidx = int(station_index or 0)
@@ -10680,7 +8303,7 @@ def render_overview_nsw_station_box(summary_store, region_index, station_index):
         style={"borderTop": f"6px solid {station_colour}"},
     )
 
-    return card
+    return card, station_name
 
 
 @app.callback(
@@ -10758,27 +8381,26 @@ def render_overview_met6h(active_tab, _met_load, region_index, monitor_store):
     prev_date = None
     for i, t_raw in enumerate(display_times):
         dt = _parse_forecast_timestamp(t_raw) if t_raw else None
-        date_label = ""
-        time_label = ""
+        date_prefix = ""
         if dt:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=SYDNEY_TZ)
             dt = dt.astimezone(SYDNEY_TZ)
             if i == 0 or (prev_date is not None and dt.date() != prev_date):
-                date_label = dt.strftime("%d %b")
-            time_label = dt.strftime("%I %p").lstrip("0")
+                date_prefix = dt.strftime("%d %b ")
+            time_part = dt.strftime("%I %p").lstrip("0")
+            lbl = f"{date_prefix}{time_part}"
             prev_date = dt.date()
         else:
-            time_label = "--"
+            lbl = "--"
 
         # Last label should be 'Now'
         if i == len(display_times) - 1:
-            time_label = "Now"
-            date_label = ""
+            lbl = "Now"
         else:
-            if (i % 4 != 0) and (not date_label):
-                time_label = ""
-        formatted_labels_bottom.append({"time": time_label, "date": date_label})
+            if (i % 4 != 0) and (not date_prefix):
+                lbl = ""
+        formatted_labels_bottom.append(lbl)
 
     # Placeholder labels (empty) used for non-bottom rows to keep alignment
     formatted_labels_blank = ["" for _ in formatted_labels_bottom]
@@ -10831,52 +8453,74 @@ def render_overview_met6h(active_tab, _met_load, region_index, monitor_store):
                 )
             )
 
+        # Right column shows min / max
+        min_label = "--" if min_val is None else f"{float(min_val):.1f}"
+        max_label = "--" if max_val is None else f"{float(max_val):.1f}"
+
+        # Use date/time labels only for the bottom (Rainfall) row; others get blank placeholders.
+        use_labels = formatted_labels_bottom if key == "RAIN" else formatted_labels_blank
+
         rows.append(
             html.Div(
                 [
                     html.Div(
-                        ICONS.get(label, ""),
-                        className="overview-met6h__icon",
+                        [
+                            html.Span(ICONS.get(label, ""), style={"marginRight": "8px", "fontSize": "18px"}),
+                            html.Span(label, style={"fontWeight": 900, "fontSize": "0.94rem", "color": "rgba(15, 23, 42, 0.9)"}),
+                        ],
+                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
                     ),
                     html.Div(
-                        label,
-                        className="overview-met6h__label",
+                        html.Div(bars, style={"height": "48px", "display": "flex", "alignItems": "flex-end", "overflowX": "auto", "paddingBottom": "6px"}),
+                        style={"paddingLeft": "6px", "paddingRight": "6px"},
                     ),
+                    # Only show inline x-axis labels for Rainfall (bottom row). Others get a placeholder to keep alignment.
                     html.Div(
-                        bars,
-                        className="overview-met6h__bars",
+                        html.Div(
+                            [
+                                html.Span(
+                                    lbl,
+                                    style={
+                                        "display": "inline-block",
+                                        "width": "76px",
+                                        "marginRight": "6px",
+                                        "textAlign": "center",
+                                        "fontSize": "11px",
+                                        "color": "rgba(15,23,42,0.65)",
+                                        "whiteSpace": "nowrap",
+                                        "overflow": "hidden",
+                                        "textOverflow": "ellipsis",
+                                    },
+                                )
+                                for lbl in use_labels
+                            ],
+                            style={"whiteSpace": "nowrap", "overflowX": "auto", "paddingTop": "6px"},
+                        ),
+                        style={"gridColumn": "2 / span 1"},
                     ),
+                    # Right column intentionally left blank to avoid showing numeric labels
+                    html.Div("", style={"textAlign": "right"}),
                 ],
-                className="overview-met6h__row",
+                style={"display": "grid", "gridTemplateColumns": "110px 1fr 0.25fr", "gap": "4px", "alignItems": "center", "paddingTop": "2px", "paddingBottom": "2px"},
             )
         )
 
     axis = html.Div(
         [
-            html.Div("", className="overview-met6h__axis-spacer"),
-            html.Div("", className="overview-met6h__axis-spacer"),
-            html.Div(
-                [
-                    html.Span(
-                        [
-                            html.Span(label.get("time", ""), className="overview-met6h__axis-time"),
-                            html.Span(label.get("date", ""), className="overview-met6h__axis-date") if label.get("date") else None,
-                        ],
-                        className="overview-met6h__axis-label",
-                    )
-                    for label in formatted_labels_bottom
-                ],
-                className="overview-met6h__axis-track",
-            ),
+            html.Div(axis_start, style={"fontWeight": 900, "fontSize": "0.85rem", "color": "rgba(15, 23, 42, 0.60)"}),
+            html.Div(axis_end, style={"fontWeight": 900, "fontSize": "0.85rem", "color": "rgba(15, 23, 42, 0.60)"}),
         ],
-        className="overview-met6h__axis",
+        style={"display": "flex", "justifyContent": "space-between", "marginTop": "8px", "paddingTop": "6px", "borderTop": "1px solid rgba(148, 163, 184, 0.25)"},
     )
 
-    return html.Div(rows + [axis], className="overview-met6h__body")
+    return html.Div(rows + [axis], style={"display": "flex", "flexDirection": "column"})
 
 
 @app.callback(
-    Output("overview-forecast-trends", "children"),
+    [
+        Output("overview-forecast-trends", "children"),
+        Output("overview-trends-current-region-label", "children"),
+    ],
     [
         Input("dashboard-tabs", "value"),
         Input("time-dropdown", "value"),
@@ -10888,7 +8532,7 @@ def render_overview_met6h(active_tab, _met_load, region_index, monitor_store):
 )
 def render_overview_trends(active_tab, time_scope, model_name, run_date, _overview_load, selected_index):
     if active_tab != "overview":
-        return no_update
+        return no_update, no_update
 
     selection = {
         "regions": DEFAULT_SELECTION.get("regions"),
@@ -10898,73 +8542,39 @@ def render_overview_trends(active_tab, time_scope, model_name, run_date, _overvi
         "date": run_date or DEFAULT_SELECTION.get("date"),
     }
 
-    selection_for_panel, regions = _overview_pick_multi_region_forecast_selection(selection)
+    sections = []
+    time_label = "--"
+    for pollutant in ["PM2.5", "PM10", "O3"]:
+        rows, pollutant_time_label = _overview_forecast_region_rows(selection, pollutant)
+        if time_label == "--" and pollutant_time_label != "--":
+            time_label = pollutant_time_label
+        sections.append(_overview_region_bar_section(pollutant, rows, "No forecast data available."))
 
-    if not regions:
-        return html.Div("No forecast regions found for the current run selection.", className="placeholder__body")
-
-    def _run_label_for_region(region):
-        """Best-effort run timestamp label (e.g. 'May 21 8PM') from file mtime."""
-        for pollutant in ("PM2.5", "PM10", "O3"):
-            file_path = forecast_file_path(
-                [
-                    str(region),
-                    pollutant,
-                    str(selection_for_panel.get("timeScopes")),
-                    str(selection_for_panel.get("models")),
-                    str(selection_for_panel.get("date")),
-                ]
-            )
-            if not file_path:
-                continue
-            try:
-                epoch = os.path.getmtime(file_path)
-            except OSError:
-                epoch = None
-            if epoch is None:
-                continue
-            try:
-                dt = datetime.fromtimestamp(float(epoch), tz=SYDNEY_TZ)
-                hour = dt.strftime("%I").lstrip("0") or "0"
-                return f"{dt.strftime('%b')} {dt.day} {hour}{dt.strftime('%p')}"
-            except (TypeError, ValueError, OSError):
-                return ""
-        return ""
-
-    def _sort_key(value):
-        norm = _overview_normalize_forecast_region(value)
-        if str(norm).lower() in {"sydney_east", "sydney east"}:
-            return (0, str(norm))
-        return (1, str(norm))
-
-    regions_sorted = sorted(regions, key=_sort_key)
-
-    # Determine index (wrap within bounds)
-    try:
-        idx = int(selected_index or 0)
-    except Exception:
-        idx = 0
-
-    if not regions_sorted:
-        return html.Div("No forecast regions found for the current run selection.", className="placeholder__body")
-
-    idx = max(0, min(idx, len(regions_sorted) - 1))
-    region = regions_sorted[idx]
-    fig = _overview_build_forecast_trends_figure(region, selection_for_panel)
-    card = html.Div(
-        [
-            html.Div(
-                className="overview-region-card__body",
-                children=dcc.Graph(figure=fig, config={"displayModeBar": False}, className="overview-region-card__graph"),
-            ),
-        ],
-        className="overview-region-card overview-region-card--collapsible",
-    )
-
-    return [card]
+    return sections, time_label
 
 
-def _overview_forecast_region_options(time_scope, model_name, run_date):
+@app.callback(
+    Output("overview-trends-index", "data"),
+    [
+        Input("overview-trends-prev", "n_clicks"),
+        Input("overview-trends-next", "n_clicks"),
+        Input("dashboard-tabs", "value"),
+        Input("time-dropdown", "value"),
+        Input("model-dropdown", "value"),
+        Input("date-dropdown", "value"),
+        Input("overview-nsw-region-prev", "n_clicks"),
+        Input("overview-nsw-region-next", "n_clicks"),
+        Input("overview-region-autoplay", "n_intervals"),
+    ],
+    [State("overview-trends-index", "data")],
+)
+def overview_trends_nav(prev_clicks, next_clicks, active_tab, time_scope, model_name, run_date, _nsw_prev, _nsw_next, _autoplay_intervals, current_index):
+    """Update the overview trends index when Prev/Next are clicked."""
+    # Only operate on Overview tab
+    if active_tab != "overview":
+        return current_index or 0
+
+    # Recompute available regions for the current selection
     selection = {
         "regions": DEFAULT_SELECTION.get("regions"),
         "pollutants": DEFAULT_SELECTION.get("pollutants"),
@@ -10974,88 +8584,38 @@ def _overview_forecast_region_options(time_scope, model_name, run_date):
     }
     _sel, regions = _overview_pick_multi_region_forecast_selection(selection)
     if not regions:
-        return []
+        return current_index or 0
 
-    def _sort_key(value):
-        norm = _overview_normalize_forecast_region(value)
-        if str(norm).lower() in {"sydney_east", "sydney east"}:
-            return (0, str(norm))
-        return (1, str(norm))
+    # Determine which button triggered the callback
+    triggered = callback_context.triggered[0]["prop_id"] if callback_context.triggered else None
+    try:
+        idx = int(current_index or 0)
+    except Exception:
+        idx = 0
 
-    return [
-        {
-            "value": str(region),
-            "label": title_case_station_name(str(region).replace("_", " ")),
-        }
-        for region in sorted(regions, key=_sort_key)
-    ]
+    if triggered and triggered.startswith("overview-trends-prev"):
+        idx = (idx - 1) % len(regions)
+    elif triggered and triggered.startswith("overview-trends-next"):
+        idx = (idx + 1) % len(regions)
+    elif triggered and triggered.startswith("overview-nsw-region-prev"):
+        idx = (idx - 1) % len(regions)
+    elif triggered and triggered.startswith("overview-nsw-region-next"):
+        idx = (idx + 1) % len(regions)
+    elif triggered and triggered.startswith("overview-region-autoplay"):
+        idx = (idx + 1) % len(regions)
+    else:
+        # Reset index when the selection changes (time/model/date) or on first load
+        idx = 0
 
-
-@app.callback(
-    Output("overview-trends-region-options", "data"),
-    [
-        Input("dashboard-tabs", "value"),
-        Input("time-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("date-dropdown", "value"),
-        Input("overview-forecast-load", "n_intervals"),
-    ],
-)
-def sync_overview_trends_region_options(active_tab, time_scope, model_name, run_date, _overview_load):
-    if active_tab != "overview":
-        return no_update
-    return _overview_forecast_region_options(time_scope, model_name, run_date)
-
-
-app.clientside_callback(
-    """
-    function(prevClicks, nextClicks, options, currentIndex) {
-        const ctx = dash_clientside.callback_context;
-        const opts = Array.isArray(options) && options.length ? options : [{label: ""}];
-        const count = opts.length || 1;
-        let idx = Number.isFinite(Number(currentIndex)) ? Number(currentIndex) : 0;
-        if (!ctx.triggered.length) {
-            return Math.max(0, Math.min(idx, count - 1));
-        }
-        const prop = ctx.triggered[0].prop_id || "";
-        if (prop.indexOf("overview-trends-region-options") === 0) {
-            return 0;
-        }
-        if (prop.indexOf("overview-trends-prev") === 0) {
-            idx = (idx - 1 + count) % count;
-        } else if (prop.indexOf("overview-trends-next") === 0) {
-            idx = (idx + 1) % count;
-        }
-        return idx;
-    }
-    """,
-    Output("overview-trends-index", "data"),
-    [
-        Input("overview-trends-prev", "n_clicks"),
-        Input("overview-trends-next", "n_clicks"),
-        Input("overview-trends-region-options", "data"),
-    ],
-    [State("overview-trends-index", "data")],
-)
-
-
-app.clientside_callback(
-    """
-    function(indexValue, options) {
-        const opts = Array.isArray(options) && options.length ? options : [{label: ""}];
-        const idx = Math.max(0, Math.min(Number(indexValue) || 0, opts.length - 1));
-        return opts[idx].label || "";
-    }
-    """,
-    Output("overview-trends-current-region-label", "children"),
-    [Input("overview-trends-index", "data")],
-    [State("overview-trends-region-options", "data")],
-)
+    return idx
 
 
 @app.callback(Output("header-monitor-updated", "children"), [Input("monitor-store", "data")])
 def render_header_monitor_timestamps(monitor_store):
-    return _monitor_header_timestamp_label(monitor_store)
+    monitor_store = monitor_store or {}
+    epoch = monitor_store.get("fetchedAtEpoch")
+    updated_label = _format_header_timestamp(epoch) if epoch is not None else "--"
+    return updated_label
 
 
 @app.callback(
@@ -11115,38 +8675,22 @@ def _monitor_from_key(monitor_key):
     return None
 
 
-def _haversine_meters(lat1, lon1, lat2, lon2):
-    try:
-        lat1 = float(lat1)
-        lon1 = float(lon1)
-        lat2 = float(lat2)
-        lon2 = float(lon2)
-    except (TypeError, ValueError):
+def _parse_aqms_time_point(item):
+    date_text = item.get("Date")
+    hour = item.get("Hour")
+    if not date_text:
         return None
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return 6371000.0 * c
-
-
-def _nearest_aqms_site(lat, lon):
-    best_site = None
-    best_distance = None
-    for site in (_sites_by_id() or {}).values():
-        site_lat = site.get("Latitude")
-        site_lon = site.get("Longitude")
-        if site_lat is None or site_lon is None:
-            continue
-        distance = _haversine_meters(lat, lon, site_lat, site_lon)
-        if distance is None:
-            continue
-        if best_distance is None or distance < best_distance:
-            best_distance = distance
-            best_site = site
-    return best_site, best_distance
+    try:
+        base = datetime.strptime(str(date_text), "%Y-%m-%d")
+    except ValueError:
+        return None
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        hour = None
+    if not hour:
+        return base.replace(tzinfo=SYDNEY_TZ)
+    return (base + timedelta(hours=max(hour - 1, 0))).replace(tzinfo=SYDNEY_TZ)
 
 
 def _monitor_trend_figure(pollutant_label, aqms_history=None, purpleair_history=None, title=None):
@@ -11354,8 +8898,9 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
                 break
 
     if not selected_row:
+        empty = html.Div("Select a site on the map or table.", className="selected-site__empty")
         fig = _monitor_trend_figure(pollutant_label)
-        return "", fig, "", fig
+        return empty, fig, "", fig
 
     now = datetime.now(SYDNEY_TZ)
     window_value = str(window_value or "24h").strip().lower()
@@ -11396,17 +8941,10 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
         if parameter_code and parameter_code not in mini_codes:
             mini_codes.append(parameter_code)
         try:
-            raw_history = _monitor_history_rows_for_sites(
-                (site_id,),
-                tuple(mini_codes),
-                start_date,
-                end_date,
-                live_timeout=6,
-                fallback_hours=window_hours + 24,
-            )
+            raw_history = fetch_observation_history([int(site_id)], mini_codes, start_date, end_date, timeout=14)
             aqms_histories = {}
             for item in raw_history or []:
-                param = _aqms_parameter(item).get("ParameterCode")
+                param = (item.get("Parameter") or {}).get("ParameterCode")
                 if not param:
                     continue
                 aqms_histories.setdefault(param, []).append(item)
@@ -11416,16 +8954,22 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
 
         nearest_pa = nearest_purpleair_sensor(selected_row.get("lat"), selected_row.get("lon"), monitor_store.get("purpleairSensors") or [])
         if nearest_pa and pollutant_label in {"PM2.5", "PM10"}:
-            end_ts = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+            end_ts = int(now.timestamp())
             start_ts = end_ts - window_hours * 3600
             fields = ["pm2.5_alt"] if pollutant_label == "PM2.5" else ["pm10.0_atm"]
-            pa_history = _fetch_purpleair_sensor_history_cached(nearest_pa.get("site_id"), start_ts, end_ts, 60, tuple(fields), 5)
+            try:
+                pa_history = fetch_purpleair_sensor_history(nearest_pa.get("site_id"), start_ts, end_ts, average=60, fields=fields, timeout=14)
+            except Exception:
+                pa_history = {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
 
     if source == "PurpleAir":
-        end_ts = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+        end_ts = int(now.timestamp())
         start_ts = end_ts - window_hours * 3600
         fields = ["pm2.5_alt"] if pollutant_label == "PM2.5" else ["pm10.0_atm"]
-        pa_history = _fetch_purpleair_sensor_history_cached(int(selected_row.get("site_id")), start_ts, end_ts, 60, tuple(fields), 5)
+        try:
+            pa_history = fetch_purpleair_sensor_history(int(selected_row.get("site_id")), start_ts, end_ts, average=60, fields=fields, timeout=14)
+        except Exception:
+            pa_history = {"fields": [], "data": [], "error": "PurpleAir history unavailable."}
 
     # Filter down to the selected time window for plotting.
     cutoff = now - timedelta(hours=window_hours)
@@ -11691,174 +9235,51 @@ def render_monitor_selected(selection, monitor_store, window_value, pollutant_la
                 )
             )
 
-    return "", compare_fig, compare_summary, trend_fig
+    selected_children = [
+        html.Div(details, className="selected-site__body"),
+    ]
+    if mini_strip_nodes:
+        selected_children.append(html.Div(mini_strip_nodes, className="monitor-mini-strips"))
 
-
-def _prewarm_monitor_selected_render():
-    if str(os.environ.get("MONITOR_SELECTED_RENDER_PREWARM", "1")).strip().lower() in {"0", "false", "no", "n"}:
-        return
-    try:
-        store = INITIAL_MONITOR_STORE if isinstance(INITIAL_MONITOR_STORE, dict) else {}
-        selection = _default_monitor_selection(store)
-        if selection:
-            render_monitor_selected(selection, store, "24h", "PM2.5")
-    except Exception:
-        return
-
-
-_prewarm_monitor_selected_render()
-
-
-@app.callback(
-    [Output("monitor-region-series-station", "options"), Output("monitor-region-series-station", "value")],
-    [Input("monitor-region-series", "value"), Input("selected-monitor-site-store", "data")],
-    [State("monitor-region-series-station", "value")],
-)
-def sync_monitor_region_series_station(region_value, selected_monitor_site, current_station_value):
-    options = _monitor_region_series_station_options(region_value)
-    if not options:
-        return [], None
-
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    option_values = {option.get("value") for option in options}
-
-    if trigger == "monitor-region-series":
-        return options, options[0]["value"]
-
-    if current_station_value in option_values:
-        return options, current_station_value
-
-    selected_value = None
-    try:
-        if isinstance(selected_monitor_site, dict) and str(selected_monitor_site.get("source") or "").strip() == "AQMS":
-            selected_candidate = f"aqms:{int(selected_monitor_site.get('id'))}"
-            if selected_candidate in option_values:
-                selected_value = selected_candidate
-    except Exception:
-        selected_value = None
-
-    if selected_value is None:
-        selected_value = options[0]["value"]
-
-    return options, selected_value
-
-
-@app.callback(
-    [
-        Output("monitor-region-series-note", "children"),
-        Output("monitor-region-series-plots", "children"),
-    ],
-    [
-        Input("dashboard-tabs", "value"),
-        Input("monitor-region-series", "value"),
-        Input("monitor-region-series-station", "value"),
-    ],
-)
-def render_monitor_region_series(active_tab, region_value, station_value):
-    if active_tab != "monitor":
-        return no_update, no_update
-
-    region_value = str(region_value or "ALL").strip()
-    if not region_value or region_value.upper() == "ALL":
-        region_value = str(MONITOR_REGION_SERIES_DEFAULT_VALUE or "").strip()
-
-    region_label = next((option.get("label") for option in MONITOR_REGION_SERIES_OPTIONS if str(option.get("value") or "").strip() == region_value), title_case_station_name(region_value) or "Selected region")
-    station_options = _monitor_region_series_station_options(region_value)
-    if not station_options:
-        note = html.Div("No AQMS stations found for the selected region.", className="monitor-region-series-empty")
-        return note, []
-
-    station_value = str(station_value or "").strip()
-    if station_value not in {option["value"] for option in station_options}:
-        station_value = station_options[0]["value"]
-
-    try:
-        selected_site_id = int(str(station_value).split(":", 1)[1])
-    except Exception:
-        selected_site_id = None
-    if selected_site_id is None:
-        note = html.Div("No AQMS station selected.", className="monitor-region-series-empty")
-        return note, []
-
-    site_lookup = _sites_by_id()
-    station = site_lookup.get(selected_site_id) or {}
-    station_name = title_case_station_name(station.get("SiteName") or station.get("StationName") or f"Site {selected_site_id}")
-
-    now = datetime.now(SYDNEY_TZ).replace(minute=0, second=0, microsecond=0)
-    start_dt = now - timedelta(hours=24)
-    start_iso = start_dt.strftime("%Y-%m-%dT%H:00:00")
-    end_iso = now.strftime("%Y-%m-%dT%H:00:00")
-    history_rows = _fetch_monitor_region_history((selected_site_id,), start_iso, end_iso) or []
-    if history_rows:
-        has_current_window_points = False
-        for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
-            if _monitor_region_series_values(history_rows, pollutant_label, start_dt, now):
-                has_current_window_points = True
-                break
-        if not has_current_window_points:
-            latest_ts = _monitor_region_series_latest_timestamp(history_rows)
-            if latest_ts is not None:
-                now = latest_ts
-                start_dt = now - timedelta(hours=24)
-
-    plot_cards = []
-    for pollutant_label in MONITOR_REGION_SERIES_POLLUTANTS:
-        fig = _monitor_region_series_figure(
-            history_rows,
-            pollutant_label,
-            start_dt,
-            now,
-            region_label,
-            station_name,
-        )
-        plot_cards.append(
-            html.Div(
-                dcc.Graph(
-                    figure=fig,
-                    config={"displayModeBar": False, "responsive": True},
-                    className="monitor-region-series-graph",
-                ),
-                className=f"monitor-region-series-plot-card monitor-region-series-plot-card--{pollutant_label.lower().replace('.', '').replace(' ', '')}",
-            )
-        )
-
-    note = html.Div(
-        [
-            html.Span(f"{region_label}", className="monitor-region-series-note__region"),
-            html.Span(f" • {station_name} • PM2.5 / PM10 / O3 • last 24 hours", className="monitor-region-series-note__meta"),
-        ],
-        className="monitor-region-series-note__text",
-    )
-    return note, plot_cards
-
-
-def _prewarm_monitor_region_series_render():
-    if str(os.environ.get("MONITOR_REGION_SERIES_RENDER_PREWARM", "1")).strip().lower() in {"0", "false", "no", "n"}:
-        return
-    try:
-        render_monitor_region_series("monitor", MONITOR_REGION_SERIES_DEFAULT_VALUE, MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE)
-    except Exception:
-        return
-
-
-_prewarm_monitor_region_series_render()
+    return html.Div(selected_children, className="selected-site__wrap"), compare_fig, compare_summary, trend_fig
 
 
 @app.callback(
     Output("forecast-map", "srcDoc"),
-    [Input("forecast-store", "data")],
-    [State("pollutant-dropdown", "value")],
+    [Input("forecast-store", "data"), Input("forecast-map-pollutant-dropdown", "value")],
+    [
+        State("pollutant-dropdown", "value"),
+        State("time-dropdown", "value"),
+        State("model-dropdown", "value"),
+        State("date-dropdown", "value"),
+        State("time-slider", "value"),
+    ],
 )
-def render_forecast_map_srcdoc(parsed, pollutant):
-    global _LAST_GOOD_FORECAST_MAP_HTML
-    if not parsed:
-        if _LAST_GOOD_FORECAST_MAP_HTML:
-            return _LAST_GOOD_FORECAST_MAP_HTML
-        return no_update
+def render_forecast_map_srcdoc(parsed, map_pollutant, pollutant, time_scope, model, date, hour_index):
+    map_pollutant = map_pollutant or pollutant
+    selection = {
+        "pollutants": map_pollutant,
+        "timeScopes": time_scope,
+        "models": model,
+        "date": date,
+    }
+    map_payload = _merged_forecast_map_payload(selection, map_pollutant)
+    if not ((map_payload.get("data") or {}).get("stations") or {}):
+        map_payload = parsed or {}
+    if not map_payload:
+        return _leaflet_forecast_map_html({}, map_pollutant, 0)
     # Keep the same iframe document while the slider moves; values update via postMessage.
-    next_html = _leaflet_forecast_map_html(parsed, pollutant, 0)
-    _LAST_GOOD_FORECAST_MAP_HTML = next_html
-    return next_html
+    times = (map_payload.get("data") or {}).get("time", {}).get("forecastTime", [])
+    if hour_index is None:
+        index, _has_upcoming = _forecast_live_base_state(times)
+    else:
+        try:
+            index = int(hour_index)
+        except (TypeError, ValueError):
+            index = 0
+        if times:
+            index = max(0, min(index, len(times) - 1))
+    return _leaflet_forecast_map_html(map_payload, map_pollutant, index)
 
 
 @app.callback(
@@ -11878,94 +9299,9 @@ def toggle_monitor_modal(open_clicks, close_clicks, current_style):
 
 
 @app.callback(
-    Output("forecast-all-stations-modal", "style"),
-    [Input("forecast-view-all", "n_clicks"), Input("forecast-modal-close", "n_clicks")],
-    [State("forecast-all-stations-modal", "style")],
-)
-def toggle_forecast_all_stations_modal(open_clicks, close_clicks, current_style):
-    current_style = current_style or {}
-    is_open = current_style.get("display") not in (None, "", "none")
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    if trigger == "forecast-view-all" and open_clicks:
-        return {"display": "flex"}
-    if trigger == "forecast-modal-close" and close_clicks:
-        return {"display": "none"}
-    return {"display": "flex"} if is_open else {"display": "none"}
-
-
-@app.callback(
     [
-        Output("forecast-all-stations-table", "columns"),
-        Output("forecast-all-stations-table", "data"),
-        Output("forecast-all-stations-title", "children"),
-        Output("forecast-all-stations-subtitle", "children"),
-    ],
-    [
-        Input("region-dropdown", "value"),
-        Input("pollutant-dropdown", "value"),
-        Input("time-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("date-dropdown", "value"),
-        Input("ranking-hour-dropdown", "value"),
-        Input("forecast-view-all", "n_clicks"),
-    ],
-    [State("forecast-all-stations-modal", "style")],
-)
-def render_forecast_all_stations_table(region, pollutant, time_scope, model, date, ranking_hour_index, _open_clicks, modal_style):
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    modal_style = modal_style or {}
-    modal_is_open = modal_style.get("display") not in (None, "", "none")
-    if trigger != "forecast-view-all" and not modal_is_open:
-        return no_update, no_update, no_update, no_update
-    selection = {
-        "regions": region,
-        "pollutants": "PM2.5",
-        "timeScopes": time_scope,
-        "models": model,
-        "date": date,
-    }
-    return _forecast_overview_allstations_table(selection)
-
-
-@app.callback(
-    [Output("ranking-hour-dropdown", "options"), Output("ranking-hour-dropdown", "value")],
-    [Input("forecast-store", "data")],
-    [State("ranking-hour-dropdown", "value")],
-)
-def sync_ranking_hour_dropdown(parsed, current_value):
-    options = _forecast_hour_options(parsed)
-    valid_values = {option["value"] for option in options}
-    value = current_value if current_value in valid_values else 0
-    return options, value
-
-
-@app.callback(
-    [Output("ranking-cards", "children"), Output("forecast-rank-selected-time", "children")],
-    [
-        Input("region-dropdown", "value"),
-        Input("pollutant-dropdown", "value"),
-        Input("time-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("date-dropdown", "value"),
-        Input("ranking-hour-dropdown", "value"),
-    ],
-)
-def render_station_ranking(region, pollutant, time_scope, model, date, ranking_hour_index):
-    selection = {
-        "regions": region,
-        "pollutants": pollutant,
-        "timeScopes": time_scope,
-        "models": model,
-        "date": date,
-    }
-    cards = _station_prediction_cards(selection, ranking_hour_index)
-    parsed, _message = _load_forecast(selection)
-    selected_time = _selected_time_label(parsed, ranking_hour_index) if parsed else None
-    return cards, _format_forecast_label(selected_time)
-
-
-@app.callback(
-    [
+        Output("ranking-chart", "children"),
+        Output("station-ranking-title", "children"),
         Output("summary-cards", "children"),
         Output("forecast-time-label", "children"),
         Output("file-info", "children"),
@@ -11988,15 +9324,9 @@ def render_main_visuals(parsed, hour_index, region, pollutant, time_scope, model
         "date": date,
     }
     if not parsed:
-        empty = go.Figure()
-        empty.update_layout(
-            template="plotly_white",
-            height=620,
-            margin=dict(l=20, r=20, t=30, b=20),
-            font=dict(family=BASE_FONT_FAMILY, color="#0f172a"),
-        )
-        return _make_summary_cards({}, selection, 0), "Latest forecast run not loaded.", ""
+        return _station_rank_bars_for_pollutants({}, selection, hour_index or 0), "Station's Nowcasting", _make_summary_cards({}, selection, 0), "Latest forecast run not loaded.", ""
 
+    ranking = _station_rank_bars_for_pollutants(parsed, selection, hour_index or 0)
     summary = _make_summary_cards(parsed, selection, hour_index or 0, None)
     times = parsed.get("data", {}).get("time", {}).get("forecastTime", [])
     current_time = _selected_time_label(parsed, hour_index or 0)
@@ -12008,157 +9338,100 @@ def render_main_visuals(parsed, hour_index, region, pollutant, time_scope, model
         html.Div(["Current time: ", html.Strong(time_label)]),
         html.Div(["Steps available: ", html.Strong(str(len(times)))]),
     ]
-    return summary, f"Showing {time_label}", file_text
-
-
-@app.callback(
-    [Output("validation-pollutant-dropdown", "options"), Output("validation-pollutant-dropdown", "value")],
-    [Input("validation-date-dropdown", "value")],
-    [State("validation-pollutant-dropdown", "value")],
-)
-def sync_validation_pollutants(date, current_pollutant):
-    options = _validation_pollutant_options(date)
-    return options, _validation_pick_value(options, current_pollutant)
-
-
-@app.callback(
-    [Output("validation-horizon-dropdown", "options"), Output("validation-horizon-dropdown", "value")],
-    [Input("validation-date-dropdown", "value"), Input("validation-pollutant-dropdown", "value")],
-    [State("validation-horizon-dropdown", "value")],
-)
-def sync_validation_horizons(date, pollutant, current_horizon):
-    options = _validation_horizon_options(date, pollutant)
-    return options, _validation_pick_value(options, current_horizon)
-
-
-@app.callback(
-    [Output("validation-region-dropdown", "options"), Output("validation-region-dropdown", "value")],
-    [
-        Input("validation-date-dropdown", "value"),
-        Input("validation-pollutant-dropdown", "value"),
-        Input("validation-horizon-dropdown", "value"),
-    ],
-    [State("validation-region-dropdown", "value")],
-)
-def sync_validation_regions(date, pollutant, horizon, current_region):
-    options = _validation_region_options(date, pollutant, horizon)
-    return options, _validation_pick_value(options, current_region)
-
-
-@app.callback(
-    [
-        Output("validation-store", "data"),
-        Output("validation-message", "children"),
-    ],
-    [
-        Input("dashboard-tabs", "value"),
-        Input("validation-region-dropdown", "value"),
-        Input("validation-pollutant-dropdown", "value"),
-        Input("validation-horizon-dropdown", "value"),
-        Input("validation-date-dropdown", "value"),
-    ],
-)
-def load_validation_forecast(active_tab, region, pollutant, horizon, date):
-    if not all([region, pollutant, horizon, date]):
-        return None, "Choose a date, pollutant, horizon, and region to load validation data."
-    model = _validation_model_for_selection(date, pollutant, horizon, region)
-    selection = {
-        "regions": region,
-        "pollutants": pollutant,
-        "timeScopes": horizon,
-        "models": model,
-        "date": date,
-    }
-    parsed, message = _load_forecast(selection)
-    if not parsed:
-        return None, message
-
-    parsed["_selection"] = selection
-    parsed["_message"] = message
-    label = f"{message} · {len(((parsed.get('data') or {}).get('stations') or {}))} stations"
-    return parsed, label
-
-
-@app.callback(
-    [Output("validation-time-series-grid", "children"), Output("validation-metrics", "children")],
-    [
-        Input("validation-store", "data"),
-    ],
-    [
-        State("validation-region-dropdown", "value"),
-        State("validation-pollutant-dropdown", "value"),
-    ],
-)
-def render_validation_outputs(parsed, region, pollutant):
-    if not parsed:
-        return html.Div("No validation forecast file is available for this selection.", className="validation-empty"), _validation_metric_cards({}, pollutant, 0, region)
-
-    return (
-        _validation_station_plot_grid(parsed, pollutant, region),
-        _validation_metric_cards(parsed, pollutant, 0, region),
-    )
+    return ranking, f"Station's Nowcasting @ {time_label}", summary, time_label, file_text
 
 
 @app.callback(
     [Output("station-trend", "figure"), Output("station-details", "children")],
+    [Input("forecast-store", "data"), Input("selected-station-store", "data"), Input("url", "hash"), Input("time-slider", "value")],
     [
-        Input("region-dropdown", "value"),
-        Input("pollutant-dropdown", "value"),
-        Input("time-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("date-dropdown", "value"),
+        State("pollutant-dropdown", "value"),
+        State("time-dropdown", "value"),
+        State("model-dropdown", "value"),
+        State("date-dropdown", "value"),
     ],
 )
-def render_station_trend(region, pollutant, time_scope, model, date):
-    selection = {
-        "regions": region,
-        "pollutants": pollutant,
-        "timeScopes": time_scope,
-        "models": model,
-        "date": date,
-    }
-    parsed, _message = _load_forecast(selection)
+def render_station_trend(parsed, selected_station, url_hash, hour_index, pollutant, time_scope, model, date):
     if not parsed:
         figure = go.Figure()
         figure.update_layout(template="plotly_white", height=320, margin=dict(l=20, r=20, t=30, b=20))
-        return figure, "Choose a region forecast to inspect its 12 hour profile."
+        return figure, "Forecast data is not loaded."
 
-    trend_figure = _region_forecast_figure(parsed, selection, pollutant)
+    selection = {"pollutants": pollutant, "timeScopes": time_scope, "models": model, "date": date}
+    all_region_parsed = None
+    selected_station = selected_station or _station_from_hash(parsed, url_hash)
+    if not selected_station and url_hash:
+        all_region_parsed = _merged_forecast_map_payload(selection, pollutant)
+        selected_station = _station_from_hash(all_region_parsed, url_hash)
+    if not selected_station:
+        return _all_stations_trend_figure(parsed, pollutant, time_scope), _all_stations_details(parsed)
 
-    region_code = str(selection.get("regions") or "")
-    region_name = load_region_lookup().get(region_code) or title_case_station_name(region_code) or "Selected region"
-    station_count = len(((parsed.get("data") or {}).get("stations") or {}))
-    details = f"{region_name} @ {selection.get('timeScopes') or '12'} hr forecast · {station_count} station forecasts in the selected region."
-    return trend_figure, details
+    chart_parsed = parsed
+    if normalize_station_name(selected_station) not in {normalize_station_name(name) for name in ((parsed.get("data") or {}).get("stations") or {})}:
+        chart_parsed = all_region_parsed or _merged_forecast_map_payload(selection, pollutant)
+    figure = _forecast_time_series_figure(chart_parsed, pollutant, selected_station, hour_index or 0)
+    stations = (chart_parsed.get("data") or {}).get("stations", {})
+    payload = None
+    target = normalize_station_name(selected_station)
+    for key, value in stations.items():
+        if normalize_station_name(key) == target:
+            payload = value
+            break
+    values = payload.get("forecastValue", []) if payload else []
+    details = [
+        html.Div(["Station: ", html.Strong(title_case_station_name(selected_station))]),
+        html.Div(["Forecast steps: ", html.Strong(str(len(values)))]),
+    ]
+    if values:
+        details.append(html.Div(["Latest value: ", html.Strong(f"{values[-1]:.2f}")]))
+    return figure, details
 
 
 @app.callback(
-    [Output("time-series-region-dropdown", "options"), Output("time-series-region-dropdown", "value")],
-    [Input("forecast-store", "data")],
-    [State("region-dropdown", "value"), State("time-series-region-dropdown", "value")],
+    [
+        Output("forecast-time-series-station", "options"),
+        Output("forecast-time-series-station", "value"),
+        Output("forecast-time-series-title", "children"),
+    ],
+    [
+        Input("forecast-store", "data"),
+        Input("region-dropdown", "value"),
+        Input("selected-station-store", "data"),
+        Input("url", "hash"),
+    ],
+    [State("forecast-time-series-station", "value")],
 )
-def sync_time_series_region_options(parsed, selected_region, current_region):
-    options = _forecast_region_options(parsed, selected_region)
-    valid_values = {option["value"] for option in options}
-    if selected_region in valid_values:
-        value = selected_region
-    elif current_region in valid_values:
-        value = current_region
+def sync_forecast_time_series_station(parsed, region, selected_station, url_hash, current_station):
+    title = f"Nowcasting Time Series @ {_display_region_label(region)}"
+    options = _forecast_station_dropdown_options(parsed)
+    if not options:
+        return [], None, title
+
+    stations = ((parsed or {}).get("data") or {}).get("stations") or {}
+    valid_by_normalized = {normalize_station_name(option["value"]): option["value"] for option in options}
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    hash_station = _station_from_hash(parsed, url_hash)
+
+    if trigger in ("selected-station-store", "url"):
+        candidates = [selected_station, hash_station, current_station]
     else:
-        value = options[0]["value"] if options else None
-    return options, value
+        candidates = [current_station, selected_station, hash_station]
 
+    for candidate in candidates:
+        normalized = normalize_station_name(candidate)
+        if normalized in valid_by_normalized:
+            return options, valid_by_normalized[normalized], title
 
-@app.callback(
-    [Output("time-series-station-dropdown", "options"), Output("time-series-station-dropdown", "value")],
-    [Input("forecast-store", "data"), Input("time-series-region-dropdown", "value")],
-    [State("time-series-station-dropdown", "value")],
-)
-def sync_time_series_station_options(parsed, region_value, current_station):
-    options = _forecast_station_options(parsed, region_value)
-    valid_values = {option["value"] for option in options}
-    value = current_station if current_station in valid_values else (options[0]["value"] if options else None)
-    return options, value
+    times = ((parsed or {}).get("data") or {}).get("time", {}).get("forecastTime", [])
+    default_station = _best_station_for_hour(parsed, _forecast_live_base_index(times))
+    normalized_default = normalize_station_name(default_station)
+    if normalized_default in valid_by_normalized:
+        return options, valid_by_normalized[normalized_default], title
+
+    first_value = options[0]["value"]
+    if first_value in stations:
+        return options, first_value, title
+    return options, first_value, title
 
 
 @app.callback(
@@ -12166,71 +9439,45 @@ def sync_time_series_station_options(parsed, region_value, current_station):
     [
         Input("forecast-store", "data"),
         Input("time-slider", "value"),
-        Input("time-series-region-dropdown", "value"),
-        Input("time-series-station-dropdown", "value"),
+        Input("forecast-time-series-station", "value"),
+        Input("selected-station-store", "data"),
+        Input("url", "hash"),
     ],
-    [State("pollutant-dropdown", "value")],
+    [
+        State("pollutant-dropdown", "value"),
+        State("time-dropdown", "value"),
+        State("model-dropdown", "value"),
+        State("date-dropdown", "value"),
+    ],
 )
-def render_forecast_time_series(parsed, hour_index, region_value, station_name, pollutant):
+def render_forecast_time_series(parsed, hour_index, time_series_station, selected_station, url_hash, pollutant, time_scope, model, date):
     if not parsed:
         figure = go.Figure()
-        figure.update_layout(template="plotly_white", height=380, margin=dict(l=20, r=20, t=40, b=20))
+        figure.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=40, b=20))
         return figure
 
-    return _forecast_time_series_figure(parsed, pollutant, station_name, hour_index or 0, region_value)
+    selection = {"pollutants": pollutant, "timeScopes": time_scope, "models": model, "date": date}
+    all_region_parsed = None
+    selected_station = time_series_station or selected_station or _station_from_hash(parsed, url_hash)
+    if not selected_station and url_hash:
+        all_region_parsed = _merged_forecast_map_payload(selection, pollutant)
+        selected_station = _station_from_hash(all_region_parsed, url_hash)
+    chart_parsed = parsed
+    if selected_station and normalize_station_name(selected_station) not in {normalize_station_name(name) for name in ((parsed.get("data") or {}).get("stations") or {})}:
+        chart_parsed = all_region_parsed or _merged_forecast_map_payload(selection, pollutant)
+    return _forecast_time_series_figure(chart_parsed, pollutant, selected_station, hour_index or 0)
 
 
 @app.callback(
     Output("selected-station-store", "data"),
-    [
-        Input("url", "hash"),
-        Input("ranking-hour-dropdown", "value"),
-        Input("region-dropdown", "value"),
-        Input("pollutant-dropdown", "value"),
-        Input("time-dropdown", "value"),
-        Input("model-dropdown", "value"),
-        Input("date-dropdown", "value"),
-    ],
+    [Input("forecast-store", "data"), Input("url", "hash")],
 )
-def update_selected_station(url_hash, ranking_hour_index, region, pollutant, time_scope, model, date):
-    selection = {
-        "regions": region,
-        "pollutants": pollutant,
-        "timeScopes": time_scope,
-        "models": model,
-        "date": date,
-    }
-    parsed, _message = _load_forecast(selection)
+def update_selected_station(parsed, url_hash):
     if parsed:
         selected_station = _station_from_hash(parsed, url_hash)
         if selected_station:
             return selected_station
-
-    return _default_ranking_station(selection, ranking_hour_index)
-
-
-def _warm_monitor_region_series_cache():
-    if str(os.environ.get("DISABLE_MONITOR_REGION_SERIES_WARMUP", "")).strip().lower() in {"1", "true", "yes", "y"}:
-        return
-
-    def worker():
-        try:
-            station_value = str(MONITOR_REGION_SERIES_DEFAULT_STATION_VALUE or "")
-            if ":" not in station_value:
-                return
-            selected_site_id = int(station_value.split(":", 1)[1])
-            now = datetime.now(SYDNEY_TZ).replace(minute=0, second=0, microsecond=0)
-            start_dt = now - timedelta(hours=24)
-            start_iso = start_dt.strftime("%Y-%m-%dT%H:00:00")
-            end_iso = now.strftime("%Y-%m-%dT%H:00:00")
-            _fetch_monitor_region_history((selected_site_id,), start_iso, end_iso)
-        except Exception:
-            pass
-
-    threading.Thread(target=worker, name="monitor-region-series-cache-warmup", daemon=True).start()
-
-
-_warm_monitor_region_series_cache()
+    return None
 
 
 if __name__ == "__main__":

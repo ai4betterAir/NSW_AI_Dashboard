@@ -1,0 +1,24 @@
+{
+  "name": "ai_dashboard_2026y",
+  "version": "1.0.0",
+  "description": "This folder is the active Python dashboard/API application. It is now organized as a self-contained project so the dashboard does not depend on the older React/Panel folders for reference files.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DrMasrur/AI_Dashboard_2026Y.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/DrMasrur/AI_Dashboard_2026Y/issues"
+  },
+  "homepage": "https://github.com/DrMasrur/AI_Dashboard_2026Y#readme",
+  "dependencies": {
+    "playwright": "^1.57.0"
+  }
+}

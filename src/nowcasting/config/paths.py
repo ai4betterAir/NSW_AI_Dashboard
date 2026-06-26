@@ -8,7 +8,7 @@ SRC_ROOT = SERVER_ROOT / "src"
 DATA_ROOT = SERVER_ROOT / "data"
 REFERENCE_DATA_DIR = DATA_ROOT / "reference"
 # Use the shared forecast dashboard CSV folder as the default input folder.
-DASHBOARD_DATA_DIR = Path("/mnt/scratch_lustre/ar_aichem_scratch/2AI_dashboard_files")
+DASHBOARD_DATA_DIR = Path("/mnt/scratch_lustre/ar_aichem_scratch/Nawcasting_Dashboard_Files")
 
 RECOMMENDATIONS_JSON = REFERENCE_DATA_DIR / "recommendations.json"
 SITE_DETAILS_JS = REFERENCE_DATA_DIR / "SiteDetails.js"

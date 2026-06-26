@@ -1,0 +1,199 @@
+nohup: ignoring input
+Dash is running on http://0.0.0.0:8054/
+
+ * Serving Flask app 'dashboard.dash_app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8054
+ * Running on http://192.168.144.132:8054
+Press CTRL+C to quit
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /assets/style.css?m=1782348523.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /_dash-component-suites/dash/deps/polyfill@7.v4_3_0m1782362499.12.1.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /assets/vendor/leaflet/leaflet.css?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.css?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /_dash-component-suites/dash/deps/react@18.v4_3_0m1782362499.3.1.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.Default.css?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:33] "GET /_dash-component-suites/dash/deps/react-dom@18.v4_3_0m1782362499.3.1.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/deps/prop-types@15.v4_3_0m1782362499.8.1.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/overview_trends_lazyload.js?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/overview_equal_heights.js?m=1782197793.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/station-select.js?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/station-matrix-scroll.js?m=1782183568.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/vendor/leaflet/leaflet.js?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /assets/vendor/leaflet.markercluster/leaflet.markercluster.js?m=1780231537.0 HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/dash-renderer/build/dash_renderer.v4_3_0m1782362498.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/dcc/dash_core_components.v4_3_0m1782362499.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/dcc/dash_core_components-shared.v4_3_0m1782362499.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/html/dash_html_components.v4_3_0m1782362499.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:34] "GET /_dash-component-suites/dash/dash_table/bundle.v7_3_0m1782362499.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:35] "GET /_dash-dependencies HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:35] "GET /_dash-layout HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:35] "GET /assets/nsw-logo.svg HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:35] "GET /_dash-component-suites/dash/dcc/async-dropdown.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "GET /assets/vendor/leaflet/leaflet.css HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.css HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.Default.css HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_next_hour_forecast_map called active_tab=overview _overview_load=0
+DEBUG: render_overview_next_hour_station_panel called active_tab=overview _overview_load=0
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_next3_diamonds called active_tab=overview _overview_load=0
+127.0.0.1 - - [25/Jun/2026 14:46:36] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "GET /assets/nsw-government-transparent.png HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "GET /assets/vendor/leaflet/leaflet.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:37] "GET /assets/vendor/leaflet.markercluster/leaflet.markercluster.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_next_hour_forecast_map called active_tab=overview _overview_load=1
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_next_hour_station_panel called active_tab=overview _overview_load=1
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_next3_diamonds called active_tab=overview _overview_load=1
+127.0.0.1 - - [25/Jun/2026 14:46:38] "GET /assets/vendor/leaflet/leaflet.css HTTP/1.1" 304 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.css HTTP/1.1" 304 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "GET /assets/vendor/leaflet.markercluster/MarkerCluster.Default.css HTTP/1.1" 304 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "GET /assets/vendor/leaflet/leaflet.js HTTP/1.1" 304 -
+127.0.0.1 - - [25/Jun/2026 14:46:38] "GET /assets/vendor/leaflet.markercluster/leaflet.markercluster.js HTTP/1.1" 304 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "GET /assets/australian-states.json HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "GET /_dash-component-suites/dash/dash_table/async-highlight.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "GET /_dash-component-suites/dash/dash_table/async-table.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "GET /_dash-component-suites/dash/dcc/async-graph.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=0 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:39] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:40] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:40] "GET /_dash-component-suites/plotly/package_data/plotly.min.js HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:40] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:40] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:40] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:41] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:41] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=0 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:43] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:43] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:43] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=1 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:44] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=2 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:46:52] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=3 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:00] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:01] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:08] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:08] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:08] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:09] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:09] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=4 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:09] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:09] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:09] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:16] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:16] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:16] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:17] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:17] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=5 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:17] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:17] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:17] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:25] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:25] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:25] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:26] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=6 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:26] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:26] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:26] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:26] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:33] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:33] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:33] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=7 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:33] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:33] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:34] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:34] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:34] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:41] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:41] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:41] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:41] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=8 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:42] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:49] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:49] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:49] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=9 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:50] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:51] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:51] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:51] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:54] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+DEBUG: render_overview_nsw_air_quality_status called region_index=10 monitor_store_present=True
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -
+127.0.0.1 - - [25/Jun/2026 14:47:56] "POST /_dash-update-component HTTP/1.1" 200 -

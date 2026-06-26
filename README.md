@@ -1,4 +1,4 @@
-# NSW Air Quality Forecast Dashboard
+# NSW Air Quality Nowcasting Dashboard
 
 This folder is the active Python dashboard/API application. It is now organized
 as a self-contained project so the dashboard does not depend on the older
@@ -14,7 +14,7 @@ AI_Dashboard_2026/
     config/paths.py         # Central project paths
     data/                   # Forecast parsing, site metadata, monitoring data
   data/
-    dashboard_files/        # Forecast CSVs used by the dashboard
+    dashboard_files/        # Small fallback/sample forecast CSVs
     reference/              # Site details, recommendations, PurpleAir sensors
   api/v1/                   # FastAPI routes
   scripts/                  # Run helpers
@@ -68,10 +68,10 @@ Optional: override PurpleAir key with `PURPLEAIR_API_KEY` in your environment.
 By default, the dashboard reads forecast CSVs from:
 
 ```text
-data/dashboard_files/
+/mnt/scratch_lustre/ar_aichem_scratch/Nawcasting_Dashboard_Files/
 ```
 
-You can override that with:
+You can override that deliberately with:
 
 ```bash
 export CSV_DATA_FILE_PATH=/path/to/forecast/csvs

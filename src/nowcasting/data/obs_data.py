@@ -270,6 +270,26 @@ MONITORING_CATEGORY_COLORS = {
 PURPLEAIR_COLOR = "#7e22ce"
 
 
+def _parse_observation_time(item):
+    if not item:
+        return (datetime.min, -1)
+    date_value = str(item.get("Date") or item.get("date") or "").strip()
+    parsed_date = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            parsed_date = datetime.strptime(date_value, fmt)
+            break
+        except ValueError:
+            continue
+    try:
+        parsed_hour = int(item.get("Hour") or item.get("hour") or -1)
+    except (TypeError, ValueError):
+        parsed_hour = -1
+    if not parsed_date:
+        return (datetime.min, parsed_hour)
+    return (parsed_date, parsed_hour)
+
+
 def fetch_observations(query=None, timeout=30):
     """Fetch observations from the NSW API.
 
@@ -456,7 +476,9 @@ def fetch_latest_monitoring_rows(timeout=30):
     latest_by_site = {}
     for item in raw:
         site_id = item.get("Site_Id")
-        if site_id is None:
+        try:
+            site_id_int = int(site_id)
+        except (TypeError, ValueError):
             continue
 
         category = item.get("AirQualityCategory")
@@ -468,9 +490,10 @@ def fetch_latest_monitoring_rows(timeout=30):
         except (TypeError, ValueError):
             hour_value = -1
 
-        existing = latest_by_site.get(site_id)
-        if existing is None or hour_value >= existing["_hour"]:
-            latest_by_site[site_id] = dict(item, _hour=hour_value)
+        observation_time = _parse_observation_time(item)
+        existing = latest_by_site.get(site_id_int)
+        if existing is None or observation_time >= existing["_time"]:
+            latest_by_site[site_id_int] = dict(item, _hour=hour_value, _time=observation_time)
 
     rows = []
     site_lookup = get_site_lookup_by_id()
