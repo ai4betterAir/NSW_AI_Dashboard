@@ -14,12 +14,8 @@ This checks:
 - local AQMS cache latest timestamp
 """
 
-from __future__ import annotations
-
 import csv
 import json
-import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -31,31 +27,49 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
-def run(cmd: list[str]) -> str:
+def run(cmd):
     try:
-        return subprocess.check_output(cmd, cwd=str(REPO_ROOT), text=True, stderr=subprocess.STDOUT).strip()
+        return subprocess.check_output(cmd, cwd=str(REPO_ROOT), universal_newlines=True, stderr=subprocess.STDOUT).strip()
     except Exception as exc:
-        return f"ERROR: {exc}"
+        return "ERROR: %s" % exc
 
 
 def parse_dt(value):
     text = str(value or "").strip()
     if not text:
         return None
-    for candidate in [text, text.replace(" ", "T")]:
-        try:
-            return datetime.fromisoformat(candidate.replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-        try:
-            return datetime.strptime(text, fmt)
-        except Exception:
-            pass
+
+    # datetime.fromisoformat is not available in Python 3.6, so use explicit formats.
+    text_variants = [
+        text,
+        text.replace("T", " "),
+        text.replace("Z", "").replace("T", " "),
+    ]
+    # Remove timezone offset for parsing diagnostics only.
+    cleaned = []
+    for item in text_variants:
+        for marker in ("+",):
+            if marker in item:
+                item = item.split(marker, 1)[0].strip()
+        cleaned.append(item)
+
+    for candidate in cleaned:
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d/%m/%Y",
+        ):
+            try:
+                return datetime.strptime(candidate, fmt)
+            except Exception:
+                pass
     return None
 
 
-def latest_forecast_time_in_csv(path: Path):
+def latest_forecast_time_in_csv(path):
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as fh:
             reader = csv.DictReader(fh)
@@ -66,8 +80,6 @@ def latest_forecast_time_in_csv(path: Path):
                         dt = parse_dt(row.get(key))
                         if dt:
                             candidates.append(dt)
-                # Some dashboard CSVs may store one timestamp column and station columns.
-                # Stop scanning after enough rows for performance.
                 if len(candidates) > 5000:
                     break
             return max(candidates) if candidates else None
@@ -97,48 +109,55 @@ def latest_raw_obs_time(rows):
                 base = datetime.strptime(date.split("T", 1)[0], "%Y-%m-%d")
                 dt = base.replace(hour=int(float(hour)))
             except Exception:
-                pass
+                try:
+                    base = datetime.strptime(date, "%d/%m/%Y")
+                    dt = base.replace(hour=int(float(hour)))
+                except Exception:
+                    pass
         if dt is not None and (latest is None or dt > latest):
             latest = dt
     return latest
 
 
-def main() -> int:
+def main():
     print("=== Dashboard date diagnostics ===")
-    print(f"Repo root: {REPO_ROOT}")
-    print(f"Git branch: {run(['git', 'branch', '--show-current'])}")
-    print(f"Git commit: {run(['git', 'rev-parse', '--short', 'HEAD'])}")
-    print(f"Git latest message: {run(['git', 'log', '-1', '--pretty=%s'])}")
+    print("Repo root: %s" % REPO_ROOT)
+    print("Git branch: %s" % run(["git", "branch", "--show-current"]))
+    print("Git commit: %s" % run(["git", "rev-parse", "--short", "HEAD"]))
+    print("Git latest message: %s" % run(["git", "log", "-1", "--pretty=%s"]))
     print()
 
     try:
         from nowcasting.config import paths
         from nowcasting.data import file_discovery, obs_data
     except Exception as exc:
-        print(f"ERROR importing dashboard modules: {exc}")
+        print("ERROR importing dashboard modules: %s" % exc)
         return 2
 
     print("=== Imported modules ===")
-    print(f"obs_data.py: {Path(obs_data.__file__).resolve()}")
-    print(f"file_discovery.py: {Path(file_discovery.__file__).resolve()}")
-    print(f"DASHBOARD_DATA_DIR: {getattr(paths, 'DASHBOARD_DATA_DIR', None)}")
-    print(f"CSV_DATA_FILE_PATH: {getattr(file_discovery, 'CSV_DATA_FILE_PATH', None)}")
+    print("obs_data.py: %s" % Path(obs_data.__file__).resolve())
+    print("file_discovery.py: %s" % Path(file_discovery.__file__).resolve())
+    print("DASHBOARD_DATA_DIR: %s" % getattr(paths, "DASHBOARD_DATA_DIR", None))
+    print("CSV_DATA_FILE_PATH: %s" % getattr(file_discovery, "CSV_DATA_FILE_PATH", None))
     print()
 
     data_dir = Path(file_discovery.CSV_DATA_FILE_PATH)
-    csvs = sorted(data_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True) if data_dir.exists() else []
+    if data_dir.exists():
+        csvs = sorted(data_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    else:
+        csvs = []
     print("=== Forecast CSV files visible to dashboard ===")
-    print(f"CSV count: {len(csvs)}")
+    print("CSV count: %s" % len(csvs))
     newest_by_name = []
     for p in csvs[:25]:
         mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         latest_ft = latest_forecast_time_in_csv(p)
         newest_by_name.append((latest_ft, p))
-        print(f"{mtime} | latest forecastTime={latest_ft or 'not found'} | {p.name}")
+        print("%s | latest forecastTime=%s | %s" % (mtime, latest_ft or "not found", p.name))
     latest_found = [item for item in newest_by_name if item[0] is not None]
     if latest_found:
         dt, path = max(latest_found, key=lambda item: item[0])
-        print(f"\nLatest forecast timestamp found in scanned files: {dt} from {path.name}")
+        print("\nLatest forecast timestamp found in scanned files: %s from %s" % (dt, path.name))
     else:
         print("\nNo forecastTime column found in the first 25 newest CSVs.")
     print()
@@ -147,14 +166,14 @@ def main() -> int:
     try:
         rows = obs_data.fetch_observations(query=None, timeout=20)
         latest = latest_raw_obs_time(rows)
-        print(f"Rows fetched: {len(rows) if isinstance(rows, list) else 'not a list'}")
-        print(f"Latest AQMS observation visible: {latest or 'not found'}")
+        print("Rows fetched: %s" % (len(rows) if isinstance(rows, list) else "not a list"))
+        print("Latest AQMS observation visible: %s" % (latest or "not found"))
         if isinstance(rows, list) and rows:
             sample = max(rows, key=lambda row: latest_raw_obs_time([row]) or datetime.min)
             print("Sample latest row:")
-            print(json.dumps({k: sample.get(k) for k in ['Site_Id', 'Date', 'Hour', 'HourDescription', 'ParameterCode', 'AirQualityCategory', 'Value']}, indent=2, default=str))
+            print(json.dumps({k: sample.get(k) for k in ["Site_Id", "Date", "Hour", "HourDescription", "ParameterCode", "AirQualityCategory", "Value"]}, indent=2, default=str))
     except Exception as exc:
-        print(f"AQMS fetch error: {exc}")
+        print("AQMS fetch error: %s" % exc)
     print()
 
     print("=== AQMS cache files ===")
@@ -165,11 +184,11 @@ def main() -> int:
         try:
             with path.open("r", encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
-            print(f"{path} | rows={len(rows)} | latest={latest_raw_obs_time(rows) or 'not found'}")
+            print("%s | rows=%s | latest=%s" % (path, len(rows), latest_raw_obs_time(rows) or "not found"))
         except Exception as exc:
-            print(f"{path} | ERROR reading: {exc}")
+            print("%s | ERROR reading: %s" % (path, exc))
 
-    print("\nExpected for your dashboard right now: latest AQMS should be 2026-06-26 around 15:00-16:00, and forecast CSVs should include 2026-06-26 times. If not, the server is reading old data files or old process/code.")
+    print("\nExpected: latest AQMS should be 2026-06-26 around 15:00-16:00, and forecast CSVs should include 2026-06-26 times. If not, the server is reading old data files or old process/code.")
     return 0
 
 
