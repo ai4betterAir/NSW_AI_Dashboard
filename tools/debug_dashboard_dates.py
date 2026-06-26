@@ -5,17 +5,13 @@ Run from the repository root:
 
     python tools/debug_dashboard_dates.py
 
-This checks:
-- current git commit
-- Python module paths being imported
-- dashboard forecast data directory
-- newest forecast CSV files and their latest forecastTime
-- live AQMS latest observation timestamp
-- local AQMS cache latest timestamp
+This avoids expensive stat() calls across the full Lustre forecast folder.
 """
 
 import csv
 import json
+import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -38,35 +34,35 @@ def parse_dt(value):
     text = str(value or "").strip()
     if not text:
         return None
-
-    # datetime.fromisoformat is not available in Python 3.6, so use explicit formats.
-    text_variants = [
-        text,
-        text.replace("T", " "),
-        text.replace("Z", "").replace("T", " "),
-    ]
-    # Remove timezone offset for parsing diagnostics only.
+    text_variants = [text, text.replace("T", " "), text.replace("Z", "").replace("T", " ")]
     cleaned = []
     for item in text_variants:
-        for marker in ("+",):
-            if marker in item:
-                item = item.split(marker, 1)[0].strip()
+        if "+" in item:
+            item = item.split("+", 1)[0].strip()
         cleaned.append(item)
-
     for candidate in cleaned:
-        for fmt in (
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%d",
-            "%d/%m/%Y %H:%M:%S",
-            "%d/%m/%Y %H:%M",
-            "%d/%m/%Y",
-        ):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
             try:
                 return datetime.strptime(candidate, fmt)
             except Exception:
                 pass
     return None
+
+
+def filename_date_score(name):
+    """Score file names by date/run tokens without touching filesystem metadata."""
+    text = str(name or "")
+    dates = re.findall(r"(20\d{6})", text)
+    date_score = int(dates[-1]) if dates else 0
+    run_score = 0
+    # Common forms: _09AEST.csv, _09.csv, 20260626_09AEST.csv
+    matches = re.findall(r"(?:_|^)(\d{2})(?:AEST|AEDT)?(?:\.csv|$)", text)
+    if matches:
+        try:
+            run_score = int(matches[-1])
+        except Exception:
+            run_score = 0
+    return (date_score, run_score, text)
 
 
 def latest_forecast_time_in_csv(path):
@@ -119,6 +115,19 @@ def latest_raw_obs_time(rows):
     return latest
 
 
+def list_forecast_candidates(data_dir, limit=40):
+    """List likely latest forecast CSVs without stat() on every file."""
+    try:
+        names = [name for name in os.listdir(str(data_dir)) if name.lower().endswith(".csv")]
+    except Exception as exc:
+        print("ERROR listing forecast folder: %s" % exc)
+        return [], 0
+    # Prefer filenames carrying recent date tokens. This is much faster than stat()
+    # on a large shared Lustre folder.
+    names_sorted = sorted(names, key=filename_date_score, reverse=True)
+    return [data_dir / name for name in names_sorted[:limit]], len(names)
+
+
 def main():
     print("=== Dashboard date diagnostics ===")
     print("Repo root: %s" % REPO_ROOT)
@@ -142,24 +151,20 @@ def main():
     print()
 
     data_dir = Path(file_discovery.CSV_DATA_FILE_PATH)
-    if data_dir.exists():
-        csvs = sorted(data_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-    else:
-        csvs = []
     print("=== Forecast CSV files visible to dashboard ===")
-    print("CSV count: %s" % len(csvs))
+    csvs, total_count = list_forecast_candidates(data_dir, limit=40)
+    print("CSV count: %s" % total_count)
     newest_by_name = []
-    for p in csvs[:25]:
-        mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    for p in csvs:
         latest_ft = latest_forecast_time_in_csv(p)
         newest_by_name.append((latest_ft, p))
-        print("%s | latest forecastTime=%s | %s" % (mtime, latest_ft or "not found", p.name))
+        print("filenameScore=%s | latest forecastTime=%s | %s" % (filename_date_score(p.name)[:2], latest_ft or "not found", p.name))
     latest_found = [item for item in newest_by_name if item[0] is not None]
     if latest_found:
         dt, path = max(latest_found, key=lambda item: item[0])
         print("\nLatest forecast timestamp found in scanned files: %s from %s" % (dt, path.name))
     else:
-        print("\nNo forecastTime column found in the first 25 newest CSVs.")
+        print("\nNo forecastTime column found in scanned candidate CSVs.")
     print()
 
     print("=== Live AQMS observation fetch ===")
@@ -188,7 +193,7 @@ def main():
         except Exception as exc:
             print("%s | ERROR reading: %s" % (path, exc))
 
-    print("\nExpected: latest AQMS should be 2026-06-26 around 15:00-16:00, and forecast CSVs should include 2026-06-26 times. If not, the server is reading old data files or old process/code.")
+    print("\nExpected: forecast files should include 20260626 and latest AQMS should be around 2026-06-26 15:00-16:00. If forecast latest remains 2026-06-25, copy/generate 26 Jun forecast CSVs into CSV_DATA_FILE_PATH above.")
     return 0
 
 
