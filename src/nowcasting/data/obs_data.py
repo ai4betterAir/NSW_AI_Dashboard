@@ -1,18 +1,28 @@
-"""Helpers for latest air-quality observations used by monitoring views."""
+"""Helpers for latest air-quality observations used by monitoring views.
+
+The Dashboard should never present an old bundled/cache snapshot as if it is the
+current AQMS observation. This module normalises NSW AQMS date formats and only
+falls back to the cache for the live snapshot when the cache is still recent.
+"""
 
 import ast
+import csv
 import json
 import math
 import os
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from nowcasting.config.paths import PURPLEAIR_SENSORS_JS, DASHBOARD_DATA_DIR
-import csv
-from pathlib import Path
-from nowcasting.data.dashboard_data import category_for_value, load_sites, pollutant_by_label, title_case_station_name
+from nowcasting.config.paths import DASHBOARD_DATA_DIR, PURPLEAIR_SENSORS_JS
+from nowcasting.data.dashboard_data import (
+    category_for_value,
+    load_sites,
+    pollutant_by_label,
+    title_case_station_name,
+)
 
 
 OBSERVATION_URL = "https://data.airquality.nsw.gov.au/api/Data/get_Observations"
@@ -23,6 +33,32 @@ _CACHE_DIR = Path(DASHBOARD_DATA_DIR) / "monitoring_cache"
 _OBS_CACHE_CSV = _CACHE_DIR / "observations.csv"
 _PURPLEAIR_SNAPSHOT_JSON = _CACHE_DIR / "purpleair_snapshot.json"
 
+SYDNEY_TZ = timezone(timedelta(hours=10))
+PURPLEAIR_API_KEY = os.environ.get("PURPLEAIR_API_KEY", "D80F3AFD-DDAD-11ED-BD21-42010A800008")
+PURPLEAIR_SNAPSHOT_URL = "https://api.purpleair.com/v1/sensors"
+PURPLEAIR_HISTORY_URL = "https://api.purpleair.com/v1/sensors/{sensor_index}/history"
+OBS_CACHE_MAX_AGE_HOURS = int(os.environ.get("DASHBOARD_OBS_CACHE_MAX_AGE_HOURS", "6"))
+
+MONITORING_PARAMETER = {
+    "ParameterCode": "AQC",
+    "ParameterDescription": "AQC",
+    "Units": "category",
+    "UnitsDescription": "category",
+    "Category": "Site AQC",
+    "SubCategory": "Hourly",
+    "Frequency": "Hourly average",
+}
+MONITORING_CATEGORY_ORDER = ["EXTREMELY POOR", "VERY POOR", "POOR", "FAIR", "GOOD"]
+MONITORING_CATEGORY_COLORS = {
+    "GOOD": "#16a34a",
+    "FAIR": "#facc15",
+    "POOR": "#f97316",
+    "VERY POOR": "#ef4444",
+    "EXTREMELY POOR": "#7f1d1d",
+    "NO DATA": "#9ca3af",
+}
+PURPLEAIR_COLOR = "#7e22ce"
+
 
 def _ensure_cache_dir():
     try:
@@ -31,138 +67,222 @@ def _ensure_cache_dir():
         pass
 
 
-def _save_observations_cache(rows):
-    """Save a list of observation dicts to CSV cache (overwrites)."""
-    _ensure_cache_dir()
-    if not rows or not isinstance(rows, list):
-        return
-    # Ensure each row exposes top-level ParameterCode/ParameterDescription so
-    # the CSV includes explicit meteorological variable columns (TEMP, HUMID,
-    # WSP, RAIN, etc.) rather than embedding them only inside the `Parameter`
-    # JSON string.
-    def _ensure_param_fields(item):
-        if not isinstance(item, dict):
-            return
-        param = item.get("Parameter")
-        if isinstance(param, str):
-            # try to parse JSON-like string
+def _coerce_parameter_dict(item):
+    if not isinstance(item, dict):
+        return {}
+    param = item.get("Parameter") or {}
+    if isinstance(param, str):
+        text = param.strip()
+        if text:
             try:
-                parsed = json.loads(param)
-                param = parsed
+                param = json.loads(text)
             except Exception:
-                param = None
-        if isinstance(param, dict):
-            code = param.get("ParameterCode") or param.get("Code")
-            desc = param.get("ParameterDescription") or param.get("Description")
-            if code is not None:
-                # store as plain string for CSV column
-                item["ParameterCode"] = str(code)
-            if desc is not None:
-                item["ParameterDescription"] = str(desc)
+                try:
+                    param = ast.literal_eval(text)
+                except Exception:
+                    param = {}
+    return param if isinstance(param, dict) else {}
 
-    # Collect union of keys
-    keys = set()
-    for r in rows:
-        _ensure_param_fields(r)
-        if isinstance(r, dict):
-            keys.update(r.keys())
-    keys = sorted(list(keys))
-    try:
-        # Merge with existing cache to avoid duplicates. Key by Site_Id/Date/Hour when available.
-        existing = _load_observations_cache() or []
-        key_fields = ("Site_Id", "SiteId", "SiteId", "site_id", "Date", "Hour")
 
-        def make_key(item):
-            # Use Site/Date/Hour plus ParameterCode when present so different
-            # parameters (TEMP, HUMID, WSP, etc.) at the same site/hour are
-            # preserved rather than overwritten.
-            if not isinstance(item, dict):
-                return None
-            sid = item.get("Site_Id") or item.get("site_id") or item.get("SiteId") or item.get("SiteID")
-            date = item.get("Date")
-            hour = item.get("Hour")
-            param = item.get("Parameter") or {}
-            param_code = None
-            if isinstance(param, dict):
-                param_code = param.get("ParameterCode")
-            return f"{sid}::{date}::{hour}::{param_code or ''}"
+def _normalise_date_value(value):
+    """Return YYYY-MM-DD for common NSW API/cache date formats."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
 
-        merged_map = {}
-        # Normalize existing rows from cache as well so they gain ParameterCode
-        # if previously missing.
-        for r in existing:
-            _ensure_param_fields(r)
-            k = make_key(r)
-            if k is None:
-                # fallback to full-json key
-                k = json.dumps(r, sort_keys=True)
-            merged_map[k] = r
-
-        for r in rows:
-            _ensure_param_fields(r)
-            if not isinstance(r, dict):
+    # Common API forms: 2026-06-26, 2026-06-26T00:00:00, 26/06/2026.
+    candidates = [
+        text,
+        text.split("T", 1)[0],
+        text.split(" ", 1)[0],
+    ]
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(candidate, fmt).date().isoformat()
+            except ValueError:
                 continue
-            k = make_key(r)
-            if k is None:
-                k = json.dumps(r, sort_keys=True)
-            merged_map[k] = r
 
-        merged = list(merged_map.values())
+    # Last-resort ISO parser without adding heavy dependencies.
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return text
 
-        # Recompute keys union across merged rows
-        keys = set()
-        for r in merged:
-            if isinstance(r, dict):
-                keys.update(r.keys())
-        keys = sorted(list(keys))
 
+def _parse_hour(value):
+    try:
+        hour = int(float(str(value).strip()))
+    except Exception:
+        return -1
+    return hour
+
+
+def _observation_datetime(item):
+    if not isinstance(item, dict):
+        return None
+    date_text = _normalise_date_value(item.get("Date") or item.get("date"))
+    try:
+        base = datetime.strptime(date_text, "%Y-%m-%d")
+    except Exception:
+        return None
+    hour = _parse_hour(item.get("Hour") or item.get("hour"))
+    if hour < 0:
+        return base.replace(tzinfo=SYDNEY_TZ)
+    if hour >= 24:
+        base = base + timedelta(days=1)
+        hour = 0
+    return base.replace(hour=hour, tzinfo=SYDNEY_TZ)
+
+
+def _normalise_observation_row(row):
+    if not isinstance(row, dict):
+        return row
+    row = dict(row)
+    date_value = _normalise_date_value(row.get("Date") or row.get("date"))
+    if date_value:
+        row["Date"] = date_value
+    if "Hour" in row:
+        try:
+            row["Hour"] = str(int(float(row.get("Hour"))))
+        except Exception:
+            pass
+
+    param = _coerce_parameter_dict(row)
+    if param:
+        row["Parameter"] = param
+        code = param.get("ParameterCode") or param.get("Code")
+        desc = param.get("ParameterDescription") or param.get("Description")
+        units = param.get("Units")
+        if code is not None:
+            row["ParameterCode"] = str(code)
+        if desc is not None:
+            row["ParameterDescription"] = str(desc)
+        if units is not None:
+            row["Units"] = str(units)
+    elif row.get("ParameterCode"):
+        row["Parameter"] = {
+            "ParameterCode": row.get("ParameterCode"),
+            "ParameterDescription": row.get("ParameterDescription") or row.get("ParameterCode"),
+            "Units": row.get("Units") or "",
+            "Frequency": row.get("Frequency") or "Hourly average",
+        }
+    return row
+
+
+def _normalise_observation_rows(rows):
+    if not isinstance(rows, list):
+        return []
+    return [_normalise_observation_row(row) for row in rows if isinstance(row, dict)]
+
+
+def _latest_observation_datetime(rows):
+    latest = None
+    for row in rows or []:
+        dt = _observation_datetime(row)
+        if dt is not None and (latest is None or dt > latest):
+            latest = dt
+    return latest
+
+
+def _rows_are_recent(rows, max_age_hours=OBS_CACHE_MAX_AGE_HOURS):
+    latest = _latest_observation_datetime(rows)
+    if latest is None:
+        return False
+    now = datetime.now(SYDNEY_TZ)
+    age = now - latest
+    # Allow a small future tolerance in case the API labels the ending hour.
+    return timedelta(hours=-1) <= age <= timedelta(hours=max_age_hours)
+
+
+def _save_observations_cache(rows):
+    """Save observation rows to CSV cache, preserving different parameters."""
+    rows = _normalise_observation_rows(rows)
+    if not rows:
+        return
+    _ensure_cache_dir()
+
+    try:
+        existing = _load_observations_cache(ignore_staleness=True) or []
+    except Exception:
+        existing = []
+
+    def make_key(item):
+        sid = item.get("Site_Id") or item.get("site_id") or item.get("SiteId") or item.get("SiteID")
+        date = item.get("Date") or item.get("date")
+        hour = item.get("Hour") or item.get("hour")
+        param = _coerce_parameter_dict(item)
+        param_code = param.get("ParameterCode") or item.get("ParameterCode") or ""
+        return f"{sid}::{date}::{hour}::{param_code}"
+
+    merged_map = {}
+    for item in existing + rows:
+        if not isinstance(item, dict):
+            continue
+        item = _normalise_observation_row(item)
+        merged_map[make_key(item)] = item
+    merged = list(merged_map.values())
+
+    # Keep the cache bounded so an old huge CSV cannot dominate startup.
+    latest = _latest_observation_datetime(merged)
+    if latest is not None:
+        cutoff = latest - timedelta(days=4)
+        merged = [r for r in merged if (_observation_datetime(r) or latest) >= cutoff]
+
+    keys = sorted({k for row in merged for k in row.keys()})
+    try:
         with _OBS_CACHE_CSV.open("w", encoding="utf-8", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
             writer.writeheader()
-            for r in merged:
-                row = {}
-                for k in keys:
-                    v = r.get(k) if isinstance(r, dict) else None
-                    # Flatten lists/dicts to JSON-like strings
-                    if isinstance(v, (list, dict)):
-                        try:
-                            row[k] = json.dumps(v, ensure_ascii=False)
-                        except Exception:
-                            row[k] = str(v)
+            for row in merged:
+                out = {}
+                for key in keys:
+                    value = row.get(key)
+                    if isinstance(value, (dict, list)):
+                        out[key] = json.dumps(value, ensure_ascii=False)
                     else:
-                        row[k] = "" if v is None else str(v)
-                writer.writerow(row)
+                        out[key] = "" if value is None else str(value)
+                writer.writerow(out)
     except Exception:
         return
 
 
-def _load_observations_cache():
-    """Load cached observations from CSV if present, returning list of dicts."""
+def _load_observations_cache(ignore_staleness=False):
+    """Load cached observations; by default only return them if still recent."""
     if not _OBS_CACHE_CSV.exists():
         return []
-    out = []
+    rows = []
     try:
         with _OBS_CACHE_CSV.open("r", encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
-                # Try to parse JSON-like strings back to python structures when possible
                 parsed = {}
-                for k, v in row.items():
-                    if v is None:
-                        parsed[k] = None
+                for key, value in row.items():
+                    if value is None:
+                        parsed[key] = None
                         continue
-                    text = v.strip()
+                    text = str(value).strip()
                     if (text.startswith("[") and text.endswith("]")) or (text.startswith("{") and text.endswith("}")):
                         try:
-                            parsed[k] = json.loads(text)
+                            parsed[key] = json.loads(text)
                             continue
                         except Exception:
-                            pass
-                    parsed[k] = text
-                out.append(parsed)
+                            try:
+                                parsed[key] = ast.literal_eval(text)
+                                continue
+                            except Exception:
+                                pass
+                    parsed[key] = text
+                rows.append(_normalise_observation_row(parsed))
     except Exception:
         return []
-    return out
+
+    if ignore_staleness or _rows_are_recent(rows):
+        return rows
+    return []
 
 
 def _save_purpleair_snapshot_cache(payload):
@@ -196,8 +316,7 @@ def _bundled_monitoring_dirs():
 
 
 def _load_bundled_observations_snapshot():
-    """Load packaged AQMS observations when live access and shared cache are unavailable."""
-
+    """Load packaged AQMS observations only if they are recent enough."""
     seen = set()
     for directory in _bundled_monitoring_dirs():
         if directory in seen or not directory.exists():
@@ -215,14 +334,13 @@ def _load_bundled_observations_snapshot():
             except Exception:
                 continue
             rows = payload.get("items") if isinstance(payload, dict) else payload
-            if isinstance(rows, list) and rows:
+            rows = _normalise_observation_rows(rows)
+            if rows and _rows_are_recent(rows):
                 return rows
     return []
 
 
 def _load_bundled_purpleair_snapshot():
-    """Load a packaged PurpleAir snapshot from the repository when live access fails."""
-
     seen = set()
     for directory in _bundled_monitoring_dirs():
         if directory in seen or not directory.exists():
@@ -245,63 +363,23 @@ def _load_bundled_purpleair_snapshot():
                 payload["source"] = "bundle"
                 return payload
     return None
-SYDNEY_TZ = timezone(timedelta(hours=10))
-PURPLEAIR_API_KEY = os.environ.get("PURPLEAIR_API_KEY", "D80F3AFD-DDAD-11ED-BD21-42010A800008")
-PURPLEAIR_SNAPSHOT_URL = "https://api.purpleair.com/v1/sensors"
-PURPLEAIR_HISTORY_URL = "https://api.purpleair.com/v1/sensors/{sensor_index}/history"
-MONITORING_PARAMETER = {
-    "ParameterCode": "AQC",
-    "ParameterDescription": "AQC",
-    "Units": "category",
-    "UnitsDescription": "category",
-    "Category": "Site AQC",
-    "SubCategory": "Hourly",
-    "Frequency": "Hourly average",
-}
-MONITORING_CATEGORY_ORDER = ["EXTREMELY POOR", "VERY POOR", "POOR", "FAIR", "GOOD"]
-MONITORING_CATEGORY_COLORS = {
-    "GOOD": "#16a34a",
-    "FAIR": "#facc15",
-    "POOR": "#f97316",
-    "VERY POOR": "#ef4444",
-    "EXTREMELY POOR": "#7f1d1d",
-    "NO DATA": "#9ca3af",
-}
-PURPLEAIR_COLOR = "#7e22ce"
 
 
 def _parse_observation_time(item):
-    if not item:
-        return (datetime.min, -1)
-    date_value = str(item.get("Date") or item.get("date") or "").strip()
-    parsed_date = None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            parsed_date = datetime.strptime(date_value, fmt)
-            break
-        except ValueError:
-            continue
-    try:
-        parsed_hour = int(item.get("Hour") or item.get("hour") or -1)
-    except (TypeError, ValueError):
-        parsed_hour = -1
-    if not parsed_date:
-        return (datetime.min, parsed_hour)
-    return (parsed_date, parsed_hour)
+    dt = _observation_datetime(item)
+    hour = _parse_hour((item or {}).get("Hour") or (item or {}).get("hour"))
+    if dt is None:
+        return (datetime.min, hour)
+    return (dt.replace(tzinfo=None), hour)
 
 
 def fetch_observations(query=None, timeout=30):
-    """Fetch observations from the NSW API.
+    """Fetch NSW AQMS observations.
 
-    - When query is None, returns the current hourly snapshot (body is an empty string).
-    - When query is a dict, it is POSTed as JSON (used for historical queries).
+    For live snapshots (`query is None`), stale cache/bundled rows are not returned.
+    For historical requests, failures return [] rather than unrelated cached rows.
     """
-
-    if query is None:
-        data = b'""'
-    else:
-        data = json.dumps(query).encode("utf-8")
-
+    data = b'""' if query is None else json.dumps(query).encode("utf-8")
     request = Request(
         OBSERVATION_URL,
         data=data,
@@ -313,7 +391,8 @@ def fetch_observations(query=None, timeout=30):
         with urlopen(request, timeout=timeout) as response:
             raw = json.loads(response.read().decode("utf-8"))
     except Exception:
-        # On network error, fall back to cached observations if available
+        if query is not None:
+            return []
         cached = _load_observations_cache()
         if cached:
             return cached
@@ -326,27 +405,19 @@ def fetch_observations(query=None, timeout=30):
             return bundled
         return []
 
-    # Save successful fetch to cache for offline reuse
+    rows = _normalise_observation_rows(raw)
+    if not rows:
+        return []
     try:
-        if isinstance(raw, list):
-            _save_observations_cache(raw)
+        _save_observations_cache(rows)
     except Exception:
         pass
-
-    if not isinstance(raw, list):
-        return []
-    return raw
+    return rows
 
 
 def fetch_observation_history(site_ids, parameter_codes, start_date, end_date, timeout=30):
-    """Fetch historical hourly observations for one or more sites.
-
-    The NSW API expects a full query object for historical requests.
-    """
-
     if not site_ids or not parameter_codes:
         return []
-
     query = {
         "Parameters": list(parameter_codes),
         "Sites": [int(site_id) for site_id in site_ids],
@@ -363,18 +434,14 @@ def fetch_observation_history(site_ids, parameter_codes, start_date, end_date, t
 def get_site_lookup_by_id():
     lookup = {}
     for site in load_sites():
-        site_id = site.get("Site_Id")
+        site_id = site.get("Site_Id") or site.get("SiteId") or site.get("SiteID")
         if site_id is None:
             continue
-        lookup[int(site_id)] = site
+        try:
+            lookup[int(site_id)] = site
+        except Exception:
+            continue
     return lookup
-
-
-def _sydney_today_and_tomorrow():
-    now = datetime.now(SYDNEY_TZ)
-    today = now.date().isoformat()
-    tomorrow = (now.date() + timedelta(days=1)).isoformat()
-    return today, tomorrow
 
 
 def _category_sort_key(category):
@@ -400,11 +467,9 @@ def _extract_js_array(text, marker):
     start = text.find(marker)
     if start < 0:
         return []
-
     start = text.find("[", start)
     if start < 0:
         return []
-
     depth = 0
     in_string = False
     quote = ""
@@ -419,7 +484,6 @@ def _extract_js_array(text, marker):
             elif char == quote:
                 in_string = False
             continue
-
         if char in {"'", '"'}:
             in_string = True
             quote = char
@@ -428,8 +492,10 @@ def _extract_js_array(text, marker):
         elif char == "]":
             depth -= 1
             if depth == 0:
-                return ast.literal_eval(text[start : index + 1])
-
+                try:
+                    return ast.literal_eval(text[start : index + 1])
+                except Exception:
+                    return []
     return []
 
 
@@ -439,15 +505,18 @@ def load_purpleair_sensors():
         text = PURPLEAIR_SENSORS_PATH.read_text(encoding="utf-8")
     except OSError:
         return []
-
     rows = []
     for item in _extract_js_array(text, "data:"):
         if len(item) < 4:
             continue
         sensor_id, name, lat, lon = item[:4]
+        try:
+            sensor_id = int(sensor_id)
+        except Exception:
+            continue
         rows.append(
             {
-                "site_id": int(sensor_id),
+                "site_id": sensor_id,
                 "station": str(name),
                 "lat": lat,
                 "lon": lon,
@@ -467,40 +536,30 @@ def load_purpleair_sensors():
 
 
 def fetch_latest_monitoring_rows(timeout=30):
-    """Fetch the latest AQMS observation for each site and return dashboard rows."""
-    # Use fetch_observations which has caching/fallback built-in.
     raw = fetch_observations(query=None, timeout=timeout)
     if not isinstance(raw, list):
         return []
 
     latest_by_site = {}
     for item in raw:
-        site_id = item.get("Site_Id")
+        site_id = item.get("Site_Id") or item.get("SiteId") or item.get("SiteID")
         try:
             site_id_int = int(site_id)
-        except (TypeError, ValueError):
+        except Exception:
             continue
-
         category = item.get("AirQualityCategory")
         if category in (None, "", "N/A"):
             continue
-
-        try:
-            hour_value = int(item.get("Hour") or -1)
-        except (TypeError, ValueError):
-            hour_value = -1
-
         observation_time = _parse_observation_time(item)
         existing = latest_by_site.get(site_id_int)
         if existing is None or observation_time >= existing["_time"]:
-            latest_by_site[site_id_int] = dict(item, _hour=hour_value, _time=observation_time)
+            latest_by_site[site_id_int] = dict(item, _time=observation_time)
 
     rows = []
     site_lookup = get_site_lookup_by_id()
     for site_id, item in latest_by_site.items():
         site = site_lookup.get(int(site_id), {})
         category = item.get("AirQualityCategory")
-        value = item.get("Value")
         rows.append(
             {
                 "site_id": int(site_id),
@@ -511,7 +570,7 @@ def fetch_latest_monitoring_rows(timeout=30):
                 "date": item.get("Date"),
                 "hour": item.get("Hour"),
                 "hour_description": item.get("HourDescription"),
-                "value": value,
+                "value": item.get("Value"),
                 "category": _format_category(category),
                 "category_key": str(category or "").strip().upper(),
                 "category_color": _monitoring_color(category),
@@ -520,18 +579,11 @@ def fetch_latest_monitoring_rows(timeout=30):
             }
         )
 
-    rows.sort(
-        key=lambda row: (
-            _category_sort_key(row.get("category_key")),
-            -(int(row.get("hour") or -1)),
-            row.get("station") or "",
-        )
-    )
+    rows.sort(key=lambda row: (_category_sort_key(row.get("category_key")), -_parse_hour(row.get("hour")), row.get("station") or ""))
     return rows
 
 
 def fetch_monitoring_and_purpleair_rows(timeout=30):
-    """Fetch live AQMS rows and append the static PurpleAir sensor layer."""
     return fetch_latest_monitoring_rows(timeout=timeout) + load_purpleair_sensors()
 
 
@@ -546,8 +598,6 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 
 
 def fetch_purpleair_snapshot(bounds=None, timeout=30):
-    """Fetch PurpleAir sensors snapshot within bounds."""
-
     if not PURPLEAIR_API_KEY:
         return {"sensors": [], "fetched_at": None, "error": "PurpleAir API key missing."}
 
@@ -564,13 +614,9 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
         "humidity",
         "last_seen",
     ]
-
     query = "fields=" + "%2C%20".join(fields)
     if bounds:
-        query += (
-            f"&nwlng={bounds.get('west')}&nwlat={bounds.get('north')}"
-            f"&selng={bounds.get('east')}&selat={bounds.get('south')}"
-        )
+        query += f"&nwlng={bounds.get('west')}&nwlat={bounds.get('north')}&selng={bounds.get('east')}&selat={bounds.get('south')}"
     url = f"{PURPLEAIR_SNAPSHOT_URL}?{query}"
 
     request = Request(url, headers={"X-API-Key": PURPLEAIR_API_KEY, "accept": "application/json"}, method="GET")
@@ -578,7 +624,6 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
         with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, OSError, ValueError) as exc:
-        # Return cached snapshot when network fails
         cached = _load_purpleair_snapshot_cache()
         cached_error = cached.get("error") if isinstance(cached, dict) else None
         if cached and cached_error != "No cache":
@@ -620,10 +665,9 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
     for row in data:
         if not isinstance(row, list) or len(row) <= id_idx:
             continue
-        sensor_index = row[id_idx]
         try:
-            sensor_index = int(sensor_index)
-        except (TypeError, ValueError):
+            sensor_index = int(row[id_idx])
+        except Exception:
             continue
 
         def get(field):
@@ -649,9 +693,7 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
             }
         )
 
-    fetched_at = payload.get("time_stamp") or payload.get("data_time_stamp")
-    out = {"sensors": snapshot, "fetched_at": fetched_at, "error": None}
-    out["source"] = "live"
+    out = {"sensors": snapshot, "fetched_at": payload.get("time_stamp") or payload.get("data_time_stamp"), "error": None, "source": "live"}
     try:
         _save_purpleair_snapshot_cache(out)
     except Exception:
@@ -664,74 +706,55 @@ def fetch_purpleair_sensor_history(sensor_index, start_timestamp, end_timestamp,
         return {"fields": [], "data": [], "error": "PurpleAir API key missing."}
     if not sensor_index:
         return {"fields": [], "data": [], "error": "sensor_index missing."}
-
     fields = fields or ["pm2.5_alt"]
     field_param = "%2C".join(fields)
-    url = (
-        PURPLEAIR_HISTORY_URL.format(sensor_index=int(sensor_index))
-        + f"?start_timestamp={int(start_timestamp)}&end_timestamp={int(end_timestamp)}&average={int(average)}&fields={field_param}"
-    )
-
+    url = PURPLEAIR_HISTORY_URL.format(sensor_index=int(sensor_index)) + f"?start_timestamp={int(start_timestamp)}&end_timestamp={int(end_timestamp)}&average={int(average)}&fields={field_param}"
     request = Request(url, headers={"X-API-Key": PURPLEAIR_API_KEY, "accept": "application/json"}, method="GET")
     try:
         with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, OSError, ValueError) as exc:
         return {"fields": [], "data": [], "error": str(exc)}
-
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return {"fields": [], "data": [], "error": "Unexpected PurpleAir history payload."}
-
     return {"fields": payload.get("fields") or [], "data": payload.get("data") or [], "error": None}
 
 
 def purpleair_clusters(snapshot, bin_degrees=0.05, pollutant_label="PM2.5"):
-    """Cluster PurpleAir sensors into coarse bins for dashboard summaries."""
-
     sensors = snapshot or []
     bins = {}
     for sensor in sensors:
         lat = sensor.get("lat")
         lon = sensor.get("lon")
-        if lat is None or lon is None:
-            continue
         try:
             lat = float(lat)
             lon = float(lon)
-        except (TypeError, ValueError):
+        except Exception:
             continue
-
         key = (round(lat / bin_degrees) * bin_degrees, round(lon / bin_degrees) * bin_degrees)
         bins.setdefault(key, []).append(sensor)
 
     def sensor_value(sensor):
-        if pollutant_label == "PM10":
-            return sensor.get("pm10")
-        return sensor.get("pm25")
+        return sensor.get("pm10") if pollutant_label == "PM10" else sensor.get("pm25")
 
     clusters = []
     for cluster_index, ((lat_key, lon_key), members) in enumerate(sorted(bins.items(), key=lambda item: (-len(item[1]), item[0]))):
         values = []
         for member in members:
-            value = sensor_value(member)
             try:
-                value = float(value)
-            except (TypeError, ValueError):
+                value = float(sensor_value(member))
+            except Exception:
                 value = None
             if value is not None:
                 values.append(value)
         mean_value = sum(values) / len(values) if values else None
-
-        category_key, colour = (
-            category_for_value(pollutant_label, mean_value) if mean_value is not None else ("no-data", "#9ca3af")
-        )
+        category_key, colour = category_for_value(pollutant_label, mean_value) if mean_value is not None else ("no-data", "#9ca3af")
         pollutant_meta = pollutant_by_label(pollutant_label) or {}
         category_label = "No data"
         for category in pollutant_meta.get("categories") or []:
             if category.get("color") == colour:
                 category_label = category.get("label") or category_label
                 break
-
         clusters.append(
             {
                 "cluster_id": f"PA-{cluster_index + 1}",
@@ -752,34 +775,25 @@ def purpleair_clusters(snapshot, bin_degrees=0.05, pollutant_label="PM2.5"):
 def nearest_purpleair_sensor(lat, lon, sensors, max_distance_km=35):
     best = None
     best_distance = None
-
     if lat is None or lon is None:
         return None
     try:
         lat = float(lat)
         lon = float(lon)
-    except (TypeError, ValueError):
+    except Exception:
         return None
-
     for sensor in sensors or []:
-        s_lat = sensor.get("lat")
-        s_lon = sensor.get("lon")
-        if s_lat is None or s_lon is None:
-            continue
         try:
-            s_lat = float(s_lat)
-            s_lon = float(s_lon)
-        except (TypeError, ValueError):
+            s_lat = float(sensor.get("lat"))
+            s_lon = float(sensor.get("lon"))
+        except Exception:
             continue
-
         distance = _haversine_km(lat, lon, s_lat, s_lon)
         if best_distance is None or distance < best_distance:
             best_distance = distance
             best = sensor
-
     if best_distance is None or best_distance > max_distance_km:
         return None
-
     payload = dict(best)
     payload["distance_km"] = best_distance
     return payload
