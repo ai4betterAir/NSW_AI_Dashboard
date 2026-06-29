@@ -10,34 +10,57 @@ import csv
 import json
 import math
 import os
+import re
+import threading
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from html import unescape
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from dateutil import parser as date_parser
+from dateutil import tz
 
 from nowcasting.config.paths import DASHBOARD_DATA_DIR, PURPLEAIR_SENSORS_JS
 from nowcasting.data.dashboard_data import (
     category_for_value,
     load_sites,
+    load_site_lookup,
+    normalize_station_name,
     pollutant_by_label,
     title_case_station_name,
 )
 
 
-OBSERVATION_URL = "https://data.airquality.nsw.gov.au/api/Data/get_Observations"
-SITE_DETAILS_URL = "https://data.airquality.nsw.gov.au/api/Data/get_SiteDetails"
-PARAMETER_DETAILS_URL = "https://data.airquality.nsw.gov.au/api/Data/get_ParameterDetails"
+NSW_AQMS_API_BASE_URL = os.environ.get(
+    "NSW_AQMS_API_BASE_URL",
+    "https://data.airquality.nsw.gov.au/api/Data",
+).rstrip("/")
+OBSERVATION_URL = f"{NSW_AQMS_API_BASE_URL}/get_Observations"
+SITE_DETAILS_URL = f"{NSW_AQMS_API_BASE_URL}/get_SiteDetails"
+PARAMETER_DETAILS_URL = f"{NSW_AQMS_API_BASE_URL}/get_ParameterDetails"
+NSW_AQMS_CURRENT_REPORT_URL = os.environ.get(
+    "NSW_AQMS_CURRENT_REPORT_URL",
+    "https://airquality.environment.nsw.gov.au/aquisnetnswphp/getPage.php?reportid=2",
+)
+NSW_DUSTWATCH_FEATURE_URL = os.environ.get(
+    "NSW_DUSTWATCH_FEATURE_URL",
+    "https://portal.data.nsw.gov.au/arcgis/rest/services/Hosted/"
+    "Air_Quality_Index_Public/FeatureServer/0/query",
+)
 PURPLEAIR_SENSORS_PATH = PURPLEAIR_SENSORS_JS
 _CACHE_DIR = Path(DASHBOARD_DATA_DIR) / "monitoring_cache"
 _OBS_CACHE_CSV = _CACHE_DIR / "observations.csv"
 _PURPLEAIR_SNAPSHOT_JSON = _CACHE_DIR / "purpleair_snapshot.json"
 
-SYDNEY_TZ = timezone(timedelta(hours=10))
+SYDNEY_TZ = tz.gettz("Australia/Sydney")
 PURPLEAIR_API_KEY = os.environ.get("PURPLEAIR_API_KEY", "D80F3AFD-DDAD-11ED-BD21-42010A800008")
 PURPLEAIR_SNAPSHOT_URL = "https://api.purpleair.com/v1/sensors"
 PURPLEAIR_HISTORY_URL = "https://api.purpleair.com/v1/sensors/{sensor_index}/history"
 OBS_CACHE_MAX_AGE_HOURS = int(os.environ.get("DASHBOARD_OBS_CACHE_MAX_AGE_HOURS", "6"))
+PURPLEAIR_CACHE_MAX_AGE_HOURS = int(os.environ.get("DASHBOARD_PURPLEAIR_CACHE_MAX_AGE_HOURS", "2"))
 
 MONITORING_PARAMETER = {
     "ParameterCode": "AQC",
@@ -179,6 +202,19 @@ def _normalise_observation_rows(rows):
     return [_normalise_observation_row(row) for row in rows if isinstance(row, dict)]
 
 
+def _extract_observation_rows(payload):
+    """Accept both the legacy bare list and the current NSW API response."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("Values", "values", "Items", "items"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return rows
+    return []
+
+
 def _latest_observation_datetime(rows):
     latest = None
     for row in rows or []:
@@ -196,6 +232,252 @@ def _rows_are_recent(rows, max_age_hours=OBS_CACHE_MAX_AGE_HOURS):
     age = now - latest
     # Allow a small future tolerance in case the API labels the ending hour.
     return timedelta(hours=-1) <= age <= timedelta(hours=max_age_hours)
+
+
+def observation_rows_status(rows, max_age_hours=OBS_CACHE_MAX_AGE_HOURS):
+    """Return serialisable freshness metadata for a set of AQMS rows."""
+    latest = _latest_observation_datetime(rows)
+    return {
+        "latest": latest.isoformat() if latest is not None else None,
+        "latest_epoch": latest.timestamp() if latest is not None else None,
+        "recent": _rows_are_recent(rows, max_age_hours=max_age_hours),
+    }
+
+
+def _clean_report_cell(value):
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def _parse_official_current_report(payload):
+    """Parse the official NSW hourly data-readings HTML into API-shaped rows."""
+    text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload or "")
+    timestamp_match = re.search(r"reportid=2(?:&amp;|&)date=(\d{14})", text, flags=re.IGNORECASE)
+    if not timestamp_match:
+        return []
+    try:
+        report_time = datetime.strptime(timestamp_match.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return []
+
+    date_value = report_time.strftime("%Y-%m-%d")
+    hour = report_time.hour
+    start_time = report_time - timedelta(hours=1)
+    hour_description = f"{start_time.strftime('%-I %p').lower()} - {report_time.strftime('%-I %p').lower()}"
+    site_lookup = load_site_lookup()
+    category_by_class = {
+        "i1": "GOOD",
+        "i2": "FAIR",
+        "i3": "POOR",
+        "i4": "VERY POOR",
+        "i5": "EXTREMELY POOR",
+    }
+    columns = [
+        ("OZONE", "Ozone", "pphm", "Hourly average"),
+        ("OZONE", "Ozone", "pphm", "4h rolling average derived from 1h average"),
+        ("OZONE", "Ozone", "pphm", "8h rolling average derived from 1h average"),
+        ("NO2", "Nitrogen dioxide", "pphm", "Hourly average"),
+        ("NEPH", "Visibility", "10^-4 m^-1", "Hourly average"),
+        ("CO", "Carbon monoxide", "ppm", "Hourly average"),
+        ("SO2", "Sulfur dioxide", "pphm", "Hourly average"),
+        ("PM10", "PM 10", "µg/m³", "Hourly average"),
+        ("PM2.5", "PM 2.5", "µg/m³", "Hourly average"),
+    ]
+
+    rows = []
+    current_region = ""
+    for row_html in re.findall(r"<TR\b[^>]*>(.*?)</TR>", text, flags=re.IGNORECASE | re.DOTALL):
+        cells = []
+        for attributes, body in re.findall(
+            r"<TD\b([^>]*)>(.*?)</TD>",
+            row_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            class_match = re.search(
+                r"class\s*=\s*[\"']?([^\s\"'>]+)",
+                attributes,
+                flags=re.IGNORECASE,
+            )
+            css_class = class_match.group(1).lower() if class_match else ""
+            cells.append((css_class, _clean_report_cell(body)))
+
+        region = next((value for css_class, value in cells if css_class == "region"), "")
+        if region:
+            current_region = region
+        site_index = next(
+            (index for index, (css_class, _value) in enumerate(cells) if css_class == "site"),
+            None,
+        )
+        if site_index is None:
+            continue
+        station_name = cells[site_index][1]
+        site = site_lookup.get(normalize_station_name(station_name)) or {}
+        site_id = site.get("Site_Id") or site.get("SiteId") or site.get("SiteID")
+        try:
+            site_id = int(site_id)
+        except (TypeError, ValueError):
+            continue
+
+        reading_cells = cells[site_index + 1 : site_index + 10]
+        if len(reading_cells) != len(columns):
+            continue
+        site_category = next(
+            (
+                value.upper()
+                for css_class, value in cells[site_index + 10 :]
+                if css_class in category_by_class
+                and value.upper() in set(category_by_class.values())
+            ),
+            None,
+        )
+
+        for (css_class, raw_value), (code, description, units, frequency) in zip(reading_cells, columns):
+            try:
+                value = float(raw_value) if raw_value not in ("", "-", "N/A") else None
+            except (TypeError, ValueError):
+                value = None
+            rows.append(
+                {
+                    "Site_Id": site_id,
+                    "Parameter": {
+                        "ParameterCode": code,
+                        "ParameterDescription": description,
+                        "Units": units,
+                        "Category": "Averages",
+                        "SubCategory": "Hourly",
+                        "Frequency": frequency,
+                    },
+                    "Date": date_value,
+                    "Hour": hour,
+                    "HourDescription": hour_description,
+                    "Value": value,
+                    "AirQualityCategory": category_by_class.get(css_class),
+                    "DeterminingPollutant": None,
+                    "_ReportRegion": current_region,
+                }
+            )
+
+        rows.append(
+            {
+                "Site_Id": site_id,
+                "Parameter": dict(MONITORING_PARAMETER),
+                "Date": date_value,
+                "Hour": hour,
+                "HourDescription": hour_description,
+                "Value": None,
+                "AirQualityCategory": site_category,
+                "DeterminingPollutant": None,
+                "_ReportRegion": current_region,
+            }
+        )
+    return _normalise_observation_rows(rows)
+
+
+def _fetch_official_current_report(timeout=30):
+    request = Request(
+        NSW_AQMS_CURRENT_REPORT_URL,
+        headers={"accept": "text/html", "user-agent": "NSW-AI-Dashboard/1.0"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            rows = _parse_official_current_report(response.read())
+    except Exception:
+        return []
+    rows.extend(_fetch_official_dustwatch_rows(timeout=min(timeout, 8)))
+    return rows if _rows_are_recent(rows) else []
+
+
+def _fetch_official_dustwatch_rows(timeout=8):
+    query = urlencode(
+        {
+            "where": "parametercode in ('PM10d','PM2.5d')",
+            "outFields": "*",
+            "returnGeometry": "false",
+            "resultRecordCount": "500",
+            "f": "json",
+        }
+    )
+    request = Request(
+        f"{NSW_DUSTWATCH_FEATURE_URL}?{query}",
+        headers={"accept": "application/json", "user-agent": "NSW-AI-Dashboard/1.0"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    rows = []
+    for feature in payload.get("features") or []:
+        item = feature.get("attributes") if isinstance(feature, dict) else None
+        if not isinstance(item, dict):
+            continue
+        parameter_code = str(item.get("parametercode") or "").strip()
+        if parameter_code not in {"PM10d", "PM2.5d"}:
+            continue
+        try:
+            site_id = int(item.get("site_id"))
+        except (TypeError, ValueError):
+            continue
+        category = str(item.get("airqualitycategory") or "").strip().upper()
+        if category in {"", "NULL", "NONE", "N/A"}:
+            category = None
+        determining_pollutant = str(item.get("determiningpollutant") or "").strip()
+        if determining_pollutant.upper() in {"", "NULL", "NONE", "N/A"}:
+            determining_pollutant = None
+        rows.append(
+            {
+                "Site_Id": site_id,
+                "Parameter": {
+                    "ParameterCode": parameter_code,
+                    "ParameterDescription": item.get("parameterdescription") or parameter_code,
+                    "Units": item.get("units") or "µg/m³",
+                    "UnitsDescription": item.get("unitsdescription") or "",
+                    "Category": item.get("category") or "Averages",
+                    "SubCategory": item.get("subcategory") or "Hourly",
+                    "Frequency": item.get("frequency") or "Hourly average",
+                },
+                "Date": item.get("date"),
+                "Hour": item.get("hour"),
+                "HourDescription": item.get("hourdescription"),
+                "Value": item.get("value"),
+                "AirQualityCategory": category,
+                "DeterminingPollutant": determining_pollutant,
+                "_ReportRegion": item.get("region"),
+                "_PortalLastUpdated": item.get("portal_last_updated"),
+            }
+        )
+    return _normalise_observation_rows(rows)
+
+
+def _live_observation_fallback(primary_error, timeout):
+    report_rows = _fetch_official_current_report(timeout=timeout)
+    if report_rows:
+        try:
+            _save_observations_cache(report_rows)
+        except Exception:
+            pass
+        return {
+            "rows": report_rows,
+            "source": "official-report",
+            "error": None,
+            "primary_error": primary_error,
+            **observation_rows_status(report_rows),
+        }
+
+    cached = _load_observations_cache()
+    if cached:
+        return {"rows": cached, "source": "cache", "error": primary_error, **observation_rows_status(cached)}
+    bundled = _load_bundled_observations_snapshot()
+    if bundled:
+        try:
+            _save_observations_cache(bundled)
+        except Exception:
+            pass
+        return {"rows": bundled, "source": "bundle", "error": primary_error, **observation_rows_status(bundled)}
+    return {"rows": [], "source": "error", "error": primary_error, **observation_rows_status([])}
 
 
 def _save_observations_cache(rows):
@@ -304,6 +586,60 @@ def _load_purpleair_snapshot_cache():
         return {"sensors": [], "fetched_at": None, "error": "Corrupt cache"}
 
 
+def _timestamp_datetime(value):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        pass
+    try:
+        parsed = date_parser.parse(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _purpleair_payload_latest(payload):
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        _timestamp_datetime(payload.get("fetched_at")),
+        _timestamp_datetime(payload.get("time_stamp")),
+        _timestamp_datetime(payload.get("data_time_stamp")),
+    ]
+    for sensor in payload.get("sensors") or []:
+        if isinstance(sensor, dict):
+            candidates.append(_timestamp_datetime(sensor.get("last_seen")))
+    valid = [value for value in candidates if value is not None]
+    return max(valid) if valid else None
+
+
+def _purpleair_payload_is_recent(payload, max_age_hours=PURPLEAIR_CACHE_MAX_AGE_HOURS):
+    latest = _purpleair_payload_latest(payload)
+    if latest is None:
+        return False
+    age = datetime.now(timezone.utc) - latest
+    return timedelta(minutes=-5) <= age <= timedelta(hours=max_age_hours)
+
+
+def _recent_purpleair_sensors(sensors, max_age_hours=PURPLEAIR_CACHE_MAX_AGE_HOURS):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    rows = []
+    for sensor in sensors or []:
+        if not isinstance(sensor, dict):
+            continue
+        last_seen = _timestamp_datetime(sensor.get("last_seen"))
+        if last_seen is not None and last_seen >= cutoff:
+            rows.append(sensor)
+    return rows
+
+
 def _bundled_monitoring_dirs():
     module_root = Path(__file__).resolve().parents[4]
     server_root = Path(__file__).resolve().parents[3]
@@ -373,13 +709,13 @@ def _parse_observation_time(item):
     return (dt.replace(tzinfo=None), hour)
 
 
-def fetch_observations(query=None, timeout=30):
+def fetch_observations_result(query=None, timeout=30):
     """Fetch NSW AQMS observations.
 
     For live snapshots (`query is None`), stale cache/bundled rows are not returned.
     For historical requests, failures return [] rather than unrelated cached rows.
     """
-    data = b'""' if query is None else json.dumps(query).encode("utf-8")
+    data = json.dumps(query or {}).encode("utf-8")
     request = Request(
         OBSERVATION_URL,
         data=data,
@@ -387,32 +723,35 @@ def fetch_observations(query=None, timeout=30):
         method="POST",
     )
 
+    error = None
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = json.loads(response.read().decode("utf-8"))
-    except Exception:
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
         if query is not None:
-            return []
-        cached = _load_observations_cache()
-        if cached:
-            return cached
-        bundled = _load_bundled_observations_snapshot()
-        if bundled:
-            try:
-                _save_observations_cache(bundled)
-            except Exception:
-                pass
-            return bundled
-        return []
+            return {"rows": [], "source": "error", "error": error, **observation_rows_status([])}
+        return _live_observation_fallback(error, timeout)
 
-    rows = _normalise_observation_rows(raw)
+    rows = _normalise_observation_rows(_extract_observation_rows(raw))
     if not rows:
-        return []
+        error = "NSW AQMS API returned no observation rows."
+        if query is None:
+            return _live_observation_fallback(error, timeout)
+        return {"rows": [], "source": "error", "error": error, **observation_rows_status([])}
+    if query is None and not _rows_are_recent(rows):
+        latest = observation_rows_status(rows).get("latest") or "unknown"
+        error = f"NSW AQMS API returned stale observations (latest: {latest})."
+        return _live_observation_fallback(error, timeout)
     try:
         _save_observations_cache(rows)
     except Exception:
         pass
-    return rows
+    return {"rows": rows, "source": "live", "error": None, **observation_rows_status(rows)}
+
+
+def fetch_observations(query=None, timeout=30):
+    return fetch_observations_result(query=query, timeout=timeout)["rows"]
 
 
 def fetch_observation_history(site_ids, parameter_codes, start_date, end_date, timeout=30):
@@ -424,7 +763,7 @@ def fetch_observation_history(site_ids, parameter_codes, start_date, end_date, t
         "StartDate": str(start_date),
         "EndDate": str(end_date),
         "Categories": ["Averages"],
-        "Subcategories": ["Hourly"],
+        "SubCategories": ["Hourly"],
         "Frequency": ["Hourly average"],
     }
     return fetch_observations(query=query, timeout=timeout)
@@ -535,7 +874,24 @@ def load_purpleair_sensors():
     return rows
 
 
+# Cache for monitoring rows with timestamp
+_monitoring_cache = {"data": None, "timestamp": None}
+_monitoring_cache_lock = threading.Lock()
+
+
 def fetch_latest_monitoring_rows(timeout=30):
+    # Check cache first (1 minute TTL for more current data)
+    if _monitoring_cache_lock:
+        try:
+            with _monitoring_cache_lock:
+                if _monitoring_cache["data"] is not None:
+                    from datetime import datetime
+                    age = (datetime.now() - _monitoring_cache["timestamp"]).total_seconds()
+                    if age < 60:  # 1 minute
+                        return _monitoring_cache["data"]
+        except Exception:
+            pass
+
     raw = fetch_observations(query=None, timeout=timeout)
     if not isinstance(raw, list):
         return []
@@ -580,6 +936,17 @@ def fetch_latest_monitoring_rows(timeout=30):
         )
 
     rows.sort(key=lambda row: (_category_sort_key(row.get("category_key")), -_parse_hour(row.get("hour")), row.get("station") or ""))
+
+    # Update cache
+    if _monitoring_cache_lock:
+        try:
+            with _monitoring_cache_lock:
+                from datetime import datetime
+                _monitoring_cache["data"] = rows
+                _monitoring_cache["timestamp"] = datetime.now()
+        except Exception:
+            pass
+
     return rows
 
 
@@ -626,12 +993,12 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
     except (HTTPError, URLError, OSError, ValueError) as exc:
         cached = _load_purpleair_snapshot_cache()
         cached_error = cached.get("error") if isinstance(cached, dict) else None
-        if cached and cached_error != "No cache":
+        if cached and cached_error != "No cache" and _purpleair_payload_is_recent(cached):
             if isinstance(cached, dict):
-                cached.setdefault("source", "cache")
+                cached["source"] = "cache"
             return cached
         bundled = _load_bundled_purpleair_snapshot()
-        if bundled:
+        if bundled and _purpleair_payload_is_recent(bundled):
             try:
                 _save_purpleair_snapshot_cache(bundled)
             except Exception:
@@ -643,7 +1010,7 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
     data = payload.get("data") or []
     if not isinstance(fields, list) or not isinstance(data, list):
         bundled = _load_bundled_purpleair_snapshot()
-        if bundled:
+        if bundled and _purpleair_payload_is_recent(bundled):
             try:
                 _save_purpleair_snapshot_cache(bundled)
             except Exception:
@@ -693,7 +1060,16 @@ def fetch_purpleair_snapshot(bounds=None, timeout=30):
             }
         )
 
-    out = {"sensors": snapshot, "fetched_at": payload.get("time_stamp") or payload.get("data_time_stamp"), "error": None, "source": "live"}
+    snapshot = _recent_purpleair_sensors(snapshot)
+    fetched_at = payload.get("time_stamp") or payload.get("data_time_stamp") or datetime.now(timezone.utc).timestamp()
+    if not snapshot:
+        return {
+            "sensors": [],
+            "fetched_at": fetched_at,
+            "error": "PurpleAir returned no recently seen sensors.",
+            "source": "stale",
+        }
+    out = {"sensors": snapshot, "fetched_at": fetched_at, "error": None, "source": "live"}
     try:
         _save_purpleair_snapshot_cache(out)
     except Exception:

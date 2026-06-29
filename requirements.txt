@@ -8,3 +8,4 @@ watchdog
 dash
 plotly
 requests
+cachetools

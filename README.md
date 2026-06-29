@@ -62,6 +62,18 @@ scripts/download_monitoring_feeds.py --out-dir data/downloads/monitoring --times
 ```
 
 Optional: override PurpleAir key with `PURPLEAIR_API_KEY` in your environment.
+The dashboard rejects AQMS cache rows older than 6 hours and PurpleAir
+snapshots older than 2 hours by default. Override those limits with
+`DASHBOARD_OBS_CACHE_MAX_AGE_HOURS` and
+`DASHBOARD_PURPLEAIR_CACHE_MAX_AGE_HOURS`.
+If the official service blocks the deployment host, a contract-compatible
+permitted endpoint can be configured with `NSW_AQMS_API_BASE_URL`.
+
+The API freshness diagnostic is available at:
+
+```text
+/api/getObservationStatus
+```
 
 ## Data Paths
 

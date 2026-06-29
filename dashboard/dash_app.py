@@ -41,6 +41,7 @@ from nowcasting.data.obs_data import (
     PURPLEAIR_COLOR,
     fetch_observation_history,
     fetch_observations,
+    fetch_observations_result,
     fetch_monitoring_and_purpleair_rows,
     fetch_purpleair_sensor_history,
     fetch_purpleair_snapshot,
@@ -56,11 +57,10 @@ RECOMMENDATIONS_PATHS = [RECOMMENDATIONS_JSON]
 
 OPTIONS = get_options()
 FILE_KEY_PARAMS = get_file_key_params()
-FILE_KEY_PARAMS = get_file_key_params()
 
 
 GENERAL_HEALTH_GUIDE = []
-MONITOR_REFRESH_MS = 20 * 60 * 1000
+MONITOR_REFRESH_MS = 2 * 60 * 1000
 SYDNEY_TZ = tz.gettz("Australia/Sydney")
 
 # Path to persist the last AQMS per-site snapshot so arrows survive restarts.
@@ -477,18 +477,14 @@ def _latest_file_params():
         return None
 
     def sort_key(candidate):
-        file_path = forecast_file_path(
-            [
-                candidate.get("regions"),
-                candidate.get("pollutants"),
-                candidate.get("timeScopes"),
-                candidate.get("models"),
-                candidate.get("date"),
-            ]
-        )
         parsed_date = _parse_run_date(candidate.get("date")) or datetime.min
-        file_mtime = os.path.getmtime(file_path) if file_path and os.path.exists(file_path) else 0
-        return parsed_date, file_mtime, str(candidate.get("models") or ""), str(candidate.get("timeScopes") or "")
+        return (
+            parsed_date,
+            str(candidate.get("models") or ""),
+            str(candidate.get("timeScopes") or ""),
+            str(candidate.get("regions") or ""),
+            str(candidate.get("pollutants") or ""),
+        )
 
     return max(FILE_KEY_PARAMS, key=sort_key)
 
@@ -5377,11 +5373,14 @@ app.layout = html.Div(
                 "feeds": {},
                 "latestLabel": "--",
                 "fetchedAtEpoch": None,
+                "fetchAttemptEpoch": None,
+                "aqmsSource": None,
                 "status": INITIAL_MONITOR_STATUS,
                 "error": None,
             },
         ),
         dcc.Store(id="selected-monitor-site-store", data=None),
+        dcc.Store(id="forecast-catalog-store", data={"latestDate": DEFAULT_SELECTION.get("date")}),
         dcc.Store(id="overview-nsw-region-index", data=0),
         dcc.Store(id="overview-nsw-station-index", data=0),
         dcc.Store(id="overview-met-region-index", data=0),
@@ -5389,6 +5388,7 @@ app.layout = html.Div(
         dcc.Store(id="overview-trends-visible", data=["Sydney_East"]),
         dcc.Store(id="overview-trends-index", data=0),
         dcc.Interval(id="forecast-playback", interval=1800, n_intervals=0, disabled=True),
+        dcc.Interval(id="forecast-catalog-refresh", interval=2 * 60 * 1000, n_intervals=0),
         # Monitoring feed calls external APIs and can be slow on some hosts/networks.
         # Start disabled and enable shortly after first paint so the app opens fast.
         # Keep monitoring refresh disabled on startup to avoid blocking the server on slow external APIs.
@@ -5536,16 +5536,22 @@ app.layout = html.Div(
                                                                     html.Div(
                                                                         [
                                                                             html.H4("Observation map"),
-                                                                            dcc.Dropdown(
-                                                                                id="overview-observation-map-pollutant",
-                                                                                options=[
-                                                                                    {"label": "PM2.5", "value": "PM2.5"},
-                                                                                    {"label": "PM10", "value": "PM10"},
-                                                                                    {"label": "O3", "value": "O3"},
+                                                                            html.Div(
+                                                                                [
+                                                                                    dcc.Dropdown(
+                                                                                        id="overview-observation-map-pollutant",
+                                                                                        options=[
+                                                                                            {"label": "PM2.5", "value": "PM2.5"},
+                                                                                            {"label": "PM10", "value": "PM10"},
+                                                                                            {"label": "O3", "value": "O3"},
+                                                                                        ],
+                                                                                        value="PM2.5",
+                                                                                        clearable=False,
+                                                                                        searchable=False,
+                                                                                    ),
+                                                                                    html.Div(id="overview-observation-time", className="overview-map-time"),
                                                                                 ],
-                                                                                value="PM2.5",
-                                                                                clearable=False,
-                                                                                searchable=False,
+                                                                                className="overview-observation-controls",
                                                                             ),
                                                                         ],
                                                                         className="card-heading-row overview-observation-heading",
@@ -6448,6 +6454,72 @@ def load_monitor_region_options(active_tab):
     return [{"label": "All regions", "value": "ALL"}] + [{"label": region, "value": region} for region in regions]
 
 
+@app.callback(
+    [
+        Output("date-dropdown", "options"),
+        Output("model-dropdown", "options"),
+        Output("pollutant-dropdown", "options"),
+        Output("time-dropdown", "options"),
+        Output("region-dropdown", "options"),
+        Output("date-dropdown", "value"),
+        Output("model-dropdown", "value"),
+        Output("pollutant-dropdown", "value"),
+        Output("time-dropdown", "value"),
+        Output("region-dropdown", "value"),
+        Output("forecast-catalog-store", "data"),
+    ],
+    [Input("forecast-catalog-refresh", "n_intervals")],
+    [
+        State("date-dropdown", "value"),
+        State("model-dropdown", "value"),
+        State("pollutant-dropdown", "value"),
+        State("time-dropdown", "value"),
+        State("region-dropdown", "value"),
+        State("forecast-catalog-store", "data"),
+    ],
+)
+def refresh_forecast_catalog(_tick, date, model, pollutant, time_scope, region, catalog_state):
+    options = get_options() or {}
+    latest = _latest_file_params() or {}
+    previous_latest = (catalog_state or {}).get("latestDate")
+    latest_date = latest.get("date")
+
+    dates = options.get("date") or []
+    models = options.get("models") or []
+    pollutants = options.get("pollutants") or []
+    time_scopes = options.get("timeScopes") or []
+    regions = options.get("regions") or []
+
+    # Follow a newly arriving run only when the viewer was following the
+    # previous latest date. Preserve an intentional historical selection.
+    follow_latest = not date or date not in dates or (previous_latest and date == previous_latest and latest_date != previous_latest)
+    if follow_latest:
+        date = latest.get("date") or (dates[-1] if dates else None)
+        model = latest.get("models") or model
+        pollutant = latest.get("pollutants") or pollutant
+        time_scope = latest.get("timeScopes") or time_scope
+        region = latest.get("regions") or region
+
+    model = model if model in models else (latest.get("models") or (models[0] if models else None))
+    pollutant = pollutant if pollutant in pollutants else (latest.get("pollutants") or (pollutants[0] if pollutants else None))
+    time_scope = time_scope if time_scope in time_scopes else (latest.get("timeScopes") or (time_scopes[0] if time_scopes else None))
+    region = region if region in regions else (latest.get("regions") or (regions[0] if regions else None))
+
+    return (
+        [{"label": value, "value": value} for value in dates],
+        [{"label": value, "value": value} for value in models],
+        [{"label": value, "value": value} for value in pollutants],
+        [{"label": f"{value} hours", "value": value} for value in time_scopes],
+        [{"label": _display_region_label(value), "value": value} for value in regions],
+        date,
+        model,
+        pollutant,
+        time_scope,
+        region,
+        {"latestDate": latest_date},
+    )
+
+
 app.clientside_callback(
     """
     function(hourIndex) {
@@ -6472,21 +6544,25 @@ app.clientside_callback(
         Output("time-slider", "marks"),
     ],
     [
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("pollutant-dropdown", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
         Input("date-dropdown", "value"),
+        Input("forecast-catalog-refresh", "n_intervals"),
         Input("forecast-playback", "n_intervals"),
         Input("overview-forecast-load", "n_intervals"),
         Input("forecast-prev-hour", "n_clicks"),
         Input("forecast-next-hour", "n_clicks"),
     ],
-    [State("time-slider", "value"), State("forecast-store", "data")],
+    [State("time-slider", "value"), State("forecast-store", "data"), State("dashboard-tabs", "value")],
     prevent_initial_call=True,
 )
-def load_forecast(active_tab, region, pollutant, time_scope, model, date, _n_intervals, _overview_load, _prev_hour, _next_hour, current_time_value, current_store):
+def load_forecast(region, pollutant, time_scope, model, date, _catalog_tick, _n_intervals, _overview_load, _prev_hour, _next_hour, current_time_value, current_store, active_tab):
+    # Only process when on forecast tab
+    if active_tab != "forecast":
+        return no_update, no_update, no_update, no_update, no_update
+
     selection = {
         "regions": region,
         "pollutants": pollutant,
@@ -6495,7 +6571,7 @@ def load_forecast(active_tab, region, pollutant, time_scope, model, date, _n_int
         "date": date,
     }
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    return _load_forecast_payload(active_tab, selection, trigger, current_time_value, current_store)
+    return _load_forecast_payload("forecast", selection, trigger, current_time_value, current_store)
 
 
 def _load_forecast_payload(active_tab, selection, trigger, current_time_value, current_store):
@@ -6505,7 +6581,21 @@ def _load_forecast_payload(active_tab, selection, trigger, current_time_value, c
     if active_tab != "forecast":
         return no_update, no_update, no_update, no_update, no_update
 
-    if current_store and current_store.get("_selection") == selection:
+    current_file = _build_file_path(selection)
+    if not current_file:
+        current_file, _exact = _best_matching_file(selection)
+    try:
+        current_file_epoch = os.path.getmtime(current_file) if current_file else None
+    except OSError:
+        current_file_epoch = None
+
+    store_matches_file = (
+        current_store
+        and current_store.get("_selection") == selection
+        and current_store.get("_sourceFile") == current_file
+        and current_store.get("_generatedAtEpoch") == current_file_epoch
+    )
+    if store_matches_file:
         times = current_store.get("data", {}).get("time", {}).get("forecastTime", [])
         slider_max = max(len(times) - 1, 0)
         base_index = _forecast_live_base_index(times)
@@ -6560,14 +6650,13 @@ def toggle_monitor_refresh(active_tab):
     Output("monitor-store", "data"),
     [
         Input("monitor-refresh", "n_intervals"),
-        Input("dashboard-tabs", "value"),
         Input("monitor-settings-store", "data"),
         Input("overview-monitor-load", "n_intervals"),
     ],
-    [State("monitor-store", "data")],
+    [State("monitor-store", "data"), State("dashboard-tabs", "value")],
     prevent_initial_call=True,
 )
-def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_load, current_store):
+def refresh_monitoring(_n_intervals, monitor_settings, _overview_load, current_store, active_tab):
     # Refresh rules:
     # - Monitoring tab: refresh on its normal interval / setting changes.
     # - Overview tab: run a single AQMS-only snapshot shortly after first paint
@@ -6594,10 +6683,24 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     status_bits = []
     error = None
     try:
-        raw_obs = fetch_observations(query=None, timeout=12)
-        status_bits.append("AQMS feed: Live")
-        aqms_ok = True
+        aqms_result = fetch_observations_result(query=None, timeout=12)
+        raw_obs = aqms_result.get("rows") or []
+        aqms_source = aqms_result.get("source") or "error"
+        aqms_ok = aqms_source in {"live", "official-report"} and bool(raw_obs)
+        if aqms_ok:
+            status_bits.append(
+                "AQMS feed: Live"
+                if aqms_source == "live"
+                else "AQMS feed: Live (official NSW report)"
+            )
+        elif raw_obs:
+            status_bits.append(f"AQMS feed: {aqms_source.title()}")
+        else:
+            status_bits.append("AQMS feed: Offline")
+        if aqms_result.get("error"):
+            error = f"AQMS feed unavailable: {aqms_result['error']}"
     except Exception as exc:
+        aqms_result = {"rows": [], "source": "error", "error": str(exc), "latest_epoch": None}
         raw_obs = []
         aqms_ok = False
         error = f"AQMS feed unavailable: {exc}"
@@ -6609,8 +6712,12 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         purpleair_payload = fetch_purpleair_snapshot(bounds=purpleair_bounds, timeout=12)
         if purpleair_payload.get("error"):
             status_bits.append("PurpleAir feed: Offline")
-            if error is None:
+            # PurpleAir is an optional overlay. Do not replace a healthy AQMS
+            # Overview status with a PurpleAir billing/network error.
+            if error is None and source_filter == "purpleair":
                 error = f"PurpleAir feed unavailable: {purpleair_payload.get('error')}"
+        elif purpleair_payload.get("source") != "live":
+            status_bits.append(f"PurpleAir feed: {(purpleair_payload.get('source') or 'cached').title()}")
         else:
             status_bits.append("PurpleAir feed: Live")
     else:
@@ -6722,8 +6829,12 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
     table_rows = _monitor_table_rows(aqms_rows, purpleair_sensors, aqms_snapshot_by_site, max_rows=40)
     table_rows_all = _monitor_table_rows_all(aqms_rows, purpleair_sensors, aqms_snapshot_by_site)
     feeds = {
-        "aqms": {"status": "Live" if aqms_ok else "Offline"},
-        "purpleair": {"status": "Live" if not purpleair_payload.get("error") else "Offline"},
+        "aqms": {"status": "Live" if aqms_ok else (aqms_result.get("source") or "Offline").title()},
+        "purpleair": {
+            "status": "Live"
+            if not purpleair_payload.get("error") and purpleair_payload.get("source") == "live"
+            else (purpleair_payload.get("source") or "Offline").title()
+        },
         "completeness": completeness,
     }
 
@@ -6794,7 +6905,11 @@ def refresh_monitoring(_n_intervals, active_tab, monitor_settings, _overview_loa
         "tableRowsAll": table_rows_all,
         "feeds": feeds,
         "latestLabel": latest_label,
-        "fetchedAtEpoch": datetime.now(SYDNEY_TZ).timestamp(),
+        # This field drives every "last data update" label. Use the actual
+        # observation timestamp, not the time of a failed fetch attempt.
+        "fetchedAtEpoch": aqms_result.get("latest_epoch") if raw_obs else None,
+        "fetchAttemptEpoch": datetime.now(SYDNEY_TZ).timestamp(),
+        "aqmsSource": aqms_result.get("source"),
         "status": status_text,
         "error": error,
     }
@@ -6963,7 +7078,10 @@ def render_monitoring(monitor_store, monitor_settings):
 
 
 @app.callback(
-    Output("overview-observation-map", "srcDoc"),
+    [
+        Output("overview-observation-map", "srcDoc"),
+        Output("overview-observation-time", "children"),
+    ],
     [Input("monitor-store", "data"), Input("overview-observation-map-pollutant", "value")],
 )
 def render_overview_observation_map(monitor_store, pollutant_label):
@@ -6973,16 +7091,41 @@ def render_overview_observation_map(monitor_store, pollutant_label):
     if pollutant_label == "PM2.5":
         rows.extend(monitor_store.get("aqmsPm25Rows") or [])
         rows.extend(monitor_store.get("dustwatchPm25Rows") or [])
-        rows.extend(monitor_store.get("purpleairSensors") or [])
+        rows.extend(monitor_store.get("purpleairSensors") or load_purpleair_sensors())
     elif pollutant_label == "PM10":
         rows.extend(monitor_store.get("aqmsPm10Rows") or [])
         rows.extend(monitor_store.get("dustwatchPm10Rows") or [])
-        rows.extend(monitor_store.get("purpleairSensors") or [])
+        rows.extend(monitor_store.get("purpleairSensors") or load_purpleair_sensors())
     elif pollutant_label == "O3":
         rows.extend(monitor_store.get("aqmsO3Rows") or [])
     if not rows:
         rows = monitor_store.get("mapRows") or []
-    return _leaflet_monitoring_map_html(rows)
+
+    # Build time label in format: "PM2.5 @ 5PM-6PM /25 Jun 2026"
+    time_label = ""
+    if rows:
+        dated_rows = [
+            row
+            for row in rows
+            if row.get("date") and row.get("hour") not in (None, "")
+        ]
+        latest_row = max(dated_rows, key=_parse_monitor_time) if dated_rows else None
+        if latest_row:
+            try:
+                latest_date = datetime.strptime(str(latest_row["date"]), "%Y-%m-%d")
+                hour_int = int(latest_row["hour"])
+                current_dt = latest_date.replace(hour=hour_int)
+                next_dt = current_dt + timedelta(hours=1)
+
+                hour_str = current_dt.strftime("%I%p").lstrip("0")
+                next_hour_str = next_dt.strftime("%I%p").lstrip("0")
+                date_str = current_dt.strftime("%d %b %Y")
+
+                time_label = f"{pollutant_label} @ {hour_str}-{next_hour_str} /{date_str}"
+            except Exception:
+                time_label = f"{pollutant_label} @ Latest"
+
+    return _leaflet_monitoring_map_html(rows), html.Div(time_label, style={"fontSize": "1rem", "fontWeight": "600", "letterSpacing": "0.5px"})
 
 
 def _overview_pick_multi_region_forecast_selection(selection):
@@ -7028,7 +7171,6 @@ def _overview_pick_multi_region_forecast_selection(selection):
         Output("overview-forecast-hour-index", "data"),
     ],
     [
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
@@ -7038,10 +7180,9 @@ def _overview_pick_multi_region_forecast_selection(selection):
         Input("overview-forecast-prev-hour", "n_clicks"),
         Input("overview-forecast-next-hour", "n_clicks"),
     ],
-    [State("overview-forecast-hour-index", "data")],
+    [State("overview-forecast-hour-index", "data"), State("dashboard-tabs", "value")],
 )
 def render_overview_next_hour_forecast_map(
-    active_tab,
     region,
     time_scope,
     model,
@@ -7051,6 +7192,7 @@ def render_overview_next_hour_forecast_map(
     prev_clicks,
     next_clicks,
     current_index,
+    active_tab,
 ):
     print(f"DEBUG: render_overview_next_hour_forecast_map called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
@@ -7183,7 +7325,7 @@ def render_overview_next_hour_forecast_map(
     live_base_index, has_upcoming_forecast = _forecast_live_base_state(times)
 
     # Reset to the live/upcoming forecast hour when core selection inputs change.
-    if trigger in ("dashboard-tabs", "region-dropdown", "time-dropdown", "model-dropdown", "date-dropdown", "overview-forecast-load", "overview-forecast-map-pollutant"):
+    if trigger in ("region-dropdown", "time-dropdown", "model-dropdown", "date-dropdown", "overview-forecast-load", "overview-forecast-map-pollutant"):
         new_index = live_base_index
     else:
         new_index = current_index
@@ -7203,17 +7345,22 @@ def render_overview_next_hour_forecast_map(
     time_index = new_index if times else 0
     map_html = _leaflet_forecast_map_html(merged_parsed if merged_stations else {}, pollutant, time_index, include_series=False)
 
-    # Build user-facing label (show only the timestamp in uppercase, larger font)
+    # Build user-facing label in format: "PM2.5 @ <5PM-6PM>/25 Jun 2026"
     label_el = ""
     if times:
         sel_time = times[time_index]
         parsed_dt = _parse_forecast_timestamp(sel_time) if sel_time else None
         if parsed_dt:
-            hour = parsed_dt.strftime("%I").lstrip("0") or "0"
-            label_text = f"{parsed_dt.strftime('%b').upper()} {parsed_dt.day} {hour}{parsed_dt.strftime('%p')}"
+            # Calculate next hour for time range
+            next_dt = parsed_dt + timedelta(hours=1)
+            hour_str = parsed_dt.strftime("%I%p").lstrip("0")
+            next_hour_str = next_dt.strftime("%I%p").lstrip("0")
+            date_str = parsed_dt.strftime("%d %b %Y")
+
+            label_text = f"{pollutant} @ <{hour_str}-{next_hour_str}>/{date_str}"
             if not has_upcoming_forecast:
-                label_text = f"LATEST AVAILABLE {label_text}"
-            label_el = html.Div(label_text, style={"fontSize": "1.25rem", "fontWeight": "700", "letterSpacing": "0.5px"})
+                label_text = f"{pollutant} @ <{hour_str}-{next_hour_str}>/{date_str}"
+            label_el = html.Div(label_text, style={"fontSize": "1rem", "fontWeight": "600", "letterSpacing": "0.5px"})
     else:
         label_el = html.Div("", className="card-hint")
 
@@ -7224,7 +7371,6 @@ def render_overview_next_hour_forecast_map(
     Output("overview-next-hour-station-panel", "children"),
     [
         Input("url", "hash"),
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
@@ -7232,8 +7378,9 @@ def render_overview_next_hour_forecast_map(
         Input("overview-forecast-load", "n_intervals"),
         Input("overview-forecast-map-pollutant", "value"),
     ],
+    [State("dashboard-tabs", "value")],
 )
-def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_scope, model, date, _overview_load, overview_pollutant):
+def render_overview_next_hour_station_panel(url_hash, region, time_scope, model, date, _overview_load, overview_pollutant, active_tab):
     print(f"DEBUG: render_overview_next_hour_station_panel called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
         print("DEBUG: render_overview_next_hour_station_panel early exit (not overview)", flush=True)
@@ -7359,15 +7506,15 @@ def render_overview_next_hour_station_panel(url_hash, active_tab, region, time_s
 @app.callback(
     [Output("overview-next3-grid", "children"), Output("overview-next3-time-labels", "children")],
     [
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
         Input("date-dropdown", "value"),
         Input("overview-forecast-load", "n_intervals"),
     ],
+    [State("dashboard-tabs", "value")],
 )
-def render_overview_next3_diamonds(active_tab, region, time_scope, model, date, _overview_load):
+def render_overview_next3_diamonds(region, time_scope, model, date, _overview_load, active_tab):
     print(f"DEBUG: render_overview_next3_diamonds called active_tab={active_tab} _overview_load={_overview_load}", flush=True)
     if active_tab != "overview":
         print("DEBUG: render_overview_next3_diamonds early exit (not overview)", flush=True)
@@ -7546,7 +7693,6 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
 @app.callback(
     [Output("overview-next2-allstations-table", "columns"), Output("overview-next2-allstations-table", "data")],
     [
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
@@ -7554,8 +7700,9 @@ def _overview_allstations_multi_hour_rows(selection, hours=3):
         Input("overview-forecast-load", "n_intervals"),
         Input("overview-open-allstations", "n_clicks"),
     ],
+    [State("dashboard-tabs", "value")],
 )
-def render_overview_next2_allstations(active_tab, region, time_scope, model, date, _overview_load, open_allstations_clicks):
+def render_overview_next2_allstations(region, time_scope, model, date, _overview_load, open_allstations_clicks, active_tab):
     # Populate when either the (now-removed) All-stations tab is active or the
     # overlay open button was clicked.
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
@@ -7787,12 +7934,11 @@ def cycle_overview_nsw_region(_prev_clicks, _next_clicks, _autoplay_intervals, m
         Input("overview-nsw-region-prev", "n_clicks"),
         Input("overview-nsw-region-next", "n_clicks"),
         Input("overview-region-autoplay", "n_intervals"),
-        Input("dashboard-tabs", "value"),
     ],
-    [State("monitor-store", "data"), State("overview-met-region-index", "data")],
+    [State("monitor-store", "data"), State("overview-met-region-index", "data"), State("dashboard-tabs", "value")],
     prevent_initial_call=True,
 )
-def cycle_overview_met_region(_prev_clicks, _next_clicks, _nsw_prev, _nsw_next, _autoplay_intervals, active_tab, monitor_store, current_index):
+def cycle_overview_met_region(_prev_clicks, _next_clicks, _nsw_prev, _nsw_next, _autoplay_intervals, monitor_store, current_index, active_tab):
     """Manage the meteorology panel region selection independently, but respond to master nav."""
     if active_tab != "overview":
         return current_index or 0, dash.no_update
@@ -8309,14 +8455,13 @@ def render_overview_nsw_station_box(monitor_store, region_index, station_index):
 @app.callback(
     Output("overview-met-6h", "children"),
     [
-        Input("dashboard-tabs", "value"),
         Input("overview-met-load", "n_intervals"),
         Input("overview-nsw-region-index", "data"),
     ],
-    [State("monitor-store", "data")],
+    [State("monitor-store", "data"), State("dashboard-tabs", "value")],
     prevent_initial_call=True,
 )
-def render_overview_met6h(active_tab, _met_load, region_index, monitor_store):
+def render_overview_met6h(_met_load, region_index, monitor_store, active_tab):
     if active_tab != "overview":
         return no_update
     monitor_store = monitor_store or {}
@@ -8522,15 +8667,15 @@ def render_overview_met6h(active_tab, _met_load, region_index, monitor_store):
         Output("overview-trends-current-region-label", "children"),
     ],
     [
-        Input("dashboard-tabs", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
         Input("date-dropdown", "value"),
         Input("overview-forecast-load", "n_intervals"),
         Input("overview-trends-index", "data"),
     ],
+    [State("dashboard-tabs", "value")],
 )
-def render_overview_trends(active_tab, time_scope, model_name, run_date, _overview_load, selected_index):
+def render_overview_trends(time_scope, model_name, run_date, _overview_load, selected_index, active_tab):
     if active_tab != "overview":
         return no_update, no_update
 
@@ -8558,7 +8703,6 @@ def render_overview_trends(active_tab, time_scope, model_name, run_date, _overvi
     [
         Input("overview-trends-prev", "n_clicks"),
         Input("overview-trends-next", "n_clicks"),
-        Input("dashboard-tabs", "value"),
         Input("time-dropdown", "value"),
         Input("model-dropdown", "value"),
         Input("date-dropdown", "value"),
@@ -8566,9 +8710,9 @@ def render_overview_trends(active_tab, time_scope, model_name, run_date, _overvi
         Input("overview-nsw-region-next", "n_clicks"),
         Input("overview-region-autoplay", "n_intervals"),
     ],
-    [State("overview-trends-index", "data")],
+    [State("overview-trends-index", "data"), State("dashboard-tabs", "value")],
 )
-def overview_trends_nav(prev_clicks, next_clicks, active_tab, time_scope, model_name, run_date, _nsw_prev, _nsw_next, _autoplay_intervals, current_index):
+def overview_trends_nav(prev_clicks, next_clicks, time_scope, model_name, run_date, _nsw_prev, _nsw_next, _autoplay_intervals, current_index, active_tab):
     """Update the overview trends index when Prev/Next are clicked."""
     # Only operate on Overview tab
     if active_tab != "overview":
@@ -8621,7 +8765,6 @@ def render_header_monitor_timestamps(monitor_store):
 @app.callback(
     Output("header-forecast-time", "children"),
     [
-        Input("dashboard-tabs", "value"),
         Input("region-dropdown", "value"),
         Input("pollutant-dropdown", "value"),
         Input("time-dropdown", "value"),
@@ -8629,8 +8772,9 @@ def render_header_monitor_timestamps(monitor_store):
         Input("date-dropdown", "value"),
         Input("overview-forecast-load", "n_intervals"),
     ],
+    [State("dashboard-tabs", "value")],
 )
-def render_header_forecast_time(_active_tab, region, pollutant, time_scope, model, date, _overview_load):
+def render_header_forecast_time(region, pollutant, time_scope, model, date, _overview_load, _active_tab):
     selection = {
         "regions": region or DEFAULT_SELECTION.get("regions"),
         "pollutants": pollutant or DEFAULT_SELECTION.get("pollutants"),
